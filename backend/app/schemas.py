@@ -21,10 +21,12 @@ class Categoria(CategoriaBase):
 
 class ProductoBase(BaseModel):
     nombre: str
+    codigo: Optional[str] = None
     categoria_id: Optional[int] = None
     precio_venta: Decimal
     costo: Decimal = Decimal("0")
     mix_pct: Decimal = Decimal("0")
+    lead_time_dias: Optional[int] = None
     activo: bool = True
 
 
@@ -34,10 +36,12 @@ class ProductoCreate(ProductoBase):
 
 class ProductoUpdate(BaseModel):
     nombre: Optional[str] = None
+    codigo: Optional[str] = None
     categoria_id: Optional[int] = None
     precio_venta: Optional[Decimal] = None
     costo: Optional[Decimal] = None
     mix_pct: Optional[Decimal] = None
+    lead_time_dias: Optional[int] = None
     activo: Optional[bool] = None
 
 
@@ -56,7 +60,7 @@ class CompraBase(BaseModel):
 
 
 class CompraCreate(CompraBase):
-    pass
+    actualizar_precio_venta: Optional[Decimal] = None  # si viene, se aplica al producto tras registrar la compra
 
 
 class Compra(CompraBase):
@@ -64,6 +68,12 @@ class Compra(CompraBase):
     id: int
     fecha: date
     producto: Optional[Producto] = None
+
+
+class CompraSimularRequest(BaseModel):
+    producto_id: int
+    cantidad: int
+    costo_unitario: Decimal
 
 
 class CostoFijoBase(BaseModel):
@@ -113,9 +123,16 @@ class StockProducto(BaseModel):
     costo_promedio: float
     dias_en_stock: Optional[int] = None
     alerta_rotacion_90_dias: bool = False
+    demanda_media_diaria: float = 0.0
+    dias_cobertura: Optional[float] = None
+    estado_stock: str = "OK"
+    necesita_reponer: bool = False
 
 
 class StockCategoria(BaseModel):
     categoria: str
     stock_actual: int
     cantidad_productos: int
+    demanda_media_diaria: float = 0.0
+    dias_cobertura: Optional[float] = None
+    estado_stock: str = "OK"

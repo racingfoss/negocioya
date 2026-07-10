@@ -32,10 +32,12 @@ class Producto(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     nombre = Column(String(150), nullable=False)
+    codigo = Column(String(50), unique=True, nullable=True)  # SKU/código de barras, opcional, no se usa para importar
     categoria_id = Column(Integer, ForeignKey("categorias.id", ondelete="SET NULL"), nullable=True)
     precio_venta = Column(Numeric(12, 2), nullable=False)
     costo = Column(Numeric(12, 2), nullable=False, default=0)  # costo promedio ponderado, se recalcula solo
     mix_pct = Column(Numeric(5, 2), nullable=False, default=0)
+    lead_time_dias = Column(Integer, nullable=True)  # plazo medio de reposición del proveedor, opcional
     activo = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 

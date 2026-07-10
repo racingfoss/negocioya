@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .database import Base, engine
-from .routers import categorias, compras, costos_fijos, dashboard, movimientos, productos, stock
+from .routers import categorias, compras, costos_fijos, dashboard, importacion, movimientos, productos, stock
 
 Base.metadata.create_all(bind=engine)
 
@@ -23,6 +23,7 @@ app.include_router(stock.router)
 app.include_router(costos_fijos.router)
 app.include_router(movimientos.router)
 app.include_router(dashboard.router)
+app.include_router(importacion.router)
 
 
 @app.get("/")

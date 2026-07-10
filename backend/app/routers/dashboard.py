@@ -24,6 +24,11 @@ def bcg(dias: int = 30, db: Session = Depends(get_db)):
     return calculations.matriz_bcg(db, dias=dias)
 
 
+@router.get("/analisis")
+def analisis(dias: int = 30, db: Session = Depends(get_db)):
+    return calculations.analisis_combinado(db, dias=dias)
+
+
 @router.get("/sell-through", response_model=list[dict])
 def sellthrough(db: Session = Depends(get_db)):
     return calculations.sell_through(db)

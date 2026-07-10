@@ -5,6 +5,7 @@ import Categorias from './pages/Categorias'
 import Compras from './pages/Compras'
 import CostosFijos from './pages/CostosFijos'
 import Dashboard from './pages/Dashboard'
+import Importar from './pages/Importar'
 import Movimientos from './pages/Movimientos'
 import Productos from './pages/Productos'
 import SellThrough from './pages/SellThrough'
@@ -14,9 +15,10 @@ const links = [
   { to: '/movimientos', label: '💰 Caja' },
   { to: '/productos', label: '👗 Catálogo' },
   { to: '/compras', label: '📦 Compras' },
+  { to: '/importar', label: '📥 Importar' },
   { to: '/categorias', label: '🗂️ Categorías' },
   { to: '/costos-fijos', label: '🔧 Estructura Fija' },
-  { to: '/bcg', label: '🎯 Matriz BCG' },
+  { to: '/bcg', label: '🎯 Análisis' },
   { to: '/sell-through', label: '📈 Stock' },
 ]
 
@@ -47,6 +49,7 @@ function App() {
             <Route path="/movimientos" element={<Movimientos />} />
             <Route path="/productos" element={<Productos />} />
             <Route path="/compras" element={<Compras />} />
+            <Route path="/importar" element={<Importar />} />
             <Route path="/categorias" element={<Categorias />} />
             <Route path="/costos-fijos" element={<CostosFijos />} />
             <Route path="/bcg" element={<BCG />} />
