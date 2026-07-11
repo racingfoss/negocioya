@@ -29,6 +29,7 @@ export default function Productos() {
   const [atributosDisponibles, setAtributosDisponibles] = useState([])
   const [variantesConfig, setVariantesConfig] = useState({}) // atributo_id -> {activo, orden, valor_ids: Set}
   const [variantesActuales, setVariantesActuales] = useState([])
+  const [tieneVariantesOriginal, setTieneVariantesOriginal] = useState(false) // valor en BD al entrar a editar
 
   const cargar = () => {
     api.get('/productos').then((r) => setProductos(r.data))
@@ -60,15 +61,44 @@ export default function Productos() {
       tiene_variantes: form.tiene_variantes,
     }
     try {
-      if (editId) await api.put(`/productos/${editId}`, payload)
-      else await api.post('/productos', payload)
+      if (editId) {
+        await api.put(`/productos/${editId}`, payload)
+      } else if (form.tiene_variantes) {
+        // alta de producto nuevo CON variantes: se resuelve en un solo paso atómico en el backend
+        // (producto + atributos + variantes), a partir de lo tildado en el bloque de abajo
+        const activos = Object.entries(variantesConfig).filter(([, c]) => c.activo)
+        if (activos.length === 0) {
+          setError('Elegí al menos un atributo para este producto.')
+          return
+        }
+        if (activos.some(([, c]) => c.valor_ids.size === 0)) {
+          setError('Elegí al menos un valor para cada atributo marcado.')
+          return
+        }
+        await api.post('/productos/con-variantes', {
+          producto: payload,
+          atributos: activos.map(([atributo_id, c]) => ({ atributo_id: Number(atributo_id), orden: c.orden })),
+          selecciones: activos.map(([atributo_id, c]) => ({
+            atributo_id: Number(atributo_id),
+            valor_ids: [...c.valor_ids],
+          })),
+        })
+      } else {
+        await api.post('/productos', payload)
+      }
       setForm(empty)
       setEditId(null)
       setVariantesConfig({})
       setVariantesActuales([])
+      setTieneVariantesOriginal(false)
       cargar()
     } catch (e) {
       setError(getErrorMessage(e))
+      // si falló un intento de sacarle variantes a un producto que ya las tenía, el backend no
+      // aplicó el cambio (bloqueado por trazabilidad) — reflejamos ese estado real en el checkbox
+      if (editId && tieneVariantesOriginal && !form.tiene_variantes) {
+        setForm((f) => ({ ...f, tiene_variantes: true }))
+      }
     }
   }
 
@@ -87,6 +117,7 @@ export default function Productos() {
 
   const editar = (p) => {
     setEditId(p.id)
+    setTieneVariantesOriginal(p.tiene_variantes || false)
     setForm({
       nombre: p.nombre,
       codigo: p.codigo || '',
@@ -195,6 +226,23 @@ export default function Productos() {
     }
   }
 
+  // Preview local (sin pegarle al backend) de la grilla de variantes que se va a generar, a partir
+  // de lo tildado en variantesConfig — combinación de todos los valores marcados, ordenada por `orden`.
+  const previewVariantes = (() => {
+    const activos = Object.entries(variantesConfig)
+      .filter(([, c]) => c.activo && c.valor_ids.size > 0)
+      .sort((a, b) => a[1].orden - b[1].orden)
+    if (activos.length === 0) return []
+    const listasDeValores = activos.map(([atributoId, c]) => {
+      const atributo = atributosDisponibles.find((a) => String(a.id) === String(atributoId))
+      return [...c.valor_ids].map((vid) => atributo?.valores.find((v) => v.id === vid)?.valor || '?')
+    })
+    return listasDeValores.reduce(
+      (combinaciones, valores) => combinaciones.flatMap((c) => valores.map((v) => [...c, v])),
+      [[]]
+    ).map((combo) => combo.join(' / '))
+  })()
+
   return (
     <div className="space-y-6">
       <h1 className="text-3xl font-bold flex items-center gap-2">👗 Catálogo de Productos</h1>
@@ -281,8 +329,8 @@ export default function Productos() {
         <p className="text-xs text-gray-500">
           El costo se puede dejar en 0 al principio — en cuanto cargues la primera Compra de este producto, se va a
           recalcular solo como promedio ponderado. El lead time se usa para la alerta de "próximo a agotarse" en
-          Stock (si no lo cargás, se asume 7 días). Si activás variantes, guardá el producto y despues configurá sus
-          atributos acá abajo.
+          Stock (si no lo cargás, se asume 7 días). Si activás variantes, elegí sus atributos y valores acá abajo
+          antes de guardar — se crea todo junto en un solo paso.
         </p>
         <div className="flex gap-2">
           <button onClick={guardar} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg font-medium">
@@ -295,6 +343,7 @@ export default function Productos() {
                 setForm(empty)
                 setVariantesConfig({})
                 setVariantesActuales([])
+                setTieneVariantesOriginal(false)
               }}
               className="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded-lg"
             >
@@ -394,6 +443,88 @@ export default function Productos() {
                     ))}
                   </tbody>
                 </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {!editId && form.tiene_variantes && (
+        <div className="bg-[#151b2b] rounded-xl p-5 space-y-4">
+          <h2 className="font-bold">Variantes del producto nuevo</h2>
+          <p className="text-xs text-gray-500">
+            Elegí qué atributos aplican a este producto y en qué orden (el primero agrupa el stock en subtotales,
+            ej. Talle), y qué valores de cada uno. Al confirmar "+ Añadir Prenda" de arriba se crea todo junto: el
+            producto, sus atributos y las variantes de la grilla (todas arrancan con 0 de stock hasta que le
+            cargues una Compra).
+          </p>
+          <div className="space-y-3">
+            {atributosDisponibles.map((a) => {
+              const config = variantesConfig[a.id]
+              return (
+                <div key={a.id} className="border border-gray-800 rounded-lg p-3">
+                  <label className="flex items-center gap-2 font-medium">
+                    <input
+                      type="checkbox"
+                      checked={!!config?.activo}
+                      onChange={(e) => toggleAtributo(a.id, e.target.checked)}
+                    />
+                    {a.nombre}
+                    {config?.activo && (
+                      <input
+                        type="number"
+                        min="1"
+                        className="w-16 bg-[#0b0f19] border border-gray-700 rounded p-1 text-sm ml-2"
+                        value={config.orden}
+                        onChange={(e) => setOrdenAtributo(a.id, e.target.value)}
+                        title="Orden (1 = agrupa el stock en subtotales)"
+                      />
+                    )}
+                  </label>
+                  {config?.activo && (
+                    <div className="flex flex-wrap gap-2 mt-2 ml-6">
+                      {a.valores.map((v) => (
+                        <label
+                          key={v.id}
+                          className="flex items-center gap-1 text-sm bg-[#0b0f19] border border-gray-700 rounded-full px-2 py-1"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={config.valor_ids.has(v.id)}
+                            onChange={() => toggleValor(a.id, v.id)}
+                          />
+                          {v.valor}
+                        </label>
+                      ))}
+                      {a.valores.length === 0 && (
+                        <span className="text-gray-500 text-xs">Sin valores cargados (andá a Atributos).</span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+            {atributosDisponibles.length === 0 && (
+              <p className="text-gray-500 text-sm">
+                Todavía no cargaste atributos. Andá a la página "Atributos" para crear Talle, Color, etc.
+              </p>
+            )}
+          </div>
+
+          {previewVariantes.length > 0 && (
+            <div>
+              <h3 className="font-medium mb-2 text-sm text-gray-300">
+                Preview de variantes a crear ({previewVariantes.length})
+              </h3>
+              <div className="flex flex-wrap gap-2">
+                {previewVariantes.map((combo) => (
+                  <span
+                    key={combo}
+                    className="text-xs bg-[#0b0f19] border border-gray-700 rounded-full px-2 py-1"
+                  >
+                    {combo}
+                  </span>
+                ))}
               </div>
             </div>
           )}

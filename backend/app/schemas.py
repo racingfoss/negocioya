@@ -129,6 +129,15 @@ class GenerarVariantesRequest(BaseModel):
     selecciones: list[SeleccionAtributo]
 
 
+class ProductoConVariantesCreate(BaseModel):
+    """Alta atómica de un producto nuevo con variantes: producto + configuración de atributos +
+    grilla de variantes a generar, todo en una sola operación de backend (ver POST /productos/con-variantes)."""
+
+    producto: ProductoCreate
+    atributos: list[ProductoAtributoIn]
+    selecciones: list[SeleccionAtributo]
+
+
 class CostoFijoBase(BaseModel):
     concepto: str
     monto: Decimal

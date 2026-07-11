@@ -82,6 +82,41 @@ export default function Compras() {
         )
       : null
 
+  const productoSeleccionado = productos.find((x) => String(x.id) === String(form.producto_id))
+
+  // Los combos de atributo en Compras solo pueden ofrecer valores que ya existen en alguna VARIANTE
+  // real de este producto puntual (no todos los valores_atributo del sistema, ni todas las
+  // combinaciones matemáticamente posibles) — acá no se dan de alta variantes nuevas, solo se
+  // registra stock contra una que ya existe. El combo de un atributo se filtra además por lo ya
+  // elegido en los atributos anteriores (en el orden que define `atributosProducto`).
+  const opcionesParaAtributo = (atributo, index) => {
+    const previos = atributosProducto.slice(0, index)
+    const candidatas = variantesProducto.filter((v) =>
+      previos.every((pa) => {
+        const elegido = valoresElegidos[pa.atributo_id]
+        if (!elegido) return true
+        return v.valores.some((x) => x.atributo_id === pa.atributo_id && x.valor_atributo_id === Number(elegido))
+      })
+    )
+    const vistos = new Set()
+    const opciones = []
+    candidatas.forEach((v) => {
+      const match = v.valores.find((x) => x.atributo_id === atributo.atributo_id)
+      if (match && !vistos.has(match.valor_atributo_id)) {
+        vistos.add(match.valor_atributo_id)
+        opciones.push({ id: match.valor_atributo_id, valor: match.valor })
+      }
+    })
+    return opciones
+  }
+
+  const elegirValorAtributo = (atributoId, index, valor) => {
+    const nuevos = { ...valoresElegidos, [atributoId]: valor }
+    // si cambia un atributo, los siguientes (en orden) pueden dejar de corresponder a una variante real
+    atributosProducto.slice(index + 1).forEach((a) => delete nuevos[a.atributo_id])
+    setValoresElegidos(nuevos)
+  }
+
   const resetForm = () => {
     setForm({ ...empty, fecha: hoy() })
     setEditId(null)
@@ -100,6 +135,10 @@ export default function Compras() {
     if (editId) {
       // en edición no simulamos (es un ajuste puntual de un registro ya cargado), guardamos directo
       guardarCompra(null)
+      return
+    }
+    if (productoSeleccionado?.tiene_variantes && variantesProducto.length === 0) {
+      setError('Este producto no tiene variantes cargadas todavía, configuralas en Catálogo antes de registrar stock.')
       return
     }
     if (atributosProducto.length > 0 && !varianteResuelta) {
@@ -253,17 +292,23 @@ export default function Compras() {
           />
         </div>
 
-        {atributosProducto.length > 0 && (
+        {productoSeleccionado?.tiene_variantes && variantesProducto.length === 0 && (
+          <p className="text-sm text-amber-400 bg-amber-950/30 border border-amber-800 rounded-lg p-3">
+            Este producto no tiene variantes cargadas todavía, configuralas en Catálogo antes de registrar stock.
+          </p>
+        )}
+
+        {atributosProducto.length > 0 && variantesProducto.length > 0 && (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            {atributosProducto.map((a) => (
+            {atributosProducto.map((a, i) => (
               <select
                 key={a.atributo_id}
                 className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
                 value={valoresElegidos[a.atributo_id] || ''}
-                onChange={(e) => setValoresElegidos({ ...valoresElegidos, [a.atributo_id]: e.target.value })}
+                onChange={(e) => elegirValorAtributo(a.atributo_id, i, e.target.value)}
               >
                 <option value="">{a.atributo}...</option>
-                {a.valores.map((v) => (
+                {opcionesParaAtributo(a, i).map((v) => (
                   <option key={v.id} value={v.id}>
                     {v.valor}
                   </option>

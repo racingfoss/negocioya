@@ -161,6 +161,41 @@ columnas fijas.
   agregado de todas sus variantes.
 - La importación por Excel (`routers/importacion.py`) **sí soporta variantes** (columnas de atributo en
   la planilla) — ver sección "Importación de Excel" más abajo para el detalle completo.
+- **Compras filtra los combos de atributo por las variantes que YA EXISTEN del producto elegido**
+  (`frontend/src/pages/Compras.jsx`, función `opcionesParaAtributo`): el combo del primer atributo
+  (ej. Talle) solo lista los valores que aparecen en alguna `Variante` real de ese producto puntual —
+  no todos los `valores_atributo` del sistema. Al elegir un valor ahí, el siguiente combo (ej. Color) se
+  filtra además a los valores que, combinados con lo ya elegido, correspondan a una variante real
+  (se recorre `variantesProducto`, que ya se traía del backend pero no se usaba para filtrar). Esto es
+  deliberado: desde Compras **no se crean variantes nuevas**, solo se registra stock contra una que ya
+  existe — si hace falta una combinación realmente nueva, el alta es en Catálogo (ver punto siguiente).
+  Si el producto tiene `tiene_variantes=True` pero cero `Variante` cargadas (quedó a medio configurar),
+  Compras lo avisa explícitamente ("Este producto no tiene variantes cargadas todavía, configuralas en
+  Catálogo antes de registrar stock") en vez de mostrar combos vacíos, tanto al elegir el producto como
+  si se intenta guardar la compra igual.
+- **Alta de producto nuevo con variantes es atómica, en un solo paso** (antes había que guardar el
+  producto primero y recién en la edición aparecía el apartado de atributos/variantes — mal UX, dos
+  pantallas para una sola operación lógica). En el formulario de ALTA de `frontend/src/pages/Productos.jsx`,
+  tildar "¿Tiene variantes?" despliega ahí mismo (sin guardar nada todavía) el mismo bloque de
+  atributos/valores que ya existía para edición, más un preview local de la grilla de combinaciones
+  (`previewVariantes`, calculado 100% en el cliente, sin pegarle al backend). Al confirmar "+ Añadir
+  Prenda" se llama a `POST /productos/con-variantes` (`backend/app/routers/productos.py`), que crea el
+  producto, sus `producto_atributos` y sus `Variante` en una única transacción — si algo falla a mitad de
+  camino no queda un producto a medio configurar. Ese endpoint reusa la misma lógica de validación que
+  los endpoints de dos pasos usados por la edición (`POST /productos/{id}/atributos` y
+  `POST /productos/{id}/variantes/generar`), refactorizada a los helpers privados `_set_atributos` y
+  `_generar_variantes` (sin commit propio, así el caller controla la transacción). **El camino de edición
+  de un producto ya existente no se tocó** — sigue siendo dos pasos (guardar atributos, después generar
+  variantes) porque ahí sí tiene sentido: el producto ya existe, y por eso el bug original solo aplicaba al
+  alta.
+- **Desactivar variantes (`tiene_variantes: true → false`) se bloquea con 400 si el producto ya tiene
+  compras o ventas registradas** (`PUT /productos/{id}`): se decidió bloquear directo en vez de permitirlo
+  con una confirmación tipo `window.confirm`, para que no se pueda perder la trazabilidad de stock/costo
+  por variante con un solo click sin vuelta atrás. Si no tiene compras ni ventas (nunca se llegó a usar en
+  serio), el `PUT` sí se aplica y de paso limpia los `producto_atributos`/`Variante` huérfanos que hubiera
+  configurados, para no dejar variantes fantasma si más adelante se reactiva. El frontend, si el `PUT`
+  falla por este motivo, vuelve a tildar el checkbox "¿Tiene variantes?" (estaba destildado en el intento
+  fallido) para reflejar el estado real que quedó en la base.
 
 ## Importación de Excel (`backend/app/routers/importacion.py`)
 

@@ -36,6 +36,30 @@ def actualizar(producto_id: int, producto: schemas.ProductoUpdate, db: Session =
     data = producto.model_dump(exclude_unset=True)
     if data.get("categoria_id") is not None and not db.get(models.Categoria, data["categoria_id"]):
         raise HTTPException(400, "La categoría indicada no existe.")
+
+    # Desactivar variantes en un producto que ya tiene trazabilidad de compras/ventas por variante
+    # perdería esa trazabilidad sin forma de recuperarla — se bloquea directamente en vez de permitirlo
+    # con confirmación, para que no se pueda perder sin querer con un solo click.
+    if data.get("tiene_variantes") is False and obj.tiene_variantes:
+        tiene_compras = db.query(models.Compra).filter(models.Compra.producto_id == producto_id).first() is not None
+        tiene_ventas = (
+            db.query(models.Movimiento)
+            .filter(models.Movimiento.producto_id == producto_id, models.Movimiento.tipo == "Venta")
+            .first()
+            is not None
+        )
+        if tiene_compras or tiene_ventas:
+            raise HTTPException(
+                400,
+                "Este producto tiene compras o ventas registradas por variante. No se puede desactivar "
+                "variantes sin perder esa trazabilidad de stock/costo. Borrá esos registros primero si "
+                "estás segura de que querés sacarle las variantes.",
+            )
+        # sin compras ni ventas de por medio, la configuración de atributos/variantes queda huérfana:
+        # se limpia para no dejar variantes fantasma si más adelante se vuelve a activar
+        db.query(models.Variante).filter(models.Variante.producto_id == producto_id).delete()
+        db.query(models.ProductoAtributo).filter(models.ProductoAtributo.producto_id == producto_id).delete()
+
     for k, v in data.items():
         setattr(obj, k, v)
     db.commit()
@@ -54,6 +78,80 @@ def borrar(producto_id: int, db: Session = Depends(get_db)):
 
 
 # --- Variantes: atributos que aplican al producto (y su orden) + generación de la grilla ---
+#
+# `_set_atributos` y `_generar_variantes` no hacen commit — así se pueden reusar tanto desde los
+# endpoints de dos pasos (usados por la edición de un producto existente) como desde el alta atómica
+# de un producto nuevo con variantes (`POST /productos/con-variantes`), donde todo tiene que quedar
+# adentro de una única transacción.
+
+def _set_atributos(db: Session, producto_id: int, atributos: list[schemas.ProductoAtributoIn]) -> dict:
+    atributos_map = {}
+    for item in atributos:
+        atributo = db.get(models.Atributo, item.atributo_id)
+        if not atributo:
+            raise HTTPException(400, f"El atributo {item.atributo_id} no existe.")
+        atributos_map[item.atributo_id] = atributo
+
+    db.query(models.ProductoAtributo).filter(models.ProductoAtributo.producto_id == producto_id).delete()
+    for item in atributos:
+        db.add(models.ProductoAtributo(producto_id=producto_id, atributo_id=item.atributo_id, orden=item.orden))
+    db.flush()
+    return atributos_map
+
+
+def _generar_variantes(db: Session, producto_id: int, selecciones: list[schemas.SeleccionAtributo]) -> None:
+    if not selecciones:
+        raise HTTPException(400, "Elegí al menos un atributo con sus valores para generar variantes.")
+
+    atributos_producto = {
+        pa.atributo_id
+        for pa in db.query(models.ProductoAtributo).filter(models.ProductoAtributo.producto_id == producto_id).all()
+    }
+    for sel in selecciones:
+        if sel.atributo_id not in atributos_producto:
+            raise HTTPException(400, f"El atributo {sel.atributo_id} no está configurado para este producto.")
+        if not sel.valor_ids:
+            raise HTTPException(400, "Cada atributo seleccionado necesita al menos un valor.")
+        validos = {
+            vid
+            for (vid,) in db.query(models.ValorAtributo.id)
+            .filter(models.ValorAtributo.atributo_id == sel.atributo_id, models.ValorAtributo.id.in_(sel.valor_ids))
+            .all()
+        }
+        faltantes = set(sel.valor_ids) - validos
+        if faltantes:
+            raise HTTPException(400, f"Valores inválidos para el atributo {sel.atributo_id}: {sorted(faltantes)}")
+
+    # una combinación por cada iteración del producto cartesiano; resolver_o_crear_variante
+    # se encarga de no duplicar ni pisar combinaciones ya existentes (con stock o sin stock)
+    listas_valores = [sel.valor_ids for sel in selecciones]
+    for combinacion in itertools.product(*listas_valores):
+        calculations.resolver_o_crear_variante(db, producto_id, list(combinacion))
+
+
+@router.post("/con-variantes", response_model=schemas.Producto)
+def crear_con_variantes(payload: schemas.ProductoConVariantesCreate, db: Session = Depends(get_db)):
+    """Alta atómica de un producto nuevo CON variantes: producto + producto_atributos + variantes
+    quedan todos en la misma transacción — si algo falla a mitad de camino no queda un producto a
+    medio configurar. Reusa la misma lógica que los endpoints de dos pasos usados por la edición."""
+    if not payload.producto.tiene_variantes:
+        raise HTTPException(400, "tiene_variantes debe ser true para usar este endpoint.")
+    if payload.producto.categoria_id is not None and not db.get(models.Categoria, payload.producto.categoria_id):
+        raise HTTPException(400, "La categoría indicada no existe.")
+    if not payload.atributos:
+        raise HTTPException(400, "Elegí al menos un atributo para este producto.")
+
+    obj = models.Producto(**payload.producto.model_dump())
+    db.add(obj)
+    db.flush()  # obj.id disponible sin comprometer la transacción todavía
+
+    _set_atributos(db, obj.id, payload.atributos)
+    _generar_variantes(db, obj.id, payload.selecciones)
+
+    db.commit()
+    db.refresh(obj)
+    return obj
+
 
 @router.post("/{producto_id}/atributos", response_model=list[dict])
 def set_atributos(producto_id: int, payload: schemas.ProductoAtributosRequest, db: Session = Depends(get_db)):
@@ -63,16 +161,7 @@ def set_atributos(producto_id: int, payload: schemas.ProductoAtributosRequest, d
     if not producto.tiene_variantes:
         raise HTTPException(400, "El producto no tiene variantes habilitadas (tiene_variantes=False).")
 
-    atributos_map = {}
-    for item in payload.atributos:
-        atributo = db.get(models.Atributo, item.atributo_id)
-        if not atributo:
-            raise HTTPException(400, f"El atributo {item.atributo_id} no existe.")
-        atributos_map[item.atributo_id] = atributo
-
-    db.query(models.ProductoAtributo).filter(models.ProductoAtributo.producto_id == producto_id).delete()
-    for item in payload.atributos:
-        db.add(models.ProductoAtributo(producto_id=producto_id, atributo_id=item.atributo_id, orden=item.orden))
+    atributos_map = _set_atributos(db, producto_id, payload.atributos)
     db.commit()
 
     filas = (
@@ -139,33 +228,8 @@ def generar_variantes(producto_id: int, payload: schemas.GenerarVariantesRequest
         raise HTTPException(404, "Producto no encontrado.")
     if not producto.tiene_variantes:
         raise HTTPException(400, "El producto no tiene variantes habilitadas (tiene_variantes=False).")
-    if not payload.selecciones:
-        raise HTTPException(400, "Elegí al menos un atributo con sus valores para generar variantes.")
 
-    atributos_producto = {
-        pa.atributo_id
-        for pa in db.query(models.ProductoAtributo).filter(models.ProductoAtributo.producto_id == producto_id).all()
-    }
-    for sel in payload.selecciones:
-        if sel.atributo_id not in atributos_producto:
-            raise HTTPException(400, f"El atributo {sel.atributo_id} no está configurado para este producto.")
-        if not sel.valor_ids:
-            raise HTTPException(400, "Cada atributo seleccionado necesita al menos un valor.")
-        validos = {
-            vid
-            for (vid,) in db.query(models.ValorAtributo.id)
-            .filter(models.ValorAtributo.atributo_id == sel.atributo_id, models.ValorAtributo.id.in_(sel.valor_ids))
-            .all()
-        }
-        faltantes = set(sel.valor_ids) - validos
-        if faltantes:
-            raise HTTPException(400, f"Valores inválidos para el atributo {sel.atributo_id}: {sorted(faltantes)}")
-
-    # una combinación por cada iteración del producto cartesiano; resolver_o_crear_variante
-    # se encarga de no duplicar ni pisar combinaciones ya existentes (con stock o sin stock)
-    listas_valores = [sel.valor_ids for sel in payload.selecciones]
-    for combinacion in itertools.product(*listas_valores):
-        calculations.resolver_o_crear_variante(db, producto_id, list(combinacion))
+    _generar_variantes(db, producto_id, payload.selecciones)
     db.commit()
 
     return listar_variantes(producto_id, db)
