@@ -176,3 +176,48 @@ class VarianteValor(Base):
 
     variante = relationship("Variante", back_populates="valores")
     valor_atributo = relationship("ValorAtributo")
+
+
+# ---------------------------------------------------------------------------
+# Configuración del negocio: fila única (singleton, id fijo = 1) con los
+# "números mágicos" que antes eran constantes de módulo hardcodeadas en
+# calculations.py. Ver get_configuracion() ahí, y la sección correspondiente
+# en CLAUDE.md para el detalle de qué controla cada campo y sus defaults.
+# ---------------------------------------------------------------------------
+class Configuracion(Base):
+    __tablename__ = "configuracion"
+
+    id = Column(Integer, primary_key=True, default=1)
+    demanda_ventana_dias = Column(Integer, nullable=False, default=90)
+    lead_time_default_dias = Column(Integer, nullable=False, default=7)
+    safety_days = Column(Integer, nullable=False, default=3)
+    stock_dias_verde = Column(Integer, nullable=False, default=30)
+    stock_dias_rojo = Column(Integer, nullable=False, default=7)
+    rotacion_alerta_dias = Column(Integer, nullable=False, default=90)
+    umbral_cambio_costo_pct = Column(Numeric(5, 2), nullable=False, default=2.0)
+    renegociacion_margen_umbral_pct = Column(Numeric(5, 2), nullable=False, default=15.0)
+    renegociacion_percentil_volumen = Column(Numeric(4, 3), nullable=False, default=0.7)
+    motor_decoracion_pareto_pct = Column(Numeric(5, 2), nullable=False, default=80.0)
+    mix_real_ventana_dias_default = Column(Integer, nullable=False, default=30)
+    snapshot_periodo_dias = Column(Integer, nullable=False, default=30)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+# ---------------------------------------------------------------------------
+# Snapshot periódico del mix real (% de facturación) de cada producto activo,
+# para poder graficar su evolución en el tiempo. `producto_id` es nullable y
+# `producto_nombre`/`categoria_nombre` se guardan como texto plano (no FK de
+# lectura) a propósito: el histórico tiene que seguir siendo legible aunque el
+# producto se borre, se renombre o cambie de categoría más adelante.
+# ---------------------------------------------------------------------------
+class MixSnapshot(Base):
+    __tablename__ = "mix_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    fecha = Column(DateTime(timezone=True), nullable=False, default=_now_utc)
+    ventana_dias = Column(Integer, nullable=False)
+    producto_id = Column(Integer, ForeignKey("productos.id", ondelete="SET NULL"), nullable=True)
+    producto_nombre = Column(String(150), nullable=False)
+    categoria_nombre = Column(String(100), nullable=True)
+    mix_pct = Column(Numeric(6, 3), nullable=False)
+    facturacion = Column(Numeric(12, 2), nullable=False)

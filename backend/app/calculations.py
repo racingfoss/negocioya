@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from statistics import median
 from typing import Optional
 
@@ -8,13 +8,24 @@ from sqlalchemy.orm import Session, joinedload
 
 from . import models
 
-# Ventana usada para estimar la demanda media diaria (Days-of-Cover).
-# 90 días es un buen equilibrio para un negocio chico: suficiente historial
-# para no ser ruido, pero sensible a estacionalidad reciente.
-DEMANDA_VENTANA_DIAS = 90
-LEAD_TIME_DEFAULT_DIAS = 7  # plazo de reposición asumido si el producto no tiene uno configurado
-SAFETY_DAYS = 3  # colchón fijo simple (no estadístico) sumado al lead time
-UMBRAL_CAMBIO_COSTO_PCT = 2.0  # a partir de qué % de cambio en el costo promedio se avisa
+
+# ---------------------------------------------------------------------------
+# Configuración del negocio: fila única (singleton, id fijo = 1). Reemplaza a
+# los "números mágicos" que antes eran constantes de módulo acá mismo
+# (DEMANDA_VENTANA_DIAS, LEAD_TIME_DEFAULT_DIAS, SAFETY_DAYS,
+# UMBRAL_CAMBIO_COSTO_PCT, y varios hardcodeados sueltos en Stock/Análisis) —
+# ver la tabla completa y sus defaults en CLAUDE.md. Se crea con esos mismos
+# defaults en el primer uso (bootstrap), así que aplicar esto no cambia ningún
+# comportamiento hasta que la usuaria edite algo desde Configuración.
+# ---------------------------------------------------------------------------
+def get_configuracion(db: Session) -> models.Configuracion:
+    config = db.get(models.Configuracion, 1)
+    if not config:
+        config = models.Configuracion(id=1)
+        db.add(config)
+        db.commit()
+        db.refresh(config)
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +75,8 @@ def simular_compra(db: Session, producto_id: int, cantidad: int, costo_unitario:
     if not producto:
         return None
 
+    umbral_cambio_costo_pct = float(get_configuracion(db).umbral_cambio_costo_pct)
+
     compras = db.query(models.Compra).filter(models.Compra.producto_id == producto_id).all()
     total_unidades_actual = sum(c.cantidad for c in compras)
     total_costo_actual = sum(float(c.cantidad) * float(c.costo_unitario) for c in compras)
@@ -105,7 +118,7 @@ def simular_compra(db: Session, producto_id: int, cantidad: int, costo_unitario:
         "diferencia_vs_ultima_compra_pct": diferencia_vs_ultima_compra_pct,
         "diferencia_vs_promedio_pct": diferencia_vs_promedio_pct,
         "supera_umbral": (
-            diferencia_vs_ultima_compra_pct is not None and abs(diferencia_vs_ultima_compra_pct) > UMBRAL_CAMBIO_COSTO_PCT
+            diferencia_vs_ultima_compra_pct is not None and abs(diferencia_vs_ultima_compra_pct) > umbral_cambio_costo_pct
         ),
         "precio_venta_actual": precio_actual,
         "precio_venta_sugerido": precio_sugerido,
@@ -449,23 +462,27 @@ def _fifo_dias_en_stock(compras: list, vendido: int, hoy: date) -> Optional[int]
     return None  # todo el stock comprado ya se vendió (o no hay compras)
 
 
-def _estado_stock(stock_actual: int, dias_cobertura: Optional[float], umbral_reposicion: int) -> tuple[str, bool]:
+def _estado_stock(
+    stock_actual: int, dias_cobertura: Optional[float], umbral_reposicion: int,
+    dias_verde: int, dias_rojo: int,
+) -> tuple[str, bool]:
     if stock_actual <= 0:
         return "Sin stock", True
     if dias_cobertura is None:
         return "Sin ventas recientes", False
     necesita_reponer = dias_cobertura <= umbral_reposicion
-    if dias_cobertura < 7:
+    if dias_cobertura < dias_rojo:
         return "Crítico", True
-    if dias_cobertura <= 30:
+    if dias_cobertura <= dias_verde:
         return "Próximo a agotarse" if necesita_reponer else "Atención", necesita_reponer
     return "OK", False
 
 
 def stock_por_producto(db: Session) -> list:
+    config = get_configuracion(db)
     productos = db.query(models.Producto).filter(models.Producto.activo.is_(True)).all()
     ventas_total = unidades_vendidas_por_producto(db, dias=None)
-    ventas_ventana = unidades_vendidas_por_producto(db, dias=DEMANDA_VENTANA_DIAS)
+    ventas_ventana = unidades_vendidas_por_producto(db, dias=config.demanda_ventana_dias)
     hoy = date.today()
 
     resultado = []
@@ -475,13 +492,15 @@ def stock_por_producto(db: Session) -> list:
         total_vendido = ventas_total.get(p.id, 0)
         stock_actual = total_comprado - total_vendido
         dias_en_stock = _fifo_dias_en_stock(compras, total_vendido, hoy) if stock_actual > 0 else None
-        alerta_rotacion = dias_en_stock is not None and dias_en_stock > 90
+        alerta_rotacion = dias_en_stock is not None and dias_en_stock > config.rotacion_alerta_dias
 
         vendido_ventana = ventas_ventana.get(p.id, 0)
-        demanda_media_diaria = round(vendido_ventana / DEMANDA_VENTANA_DIAS, 3)
+        demanda_media_diaria = round(vendido_ventana / config.demanda_ventana_dias, 3)
         dias_cobertura = round(stock_actual / demanda_media_diaria, 1) if demanda_media_diaria > 0 else None
-        umbral_reposicion = (p.lead_time_dias or LEAD_TIME_DEFAULT_DIAS) + SAFETY_DAYS
-        estado_stock, necesita_reponer = _estado_stock(stock_actual, dias_cobertura, umbral_reposicion)
+        umbral_reposicion = (p.lead_time_dias or config.lead_time_default_dias) + config.safety_days
+        estado_stock, necesita_reponer = _estado_stock(
+            stock_actual, dias_cobertura, umbral_reposicion, config.stock_dias_verde, config.stock_dias_rojo
+        )
 
         resultado.append({
             "producto_id": p.id,
@@ -495,7 +514,7 @@ def stock_por_producto(db: Session) -> list:
             "alerta_rotacion_90_dias": alerta_rotacion,
             "demanda_media_diaria": demanda_media_diaria,
             "dias_cobertura": dias_cobertura,
-            "lead_time_dias": p.lead_time_dias or LEAD_TIME_DEFAULT_DIAS,
+            "lead_time_dias": p.lead_time_dias or config.lead_time_default_dias,
             "estado_stock": estado_stock,
             "necesita_reponer": necesita_reponer,
         })
@@ -505,6 +524,7 @@ def stock_por_producto(db: Session) -> list:
 
 
 def stock_por_categoria(db: Session, rollup: bool = False) -> list:
+    config = get_configuracion(db)
     items = stock_por_producto(db)
     productos_cat = dict(db.query(models.Producto.id, models.Producto.categoria_id).all())
     categorias_todas = {c.id: c for c in db.query(models.Categoria).all()}
@@ -528,7 +548,10 @@ def stock_por_categoria(db: Session, rollup: bool = False) -> list:
             round(c["stock_actual"] / c["demanda_media_diaria"], 1) if c["demanda_media_diaria"] > 0 else None
         )
         c["dias_cobertura"] = dias_cobertura
-        estado, _ = _estado_stock(c["stock_actual"], dias_cobertura, LEAD_TIME_DEFAULT_DIAS + SAFETY_DAYS)
+        estado, _ = _estado_stock(
+            c["stock_actual"], dias_cobertura, config.lead_time_default_dias + config.safety_days,
+            config.stock_dias_verde, config.stock_dias_rojo,
+        )
         c["estado_stock"] = estado
 
     resultado.sort(key=lambda x: (x["dias_cobertura"] is None, x["dias_cobertura"] if x["dias_cobertura"] is not None else 9999))
@@ -543,9 +566,10 @@ def stock_por_categoria(db: Session, rollup: bool = False) -> list:
 # dan el total correcto sin necesidad de reescribirlos.
 # ---------------------------------------------------------------------------
 def stock_por_variante(db: Session) -> list:
+    config = get_configuracion(db)
     variantes = db.query(models.Variante).filter(models.Variante.activo.is_(True)).all()
     ventas_total = unidades_vendidas_por_variante(db, dias=None)
-    ventas_ventana = unidades_vendidas_por_variante(db, dias=DEMANDA_VENTANA_DIAS)
+    ventas_ventana = unidades_vendidas_por_variante(db, dias=config.demanda_ventana_dias)
     hoy = date.today()
 
     resultado = []
@@ -555,14 +579,16 @@ def stock_por_variante(db: Session) -> list:
         total_vendido = ventas_total.get(v.id, 0)
         stock_actual = total_comprado - total_vendido
         dias_en_stock = _fifo_dias_en_stock(compras, total_vendido, hoy) if stock_actual > 0 else None
-        alerta_rotacion = dias_en_stock is not None and dias_en_stock > 90
+        alerta_rotacion = dias_en_stock is not None and dias_en_stock > config.rotacion_alerta_dias
 
         vendido_ventana = ventas_ventana.get(v.id, 0)
-        demanda_media_diaria = round(vendido_ventana / DEMANDA_VENTANA_DIAS, 3)
+        demanda_media_diaria = round(vendido_ventana / config.demanda_ventana_dias, 3)
         dias_cobertura = round(stock_actual / demanda_media_diaria, 1) if demanda_media_diaria > 0 else None
-        lead_time = v.producto.lead_time_dias or LEAD_TIME_DEFAULT_DIAS
-        umbral_reposicion = lead_time + SAFETY_DAYS
-        estado_stock, necesita_reponer = _estado_stock(stock_actual, dias_cobertura, umbral_reposicion)
+        lead_time = v.producto.lead_time_dias or config.lead_time_default_dias
+        umbral_reposicion = lead_time + config.safety_days
+        estado_stock, necesita_reponer = _estado_stock(
+            stock_actual, dias_cobertura, umbral_reposicion, config.stock_dias_verde, config.stock_dias_rojo
+        )
 
         resultado.append({
             "variante_id": v.id,
@@ -719,6 +745,11 @@ def contribucion_por_categoria(db: Session, dias: Optional[int] = None, rollup: 
 # costos fijos cargados, usa la regla de Pareto (80% del margen acumulado).
 # ---------------------------------------------------------------------------
 def analisis_combinado(db: Session, dias: int = 30, rollup: bool = False) -> dict:
+    config = get_configuracion(db)
+    margen_umbral_pct = float(config.renegociacion_margen_umbral_pct)
+    percentil_volumen = float(config.renegociacion_percentil_volumen)
+    pareto_pct = float(config.motor_decoracion_pareto_pct) / 100
+
     bcg = matriz_bcg(db, dias=dias)
     if "error" in bcg:
         return bcg
@@ -739,14 +770,16 @@ def analisis_combinado(db: Session, dias: int = 30, rollup: bool = False) -> dic
 
     volumenes_ordenados = sorted(i["volumen"] for i in productos_out)
     if volumenes_ordenados:
-        idx_p70 = min(int(len(volumenes_ordenados) * 0.7), len(volumenes_ordenados) - 1)
+        idx_p70 = min(int(len(volumenes_ordenados) * percentil_volumen), len(volumenes_ordenados) - 1)
         percentil_70_volumen = volumenes_ordenados[idx_p70]
     else:
         percentil_70_volumen = 0
 
     for item in productos_out:
         item["pct_del_margen_total"] = round(item["margen_generado"] / total_margen * 100, 1) if total_margen else 0
-        item["candidato_renegociacion"] = item["margen_pct"] < 15 and item["volumen"] >= percentil_70_volumen and item["volumen"] > 0
+        item["candidato_renegociacion"] = (
+            item["margen_pct"] < margen_umbral_pct and item["volumen"] >= percentil_70_volumen and item["volumen"] > 0
+        )
 
     # rollup por categoría, con conteo de cuadrantes BCG
     categorias_map: dict = {}
@@ -772,7 +805,7 @@ def analisis_combinado(db: Session, dias: int = 30, rollup: bool = False) -> dic
         if costos_fijos_total > 0:
             c["clasificacion"] = "Motor" if acumulado < costos_fijos_total else "Decoración"
         else:
-            c["clasificacion"] = "Motor" if acumulado < total_margen * 0.8 else "Decoración"
+            c["clasificacion"] = "Motor" if acumulado < total_margen * pareto_pct else "Decoración"
         acumulado += c["margen_generado"]
 
     return {
@@ -784,3 +817,62 @@ def analisis_combinado(db: Session, dias: int = 30, rollup: bool = False) -> dic
         "productos": productos_out,
         "categorias": categorias_out,
     }
+
+
+# ---------------------------------------------------------------------------
+# Snapshots del mix real: una foto periódica de facturacion_por_producto (la
+# MISMA función que usa el modo "real" del Punto de Equilibrio, no se duplica
+# lógica) para poder graficar la evolución del mix% en el tiempo.
+#
+# Detección "lazy" (sin scheduler/cron nuevo): en vez de programar una tarea
+# periódica, se revisa en cada apertura de las pantallas de rutina (Dashboard:
+# /dashboard/resumen y /dashboard/punto-equilibrio) si ya pasó el período
+# configurado desde el último snapshot, y si es así se toma uno. No hace falta
+# que sea puntual al día exacto — alcanza con que se dispare la primera vez que
+# se detecta que ya tocaba. Se eligió este enfoque en vez de un cron real
+# porque el proyecto no tiene infraestructura de tareas en segundo plano
+# (no hay Celery/APScheduler ni un worker separado), y para un negocio
+# unipersonal que abre la app todos los días alcanza de sobra: el "atraso"
+# máximo es de un día de uso, no semanas.
+# ---------------------------------------------------------------------------
+def tomar_snapshot_mix(db: Session) -> list[models.MixSnapshot]:
+    config = get_configuracion(db)
+    ventana_dias = config.snapshot_periodo_dias
+    facturacion = facturacion_por_producto(db, dias=ventana_dias)
+    total = sum(facturacion.values())
+    if total <= 0:
+        return []
+
+    productos = db.query(models.Producto).filter(models.Producto.activo.is_(True)).all()
+    ahora = datetime.now(timezone.utc)
+    creados = []
+    for p in productos:
+        monto = facturacion.get(p.id, 0.0)
+        if monto <= 0:
+            continue
+        snap = models.MixSnapshot(
+            fecha=ahora,
+            ventana_dias=ventana_dias,
+            producto_id=p.id,
+            producto_nombre=p.nombre,
+            categoria_nombre=p.categoria.nombre if p.categoria else None,
+            mix_pct=round(monto / total * 100, 3),
+            facturacion=round(monto, 2),
+        )
+        db.add(snap)
+        creados.append(snap)
+    db.commit()
+    for s in creados:
+        db.refresh(s)
+    return creados
+
+
+def verificar_y_tomar_snapshot_si_corresponde(db: Session) -> None:
+    config = get_configuracion(db)
+    ultimo = db.query(models.MixSnapshot).order_by(models.MixSnapshot.fecha.desc()).first()
+    if ultimo is None:
+        tomar_snapshot_mix(db)
+        return
+    proximo_vencimiento = ultimo.fecha + timedelta(days=config.snapshot_periodo_dias)
+    if datetime.now(timezone.utc) >= proximo_vencimiento:
+        tomar_snapshot_mix(db)

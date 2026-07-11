@@ -54,6 +54,10 @@ Tres entidades separadas a propósito, no es sobre-ingeniería:
 - **`atributos` / `valores_atributo` / `producto_atributos` / `variantes` / `variante_valores`**: patrón
   Atributo + Valor + Variante (Shopify/VTEX) para talle/color/etc definidos por la usuaria. Ver sección
   "Variantes de producto" más abajo.
+- **`configuracion`**: fila única (singleton) con los "números mágicos" de `calculations.py`, editable
+  desde la pantalla ⚙️ Configuración. Ver sección "Configuración del negocio" más abajo.
+- **`mix_snapshots`**: histórico de fotos periódicas del mix% real de facturación, para graficar su
+  evolución. Ver sección "Snapshots del mix real" más abajo.
 
 ## Decisiones de negocio importantes (no reinventar sin releer esto)
 
@@ -268,6 +272,68 @@ columnas fijas.
     `openpyxl`: agrega una columna al header por cada `Atributo` que exista en el momento de la descarga,
     y completa 1-2 filas de ejemplo con valores reales ya cargados en `valores_atributo` (no inventados).
 
+## Configuración del negocio (`configuracion`, singleton)
+
+Los "números mágicos" que antes eran constantes de módulo hardcodeadas en `calculations.py`
+(`DEMANDA_VENTANA_DIAS`, `LEAD_TIME_DEFAULT_DIAS`, `SAFETY_DAYS`, `UMBRAL_CAMBIO_COSTO_PCT`, y varios
+hardcodeados sueltos en Stock/Análisis) ahora viven en una fila única de la tabla `configuracion` (id
+fijo = 1), editable desde la pantalla ⚙️ Configuración sin reiniciar nada. `calculations.get_configuracion(db)`
+devuelve esa fila, creándola con los defaults de abajo la primera vez que se necesita (bootstrap, no hace
+falta migración de datos ni tocar nada al actualizar). Ninguna fórmula de negocio cambió — solo de dónde
+sale el número.
+
+| Campo | Default | Qué controla |
+|---|---|---|
+| `demanda_ventana_dias` | 90 | Ventana (días) para calcular demanda media diaria (Days-of-Cover), en `stock_por_producto`/`stock_por_variante`. |
+| `lead_time_default_dias` | 7 | Plazo de reposición asumido cuando el producto no tiene `lead_time_dias` propio cargado. |
+| `safety_days` | 3 | Colchón fijo sumado al lead time antes de marcar `necesita_reponer`. |
+| `stock_dias_verde` | 30 | Por encima de estos días de cobertura, estado "OK" (verde) en `_estado_stock`. |
+| `stock_dias_rojo` | 7 | Por debajo de estos días de cobertura, estado "Crítico" (rojo) en `_estado_stock`. |
+| `rotacion_alerta_dias` | 90 | A partir de cuántos días sin venderse se marca una prenda como estancada (alerta FIFO en `stock_por_producto`). |
+| `umbral_cambio_costo_pct` | 2.0 | % de cambio de costo (vs. última compra) que dispara el aviso de "¿actualizamos precio de venta?" en `simular_compra` y en la Importación de Excel. |
+| `renegociacion_margen_umbral_pct` | 15.0 | Margen% por debajo del cual un producto es candidato a "renegociación" en `analisis_combinado`. |
+| `renegociacion_percentil_volumen` | 0.7 | Percentil de volumen (0 a 1) que además tiene que cumplir ese producto para contar como candidato. |
+| `motor_decoracion_pareto_pct` | 80.0 | % de Pareto usado como fallback de "Motor vs Decoración" en `analisis_combinado` cuando no hay costos fijos cargados. |
+| `mix_real_ventana_dias_default` | 30 | Solo afecta al frontend: con cuántos días viene tildado por defecto el selector de ventana al abrir el Punto de Equilibrio (el selector 7/30/90 sigue existiendo igual, esto no lo reemplaza). |
+| `snapshot_periodo_dias` | 30 | Cada cuántos días corresponde tomar un snapshot del mix real (ver sección siguiente). |
+
+`GET /configuracion` devuelve la fila (la crea si no existe); `PUT /configuracion` actualiza los campos
+que se manden (`exclude_unset`, así que se puede mandar solo el campo que cambia).
+
+## Snapshots del mix real (`mix_snapshots`)
+
+Guarda una foto periódica del mix% real de facturación de cada producto activo (misma función
+`facturacion_por_producto` que usa el modo "real" del Punto de Equilibrio — no se duplica lógica), para
+poder graficar su evolución en el tiempo desde el Dashboard. `producto_id` es nullable y
+`producto_nombre`/`categoria_nombre` se guardan como texto plano (no se leen por join) a propósito: el
+histórico tiene que seguir siendo legible aunque el producto se borre, se renombre o cambie de categoría
+más adelante.
+
+- **Detección "lazy", sin scheduler/cron nuevo**: en vez de agregar infraestructura de tareas en segundo
+  plano (Celery, APScheduler, un worker separado — nada de eso existe hoy en el proyecto), cada apertura
+  de las pantallas de rutina (`GET /dashboard/resumen` y `GET /dashboard/punto-equilibrio`) dispara
+  `calculations.verificar_y_tomar_snapshot_si_corresponde(db)` como
+  [BackgroundTask](https://fastapi.tiangolo.com/tutorial/background-tasks/) de FastAPI (no bloquea la
+  respuesta del endpoint). Esa función mira cuándo fue el último snapshot y, si ya pasaron
+  `snapshot_periodo_dias` (o si nunca se tomó ninguno), toma uno nuevo. No hace falta que sea puntual al
+  día exacto — alcanza con que se dispare la primera vez que se detecta que ya tocaba. Para un negocio
+  unipersonal que abre la app todos los días, el atraso máximo real es de un día de uso, no semanas, así
+  que no se justificaba la complejidad de un scheduler de verdad.
+- El `BackgroundTask` abre su propia sesión de base (`SessionLocal()` en `routers/dashboard.py`) en vez de
+  reusar la del request, porque para cuando corre el background task la sesión del request ya se cerró.
+- `POST /mix-snapshots/tomar` fuerza un snapshot ahora mismo (para la usuaria, o para pruebas), sin
+  importar si "tocaba" según el período configurado.
+- `GET /mix-snapshots?producto_id=&categoria=` devuelve el historial ordenado por fecha, opcionalmente
+  filtrado.
+- Un producto activo sin facturación en la ventana simplemente no genera fila ese día (no tiene sentido
+  graficar 0% mix indefinidamente para productos que no rotan).
+- **Frontend (`Dashboard.jsx`)**: agrupa las filas devueltas por `GET /mix-snapshots` por el **timestamp
+  exacto** de cada tanda (todas las filas de una misma "tomada" comparten el mismo `fecha` al
+  milisegundo, ver `tomar_snapshot_mix`), nunca por día truncado — si se agrupara por día, dos snapshots
+  tomados el mismo día (ej. el automático y uno manual) sumarían sus mix% en un solo punto e inflarían el
+  total por encima de 100%. Las categorías se acotan a las 8 con más mix% acumulado (paleta categórica
+  fija de 8 colores) y el resto se agrupa en "Otras" en vez de generar más colores.
+
 ## Convenciones de código
 
 - **Backend**: nombres de tablas, campos, funciones y mensajes de error en español. Sin Alembic (ver nota
@@ -302,6 +368,22 @@ columnas fijas.
   server distinto de donde se abre el navegador (este es el caso real: VM Alpine sobre Hyper-V), hay que
   setear `VITE_API_URL` a la IP/dominio real del server en un archivo `.env` en la raíz del repo, si no
   el frontend intenta pegarle a `localhost` del lado del navegador y falla en silencio.
+
+## Testing
+
+No intentes verificación visual con navegador (chromium-cli, Playwright, Claude in Chrome, ni instalar
+chromium/chromium-browser vía apk u otro gestor) bajo ninguna circunstancia. Este proyecto corre en una
+VM Alpine headless sin entorno gráfico — no hay forma de que un navegador real ande ahí, y el intento
+de instalarlo/usarlo solo quema tiempo y tokens sin resultado útil.
+
+Para verificar cambios de backend: probá contra la API real con curl o scripts Python (como ya se viene
+haciendo en todo este proyecto) — levantá el stack con docker compose, pegale a los endpoints, confirmá
+las respuestas.
+
+Para verificar cambios de frontend: no se puede confirmar visualmente en esta sesión. Asumí que el
+build sin errores (`docker compose exec frontend ...` o el chequeo de compilación que ya hacés) es
+suficiente para dar el cambio por terminado, y avisame explícitamente qué pantalla y qué flujo tengo
+que probar yo a mano en mi navegador antes de dar el cambio por bueno.
 
 ## Ideas mencionadas pero no implementadas (posibles próximos pasos)
 

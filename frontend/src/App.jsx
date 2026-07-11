@@ -4,6 +4,7 @@ import Atributos from './pages/Atributos'
 import BCG from './pages/BCG'
 import Categorias from './pages/Categorias'
 import Compras from './pages/Compras'
+import Configuracion from './pages/Configuracion'
 import CostosFijos from './pages/CostosFijos'
 import Dashboard from './pages/Dashboard'
 import Importar from './pages/Importar'
@@ -22,6 +23,7 @@ const links = [
   { to: '/costos-fijos', label: '🔧 Estructura Fija' },
   { to: '/bcg', label: '🎯 Análisis' },
   { to: '/sell-through', label: '📈 Stock' },
+  { to: '/configuracion', label: '⚙️ Configuración' },
 ]
 
 function App() {
@@ -57,6 +59,7 @@ function App() {
             <Route path="/costos-fijos" element={<CostosFijos />} />
             <Route path="/bcg" element={<BCG />} />
             <Route path="/sell-through" element={<SellThrough />} />
+            <Route path="/configuracion" element={<Configuracion />} />
           </Routes>
         </main>
       </div>

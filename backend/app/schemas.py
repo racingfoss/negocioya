@@ -199,3 +199,54 @@ class StockCategoria(BaseModel):
     demanda_media_diaria: float = 0.0
     dias_cobertura: Optional[float] = None
     estado_stock: str = "OK"
+
+
+# --- Configuración del negocio (singleton) ---
+
+class ConfiguracionBase(BaseModel):
+    demanda_ventana_dias: int
+    lead_time_default_dias: int
+    safety_days: int
+    stock_dias_verde: int
+    stock_dias_rojo: int
+    rotacion_alerta_dias: int
+    umbral_cambio_costo_pct: Decimal
+    renegociacion_margen_umbral_pct: Decimal
+    renegociacion_percentil_volumen: Decimal
+    motor_decoracion_pareto_pct: Decimal
+    mix_real_ventana_dias_default: int
+    snapshot_periodo_dias: int
+
+
+class Configuracion(ConfiguracionBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+
+
+class ConfiguracionUpdate(BaseModel):
+    demanda_ventana_dias: Optional[int] = None
+    lead_time_default_dias: Optional[int] = None
+    safety_days: Optional[int] = None
+    stock_dias_verde: Optional[int] = None
+    stock_dias_rojo: Optional[int] = None
+    rotacion_alerta_dias: Optional[int] = None
+    umbral_cambio_costo_pct: Optional[Decimal] = None
+    renegociacion_margen_umbral_pct: Optional[Decimal] = None
+    renegociacion_percentil_volumen: Optional[Decimal] = None
+    motor_decoracion_pareto_pct: Optional[Decimal] = None
+    mix_real_ventana_dias_default: Optional[int] = None
+    snapshot_periodo_dias: Optional[int] = None
+
+
+# --- Snapshots del mix real (para graficar evolución en el tiempo) ---
+
+class MixSnapshot(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    fecha: datetime
+    ventana_dias: int
+    producto_id: Optional[int] = None
+    producto_nombre: str
+    categoria_nombre: Optional[str] = None
+    mix_pct: float
+    facturacion: float

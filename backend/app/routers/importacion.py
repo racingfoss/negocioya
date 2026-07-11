@@ -83,6 +83,8 @@ def descargar_plantilla(db: Session = Depends(get_db)):
 
 @router.post("/procesar")
 async def procesar(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    umbral_cambio_costo_pct = float(calculations.get_configuracion(db).umbral_cambio_costo_pct)
+
     if not file.filename.lower().endswith((".xlsx", ".xlsm")):
         raise HTTPException(400, "El archivo debe ser una planilla Excel (.xlsx).")
 
@@ -360,7 +362,7 @@ async def procesar(file: UploadFile = File(...), db: Session = Depends(get_db)):
                     round((float(costo_final) - costo_ultima_compra) / costo_ultima_compra * 100, 2)
                     if costo_ultima_compra else None
                 )
-                if diferencia_vs_ultima_compra_pct is not None and abs(diferencia_vs_ultima_compra_pct) > calculations.UMBRAL_CAMBIO_COSTO_PCT:
+                if diferencia_vs_ultima_compra_pct is not None and abs(diferencia_vs_ultima_compra_pct) > umbral_cambio_costo_pct:
                     precio_actual = float(producto.precio_venta)
                     cambios_costo.append({
                         "producto_id": producto.id,
