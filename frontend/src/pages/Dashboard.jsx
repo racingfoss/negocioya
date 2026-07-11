@@ -9,12 +9,20 @@ export default function Dashboard() {
   const [resumen, setResumen] = useState(null)
   const [pe, setPe] = useState(null)
   const [contrib, setContrib] = useState(null)
+  const [modoMix, setModoMix] = useState('real')
+  const [diasMix, setDiasMix] = useState(30)
 
   useEffect(() => {
     api.get('/dashboard/resumen').then((r) => setResumen(r.data))
-    api.get('/dashboard/punto-equilibrio').then((r) => setPe(r.data)).catch(() => {})
     api.get('/dashboard/contribucion-categorias').then((r) => setContrib(r.data)).catch(() => {})
   }, [])
+
+  useEffect(() => {
+    api
+      .get('/dashboard/punto-equilibrio', { params: { modo: modoMix, dias: diasMix } })
+      .then((r) => setPe(r.data))
+      .catch(() => {})
+  }, [modoMix, diasMix])
 
   return (
     <div className="space-y-8">
@@ -29,8 +37,45 @@ export default function Dashboard() {
       )}
 
       <div>
-        <h2 className="text-xl font-bold flex items-center gap-2 mb-2">🎯 Punto de Equilibrio Ponderado</h2>
-        {pe?.error && <p className="text-yellow-400">{pe.error}</p>}
+        <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
+          <h2 className="text-xl font-bold flex items-center gap-2">
+            🎯 Punto de Equilibrio Ponderado — {modoMix === 'real' ? `mix real, últimos ${diasMix} días` : 'mix manual'}
+          </h2>
+          <div className="flex items-center gap-2">
+            <select
+              className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2 text-sm"
+              value={modoMix}
+              onChange={(e) => setModoMix(e.target.value)}
+            >
+              <option value="real">Mix real (últimos N días)</option>
+              <option value="manual">Mix manual (catálogo)</option>
+            </select>
+            {modoMix === 'real' && (
+              <select
+                className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2 text-sm"
+                value={diasMix}
+                onChange={(e) => setDiasMix(Number(e.target.value))}
+              >
+                <option value={7}>Últimos 7 días</option>
+                <option value={30}>Últimos 30 días</option>
+                <option value={90}>Últimos 90 días</option>
+              </select>
+            )}
+          </div>
+        </div>
+        {pe?.error && (
+          <div className="bg-[#151b2b] rounded-xl p-5 space-y-2">
+            <p className="text-yellow-400">{pe.error}</p>
+            {modoMix === 'real' && (
+              <button
+                className="text-sm text-blue-400 hover:text-blue-300 underline"
+                onClick={() => setModoMix('manual')}
+              >
+                Cambiar a modo manual
+              </button>
+            )}
+          </div>
+        )}
         {pe && !pe.error && (
           <div className="bg-[#151b2b] rounded-xl p-5 space-y-3">
             <p className="text-gray-400 text-sm">Facturación Mínima Requerida</p>
@@ -39,7 +84,7 @@ export default function Dashboard() {
               Debés vender un mínimo de <b>{pe.unidades_totales_requeridas}</b> prendas mensuales
               {' '}(margen ponderado: {pe.margen_ponderado_pct}%).
             </p>
-            {Math.round(pe.mix_total_pct) !== 100 && (
+            {modoMix === 'manual' && Math.round(pe.mix_total_pct) !== 100 && (
               <p className="text-yellow-400 text-sm">
                 ⚠️ El mix de productos activos suma {pe.mix_total_pct}%, debería sumar 100%.
               </p>
@@ -50,6 +95,7 @@ export default function Dashboard() {
                   <tr className="text-left text-gray-400 border-b border-gray-700">
                     <th className="py-2">Producto</th>
                     <th>Mix (%)</th>
+                    {modoMix === 'real' && <th>Facturación (ventana)</th>}
                     <th>P. Venta ($)</th>
                     <th>Costo ($)</th>
                     <th>Margen (%)</th>
@@ -61,6 +107,7 @@ export default function Dashboard() {
                     <tr key={d.producto_id} className="border-b border-gray-800">
                       <td className="py-2">{d.producto}</td>
                       <td>{d.mix_pct}</td>
+                      {modoMix === 'real' && <td>{fmt(d.facturacion_ventana)}</td>}
                       <td>{fmt(d.precio_venta)}</td>
                       <td>{fmt(d.costo)}</td>
                       <td>{d.margen_pct}%</td>

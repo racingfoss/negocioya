@@ -15,8 +15,8 @@ def resumen(db: Session = Depends(get_db)):
 
 
 @router.get("/punto-equilibrio")
-def punto_equilibrio(db: Session = Depends(get_db)):
-    return calculations.punto_equilibrio_ponderado(db)
+def punto_equilibrio(modo: str = "real", dias: int = 30, db: Session = Depends(get_db)):
+    return calculations.punto_equilibrio_ponderado(db, modo=modo, dias=dias)
 
 
 @router.get("/bcg")

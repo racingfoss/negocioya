@@ -231,8 +231,19 @@ def _nombre_categoria(categoria_id: Optional[int], categorias_todas: dict) -> st
 
 # ---------------------------------------------------------------------------
 # Punto de equilibrio ponderado (mix de productos activos, en $ de facturación)
+#
+# Dos modos para el mix_pct de cada producto:
+# - "real" (default): sale de la facturación real de cada producto en los
+#   últimos `dias` días (Movimiento tipo "Venta"), no de un valor cargado a
+#   mano. Se prefiere sobre el manual porque una vez que hay ventas cargadas,
+#   mantener mix_pct actualizado a mano es una carga extra que nadie va a
+#   sostener semana a semana, y se desactualiza. Un producto sin ventas en la
+#   ventana da 0% (correcto: si no se vendió, no debería pesar en el mix).
+# - "manual": usa producto.mix_pct tal cual está cargado en el Catálogo. Sigue
+#   siendo necesario para productos nuevos sin historial, o para simular
+#   escenarios ("¿y si este producto vendiera más?"). Ver CLAUDE.md.
 # ---------------------------------------------------------------------------
-def punto_equilibrio_ponderado(db: Session) -> dict:
+def punto_equilibrio_ponderado(db: Session, modo: str = "real", dias: int = 30) -> dict:
     productos = db.query(models.Producto).filter(models.Producto.activo.is_(True)).all()
     costos_fijos_total = float(
         db.query(func.coalesce(func.sum(models.CostoFijo.monto), 0)).scalar()
@@ -241,24 +252,44 @@ def punto_equilibrio_ponderado(db: Session) -> dict:
     if not productos:
         return {"error": "No hay productos activos cargados en el catálogo."}
 
-    mix_total = sum(float(p.mix_pct) for p in productos)
+    facturacion_ventana = {}
+    if modo == "real":
+        facturacion_ventana = facturacion_por_producto(db, dias=dias)
+        facturacion_total_ventana = sum(facturacion_ventana.values())
+        if facturacion_total_ventana <= 0:
+            return {
+                "error": f"No hay ventas registradas en los últimos {dias} días. "
+                         "Probá con una ventana más amplia o usá el modo manual."
+            }
+
+    mix_por_producto = {}
+    for p in productos:
+        if modo == "real":
+            mix_por_producto[p.id] = (facturacion_ventana.get(p.id, 0.0) / facturacion_total_ventana) * 100
+        else:
+            mix_por_producto[p.id] = float(p.mix_pct)
+
+    mix_total = sum(mix_por_producto.values())
 
     margen_ponderado = 0.0
     detalle = []
     for p in productos:
         precio = float(p.precio_venta)
         costo = float(p.costo)
-        mix = float(p.mix_pct)
+        mix = mix_por_producto[p.id]
         margen_pct = (precio - costo) / precio if precio else 0
         margen_ponderado += (mix / 100) * margen_pct
-        detalle.append({
+        item = {
             "producto_id": p.id,
             "producto": p.nombre,
-            "mix_pct": mix,
+            "mix_pct": round(mix, 2),
             "precio_venta": precio,
             "costo": costo,
             "margen_pct": round(margen_pct * 100, 2),
-        })
+        }
+        if modo == "real":
+            item["facturacion_ventana"] = round(facturacion_ventana.get(p.id, 0.0), 2)
+        detalle.append(item)
 
     if margen_ponderado <= 0:
         return {"error": "El margen ponderado es cero o negativo. Revisá precios y costos cargados."}
@@ -274,6 +305,8 @@ def punto_equilibrio_ponderado(db: Session) -> dict:
         unidades_totales += item["unidades_requeridas"]
 
     return {
+        "modo": modo,
+        "dias": dias if modo == "real" else None,
         "costos_fijos_total": costos_fijos_total,
         "margen_ponderado_pct": round(margen_ponderado * 100, 2),
         "facturacion_minima_requerida": round(facturacion_minima, 2),
@@ -300,6 +333,28 @@ def unidades_vendidas_por_producto(db: Session, dias: Optional[int] = None) -> d
         q = q.filter(models.Movimiento.fecha >= desde)
     q = q.group_by(models.Movimiento.producto_id)
     return {row.producto_id: int(row.unidades) for row in q.all()}
+
+
+# ---------------------------------------------------------------------------
+# Facturación por producto (ventana de días opcional), para el modo "real" del
+# mix% del Punto de Equilibrio Ponderado. Mismo patrón de query que
+# unidades_vendidas_por_producto, pero sumando `monto` en vez de `cantidad` —
+# función separada a propósito, no se toca unidades_vendidas_por_producto
+# porque la usan BCG, Stock y Sell-through.
+# ---------------------------------------------------------------------------
+def facturacion_por_producto(db: Session, dias: Optional[int] = None) -> dict:
+    q = db.query(
+        models.Movimiento.producto_id,
+        func.coalesce(func.sum(models.Movimiento.monto), 0).label("monto"),
+    ).filter(
+        models.Movimiento.tipo == "Venta",
+        models.Movimiento.producto_id.isnot(None),
+    )
+    if dias:
+        desde = datetime.utcnow() - timedelta(days=dias)
+        q = q.filter(models.Movimiento.fecha >= desde)
+    q = q.group_by(models.Movimiento.producto_id)
+    return {row.producto_id: float(row.monto) for row in q.all()}
 
 
 def unidades_vendidas_por_variante(db: Session, dias: Optional[int] = None) -> dict:

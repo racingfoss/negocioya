@@ -62,6 +62,21 @@ Todas están en `backend/app/calculations.py`, con comentarios explicando el raz
 - **Punto de equilibrio ponderado**: `mix_pct` de cada producto es **% de la facturación** (no de
   unidades vendidas). `facturación_mínima = costos_fijos_totales / margen_ponderado`, y las unidades
   requeridas por producto se derivan de ahí, no al revés.
+- **Punto de equilibrio ponderado — modo "real" vs "manual" del mix%**: `punto_equilibrio_ponderado(db,
+  modo, dias)` soporta dos modos. **"real"** (default): el `mix_pct` de cada producto sale de
+  `facturacion_por_producto(db, dias)` (nueva función en `calculations.py`, mismo patrón de query que
+  `unidades_vendidas_por_producto` pero sumando `monto` en vez de `cantidad` — función separada a
+  propósito, no se tocó `unidades_vendidas_por_producto` porque la usan BCG/Stock/Sell-through) sobre la
+  ventana de días elegida (7/30/90, default 30, mismo patrón que `matriz_bcg`). Se cambió el default de
+  manual a real porque mantener `mix_pct` actualizado a mano una vez que hay ventas reales es una carga
+  que nadie sostiene semana a semana y se desactualiza solo. Un producto sin ventas en la ventana da 0%
+  mix (no error — simplemente no pesa). Si la facturación total de la ventana es 0 (nada vendido en esos
+  días), devuelve `{"error": ...}` en vez de dividir por cero, con sugerencia de ampliar la ventana o usar
+  modo manual. **"manual"**: comportamiento original, usa `producto.mix_pct` cargado a mano — sigue
+  existiendo para productos nuevos sin historial de ventas y para simular escenarios. El banner de "el mix
+  no suma 100%" solo tiene sentido en modo manual (en modo real siempre da ~100% por construcción), así
+  que el frontend (`Dashboard.jsx`) lo oculta en modo real. La respuesta incluye `modo` y `dias` usados
+  para que el frontend los muestre en el título de la sección.
 - **Costo promedio ponderado (PPP)**: cada vez que se crea/edita/borra una `Compra`, se recalcula
   `producto.costo` como promedio ponderado de TODAS las compras de ese producto
   (`recalcular_costo_promedio`). Se eligió sobre FIFO-de-costo porque es mucho más simple de mantener a
