@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .env
 .env.*
+resumesessionClaude.md
+prompt1.md
