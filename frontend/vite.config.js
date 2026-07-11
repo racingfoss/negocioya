@@ -6,5 +6,10 @@ export default defineConfig({
   server: {
     host: true,
     port: 5173,
+    strictPort: true,
+    hmr: {
+      host: 'adorantesoft.local',
+      clientPort: 5173
+    },
   },
 })

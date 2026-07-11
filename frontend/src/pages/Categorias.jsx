@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react'
 import api, { getErrorMessage } from '../api'
+import { aplanarArbol, etiquetaIndentada } from '../utils/categorias'
 
 export default function Categorias() {
   const [categorias, setCategorias] = useState([])
   const [nombre, setNombre] = useState('')
   const [descripcion, setDescripcion] = useState('')
+  const [parentId, setParentId] = useState('')
   const [editId, setEditId] = useState(null)
   const [error, setError] = useState('')
 
@@ -13,16 +15,36 @@ export default function Categorias() {
     cargar()
   }, [])
 
+  const arbol = aplanarArbol(categorias)
+  // al editar, no se puede elegir a sí misma ni a ninguno de sus propios descendientes como padre
+  const descendientesDe = (id) => {
+    const ids = new Set()
+    const recorrer = (actual) => {
+      for (const c of categorias) {
+        if (c.parent_id === actual && !ids.has(c.id)) {
+          ids.add(c.id)
+          recorrer(c.id)
+        }
+      }
+    }
+    recorrer(id)
+    return ids
+  }
+  const excluidos = editId ? new Set([editId, ...descendientesDe(editId)]) : new Set()
+  const opcionesParent = arbol.filter((c) => !excluidos.has(c.id))
+
   const guardar = async () => {
     setError('')
     try {
+      const payload = { nombre, descripcion, parent_id: parentId ? Number(parentId) : null }
       if (editId) {
-        await api.put(`/categorias/${editId}`, { nombre, descripcion })
+        await api.put(`/categorias/${editId}`, payload)
       } else {
-        await api.post('/categorias', { nombre, descripcion })
+        await api.post('/categorias', payload)
       }
       setNombre('')
       setDescripcion('')
+      setParentId('')
       setEditId(null)
       cargar()
     } catch (e) {
@@ -34,6 +56,7 @@ export default function Categorias() {
     setEditId(c.id)
     setNombre(c.nombre)
     setDescripcion(c.descripcion || '')
+    setParentId(c.parent_id || '')
   }
 
   const borrar = async (id) => {
@@ -68,6 +91,18 @@ export default function Categorias() {
           value={descripcion}
           onChange={(e) => setDescripcion(e.target.value)}
         />
+        <select
+          className="w-full bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
+          value={parentId}
+          onChange={(e) => setParentId(e.target.value)}
+        >
+          <option value="">Sin categoría padre (categoría raíz)</option>
+          {opcionesParent.map((c) => (
+            <option key={c.id} value={c.id}>
+              {etiquetaIndentada(c)}
+            </option>
+          ))}
+        </select>
         <div className="flex gap-2">
           <button onClick={guardar} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg font-medium">
             {editId ? 'Guardar cambios' : '+ Añadir Categoría'}
@@ -78,6 +113,7 @@ export default function Categorias() {
                 setEditId(null)
                 setNombre('')
                 setDescripcion('')
+                setParentId('')
               }}
               className="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded-lg"
             >
@@ -91,17 +127,15 @@ export default function Categorias() {
         <table className="w-full text-sm">
           <thead>
             <tr className="text-left text-gray-400 border-b border-gray-700">
-              <th className="py-2">ID</th>
-              <th>Nombre</th>
+              <th className="py-2">Nombre</th>
               <th>Descripción</th>
               <th></th>
             </tr>
           </thead>
           <tbody>
-            {categorias.map((c) => (
+            {arbol.map((c) => (
               <tr key={c.id} className="border-b border-gray-800">
-                <td className="py-2">{c.id}</td>
-                <td>{c.nombre}</td>
+                <td className="py-2">{etiquetaIndentada(c)}</td>
                 <td className="text-gray-400">{c.descripcion}</td>
                 <td className="text-right space-x-2">
                   <button onClick={() => editar(c)} className="text-blue-400 hover:underline">
@@ -115,7 +149,7 @@ export default function Categorias() {
             ))}
             {categorias.length === 0 && (
               <tr>
-                <td colSpan={4} className="text-gray-500 py-4 text-center">
+                <td colSpan={3} className="text-gray-500 py-4 text-center">
                   Todavía no cargaste categorías.
                 </td>
               </tr>

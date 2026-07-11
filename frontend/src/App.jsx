@@ -1,5 +1,6 @@
 import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom'
 
+import Atributos from './pages/Atributos'
 import BCG from './pages/BCG'
 import Categorias from './pages/Categorias'
 import Compras from './pages/Compras'
@@ -17,6 +18,7 @@ const links = [
   { to: '/compras', label: '📦 Compras' },
   { to: '/importar', label: '📥 Importar' },
   { to: '/categorias', label: '🗂️ Categorías' },
+  { to: '/atributos', label: '🏷️ Atributos' },
   { to: '/costos-fijos', label: '🔧 Estructura Fija' },
   { to: '/bcg', label: '🎯 Análisis' },
   { to: '/sell-through', label: '📈 Stock' },
@@ -51,6 +53,7 @@ function App() {
             <Route path="/compras" element={<Compras />} />
             <Route path="/importar" element={<Importar />} />
             <Route path="/categorias" element={<Categorias />} />
+            <Route path="/atributos" element={<Atributos />} />
             <Route path="/costos-fijos" element={<CostosFijos />} />
             <Route path="/bcg" element={<BCG />} />
             <Route path="/sell-through" element={<SellThrough />} />

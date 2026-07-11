@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import api, { getErrorMessage } from '../api'
+import { aplanarArbol, etiquetaIndentada } from '../utils/categorias'
 
 const hoy = () => new Date().toISOString().slice(0, 10)
 const empty = { categoria_id: '', producto_id: '', fecha: hoy(), cantidad: '', costo_unitario: '', proveedor: '' }
@@ -18,6 +19,13 @@ export default function Compras() {
   const [precioSugerido, setPrecioSugerido] = useState(0)
   const [actualizarPrecio, setActualizarPrecio] = useState(true)
 
+  // Selectores en cascada para resolver la variante (si el producto elegido tiene variantes)
+  const [atributosProducto, setAtributosProducto] = useState([])
+  const [variantesProducto, setVariantesProducto] = useState([])
+  const [valoresElegidos, setValoresElegidos] = useState({}) // atributo_id -> valor_id
+  const [edicionVarianteId, setEdicionVarianteId] = useState(null) // variante_id de la compra en edición, para prellenar
+  const [varianteIdOriginal, setVarianteIdOriginal] = useState(null)
+
   const cargar = () => {
     api.get('/compras').then((r) => setCompras(r.data))
     api.get('/productos').then((r) => setProductos(r.data))
@@ -27,14 +35,59 @@ export default function Compras() {
     cargar()
   }, [])
 
+  const categoriasArbol = aplanarArbol(categorias)
   const productosFiltrados = form.categoria_id
     ? productos.filter((p) => String(p.categoria_id) === String(form.categoria_id))
     : productos
+
+  useEffect(() => {
+    const p = productos.find((x) => String(x.id) === String(form.producto_id))
+    setValoresElegidos({})
+    if (p?.tiene_variantes) {
+      Promise.all([
+        api.get(`/productos/${p.id}/atributos`),
+        api.get(`/productos/${p.id}/variantes`),
+      ]).then(([{ data: atribs }, { data: variantes }]) => {
+        setAtributosProducto(atribs)
+        setVariantesProducto(variantes)
+      })
+    } else {
+      setAtributosProducto([])
+      setVariantesProducto([])
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.producto_id])
+
+  // al editar una compra ya cargada, prellenar los selectores con la variante que tenía
+  useEffect(() => {
+    if (edicionVarianteId && variantesProducto.length > 0) {
+      const v = variantesProducto.find((x) => x.id === edicionVarianteId)
+      if (v) {
+        const elegidos = {}
+        v.valores.forEach((x) => { elegidos[x.atributo_id] = x.valor_atributo_id })
+        setValoresElegidos(elegidos)
+      }
+      setEdicionVarianteId(null)
+    }
+  }, [variantesProducto, edicionVarianteId])
+
+  const varianteResuelta =
+    atributosProducto.length > 0 && atributosProducto.every((a) => valoresElegidos[a.atributo_id])
+      ? variantesProducto.find((v) =>
+          atributosProducto.every((a) =>
+            v.valores.some(
+              (x) => x.atributo_id === a.atributo_id && x.valor_atributo_id === Number(valoresElegidos[a.atributo_id])
+            )
+          )
+        )
+      : null
 
   const resetForm = () => {
     setForm({ ...empty, fecha: hoy() })
     setEditId(null)
     setSimulacion(null)
+    setValoresElegidos({})
+    setVarianteIdOriginal(null)
   }
 
   // Paso 1: el usuario aprieta "Registrar Compra" -> simulamos el impacto en el costo promedio
@@ -49,15 +102,20 @@ export default function Compras() {
       guardarCompra(null)
       return
     }
+    if (atributosProducto.length > 0 && !varianteResuelta) {
+      setError('Elegí un valor para cada atributo, así se puede resolver la variante de la compra.')
+      return
+    }
     try {
       const { data } = await api.post('/compras/simular', {
         producto_id: Number(form.producto_id),
+        variante_id: varianteResuelta?.id || null,
         cantidad: Number(form.cantidad),
         costo_unitario: Number(form.costo_unitario),
       })
       if (data.supera_umbral) {
         setSimulacion(data)
-        setPctAjuste(data.diferencia_pct)
+        setPctAjuste(data.diferencia_vs_ultima_compra_pct)
         setPrecioSugerido(data.precio_venta_sugerido)
         setActualizarPrecio(true)
       } else {
@@ -72,6 +130,7 @@ export default function Compras() {
   const guardarCompra = async (nuevoPrecioVenta) => {
     const payload = {
       producto_id: Number(form.producto_id),
+      variante_id: varianteResuelta?.id || (editId ? varianteIdOriginal : null),
       fecha: form.fecha || null,
       cantidad: Number(form.cantidad),
       costo_unitario: Number(form.costo_unitario),
@@ -107,6 +166,8 @@ export default function Compras() {
   const editar = (c) => {
     setEditId(c.id)
     setSimulacion(null)
+    setEdicionVarianteId(c.variante_id || null)
+    setVarianteIdOriginal(c.variante_id || null)
     setForm({
       categoria_id: c.producto?.categoria_id || '',
       producto_id: c.producto_id,
@@ -146,9 +207,9 @@ export default function Compras() {
             onChange={(e) => setForm({ ...form, categoria_id: e.target.value, producto_id: '' })}
           >
             <option value="">Todas las categorías</option>
-            {categorias.map((c) => (
+            {categoriasArbol.map((c) => (
               <option key={c.id} value={c.id}>
-                {c.nombre}
+                {etiquetaIndentada(c)}
               </option>
             ))}
           </select>
@@ -192,13 +253,42 @@ export default function Compras() {
           />
         </div>
 
+        {atributosProducto.length > 0 && (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {atributosProducto.map((a) => (
+              <select
+                key={a.atributo_id}
+                className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
+                value={valoresElegidos[a.atributo_id] || ''}
+                onChange={(e) => setValoresElegidos({ ...valoresElegidos, [a.atributo_id]: e.target.value })}
+              >
+                <option value="">{a.atributo}...</option>
+                {a.valores.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.valor}
+                  </option>
+                ))}
+              </select>
+            ))}
+            {!varianteResuelta && (
+              <p className="text-xs text-amber-400 md:col-span-3">
+                Elegí un valor para cada atributo para resolver la variante puntual de esta compra.
+              </p>
+            )}
+          </div>
+        )}
+
         {simulacion && (
           <div className="bg-amber-950/40 border border-amber-700 rounded-lg p-4 space-y-3">
             <p className="text-amber-300 font-medium">
-              ⚠️ Esta compra cambia el costo promedio de <b>{simulacion.producto}</b> de $
-              {simulacion.costo_promedio_actual.toLocaleString('es-AR')} a $
-              {simulacion.costo_promedio_nuevo.toLocaleString('es-AR')} ({simulacion.diferencia_pct > 0 ? '+' : ''}
-              {simulacion.diferencia_pct}%). ¿Querés ajustar el precio de venta en la misma proporción?
+              ⚠️ Respecto a tu última compra de <b>{simulacion.producto}</b> (${simulacion.costo_ultima_compra.toLocaleString('es-AR')}),
+              este costo varía {simulacion.diferencia_vs_ultima_compra_pct > 0 ? '+' : ''}
+              {simulacion.diferencia_vs_ultima_compra_pct}%. ¿Querés ajustar el precio de venta en la misma proporción?
+            </p>
+            <p className="text-amber-300/70 text-xs">
+              Promedio ponderado (contable): de ${simulacion.costo_promedio_actual.toLocaleString('es-AR')} a $
+              {simulacion.costo_promedio_nuevo.toLocaleString('es-AR')} ({simulacion.diferencia_vs_promedio_pct > 0 ? '+' : ''}
+              {simulacion.diferencia_vs_promedio_pct}%)
             </p>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3 items-end">
               <label className="text-xs text-gray-400">

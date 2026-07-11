@@ -14,9 +14,8 @@ router = APIRouter(prefix="/importacion", tags=["Importación"])
 
 # La búsqueda de productos existentes se hace por Nombre (case-insensitive, sin espacios
 # al principio/final). No requiere "código de producto": con ~100 SKU y una sola persona
-# armando la planilla, es más práctico. Si en el futuro hace falta desambiguar productos
-# con nombres parecidos, el campo `codigo` del catálogo (opcional) puede usarse como
-# columna extra "CodigoProducto" acá sin romper nada de lo que hay hoy.
+# armando la planilla, es más práctico. El campo `codigo` existe en el modelo para uso futuro
+# (código de barras, disambiguación) pero hoy no se usa en la importación.
 COLUMNAS = ["Producto", "Categoria", "Costo", "Cantidad", "Descuento", "FechaCompra", "PrecioVenta"]
 COLUMNAS_OBLIGATORIAS = ["Producto", "Costo", "Cantidad"]
 
@@ -41,14 +40,37 @@ def _parse_fecha(valor):
 
 
 @router.get("/plantilla")
-def descargar_plantilla():
+def descargar_plantilla(db: Session = Depends(get_db)):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Importación"
-    ws.append(COLUMNAS)
-    ws.append(["Top Básico", "Remeras", 15000, 10, "", "2026-07-01", 32000])
-    ws.append(["Vestido Fiesta", "Vestidos", 34000, 5, 10, "2026-07-01", ""])
-    ws.append(["Top Básico", "Remeras", 16000, 5, "", "2026-07-15", ""])
+
+    # Una columna por cada Atributo que exista HOY en el sistema (Talle, Color, etc.) — se arma
+    # en el momento de la descarga, así que si se agrega un atributo nuevo desde la pantalla
+    # Atributos, la próxima plantilla ya lo incluye sin tocar código.
+    atributos = db.query(models.Atributo).order_by(models.Atributo.id).all()
+    ws.append(COLUMNAS + [a.nombre for a in atributos])
+
+    def valor_ejemplo(atributo, indice):
+        valores = atributo.valores
+        return valores[indice % len(valores)].valor if valores else ""
+
+    ws.append(["Top Básico", "Remeras", 15000, 10, "", "2026-07-01", 32000] + ["" for _ in atributos])
+    ws.append(["Vestido Fiesta", "Vestidos", 34000, 5, 10, "2026-07-01", ""] + ["" for _ in atributos])
+    ws.append(["Top Básico", "Remeras", 16000, 5, "", "2026-07-15", ""] + ["" for _ in atributos])
+
+    if atributos:
+        # 1-2 filas de ejemplo con atributos completos, usando valores REALES ya cargados en
+        # valores_atributo (no inventados) — muestran cómo reponer/dar de alta con variantes.
+        ws.append(
+            ["Calza Deportiva", "Calzas", 12000, 3, "", "2026-07-01", 25000]
+            + [valor_ejemplo(a, 0) for a in atributos]
+        )
+        ws.append(
+            ["Calza Deportiva", "Calzas", 12000, 2, "", "2026-07-01", ""]
+            + [valor_ejemplo(a, 1) for a in atributos]
+        )
+
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -82,8 +104,35 @@ async def procesar(file: UploadFile = File(...), db: Session = Depends(get_db)):
     if faltantes:
         raise HTTPException(400, f"Faltan columnas obligatorias en la planilla: {', '.join(faltantes)}.")
 
+    # Cualquier columna que no sea una de las fijas se interpreta como un atributo (Talle, Color,
+    # etc.). Solo se reconocen atributos que YA existen en el sistema — si hay alguna columna que no
+    # matchea ningún atributo existente, se cancela TODA la importación antes de escribir nada (esto
+    # es un error estructural de la planilla, no de una fila puntual).
+    columnas_fijas_norm = {c.lower() for c in COLUMNAS}
+    atributos_por_nombre = {a.nombre.strip().lower(): a for a in db.query(models.Atributo).all()}
+    columnas_atributo = []  # [(indice_columna, Atributo), ...] en el orden en que aparecen en el encabezado
+    columnas_desconocidas = []
+    for i, nombre_col in enumerate(encabezado):
+        if not nombre_col or nombre_col.lower() in columnas_fijas_norm:
+            continue
+        atributo = atributos_por_nombre.get(nombre_col.lower())
+        if atributo is None:
+            columnas_desconocidas.append(nombre_col)
+        else:
+            columnas_atributo.append((i, atributo))
+
+    if columnas_desconocidas:
+        disponibles = ", ".join(a.nombre for a in atributos_por_nombre.values()) or "ninguno todavía"
+        raise HTTPException(
+            400,
+            "La planilla tiene columnas que no corresponden a ningún atributo existente: "
+            f"{', '.join(columnas_desconocidas)}. Atributos disponibles en el sistema: {disponibles}. "
+            "Si es un atributo nuevo, crealo primero desde la pantalla Atributos.",
+        )
+
     categorias_cache = {c.nombre.strip().lower(): c for c in db.query(models.Categoria).all()}
     productos_cache = {p.nombre.strip().lower(): p for p in db.query(models.Producto).all()}
+    valores_por_atributo_cache: dict[int, dict] = {}
 
     productos_creados = []
     compras_registradas = []
@@ -94,6 +143,78 @@ async def procesar(file: UploadFile = File(...), db: Session = Depends(get_db)):
     def val(fila, col):
         i = idx.get(col)
         return fila[i] if i is not None and i < len(fila) else None
+
+    def valor_columna(fila, col_index):
+        return fila[col_index] if col_index is not None and col_index < len(fila) else None
+
+    def valor_atributo_por_texto(atributo_id, texto_norm):
+        if atributo_id not in valores_por_atributo_cache:
+            valores_por_atributo_cache[atributo_id] = {
+                v.valor.strip().lower(): v
+                for v in db.query(models.ValorAtributo).filter(models.ValorAtributo.atributo_id == atributo_id).all()
+            }
+        return valores_por_atributo_cache[atributo_id].get(texto_norm)
+
+    def descripcion_variante(variante_id):
+        if variante_id is None:
+            return None
+        filas_desc = (
+            db.query(models.ValorAtributo.valor, models.ProductoAtributo.orden)
+            .join(models.VarianteValor, models.VarianteValor.valor_atributo_id == models.ValorAtributo.id)
+            .join(models.Variante, models.VarianteValor.variante_id == models.Variante.id)
+            .join(
+                models.ProductoAtributo,
+                (models.ProductoAtributo.producto_id == models.Variante.producto_id)
+                & (models.ProductoAtributo.atributo_id == models.ValorAtributo.atributo_id),
+            )
+            .filter(models.VarianteValor.variante_id == variante_id)
+            .order_by(models.ProductoAtributo.orden)
+            .all()
+        )
+        return " / ".join(v for v, _ in filas_desc)
+
+    def resolver_variante_para_fila(producto, atributos_fila):
+        """Devuelve (variante_id, error). Si el producto no tiene (ni necesita) variantes para esta
+        fila, devuelve (None, None). Si es la primera vez que este producto ve atributos (recién
+        creado, o recién activado sobre la marcha), configura sus `producto_atributos` a partir de
+        lo que trae ESTA fila (orden = posición de columna en la planilla). Si el producto YA tenía
+        atributos configurados (por Catálogo o por una fila anterior de este mismo import), exige que
+        la fila traiga valor para todos ellos; columnas de atributo ajenas a su configuración se
+        ignoran."""
+        configurados = (
+            db.query(models.ProductoAtributo)
+            .filter(models.ProductoAtributo.producto_id == producto.id)
+            .order_by(models.ProductoAtributo.orden)
+            .all()
+        )
+        if not configurados:
+            if not atributos_fila:
+                return None, None
+            producto.tiene_variantes = True
+            atributo_ids_usados = set(atributos_fila.keys())
+            orden = 1
+            for _, atributo in columnas_atributo:
+                if atributo.id in atributo_ids_usados:
+                    db.add(models.ProductoAtributo(producto_id=producto.id, atributo_id=atributo.id, orden=orden))
+                    orden += 1
+            db.flush()
+            configurados = (
+                db.query(models.ProductoAtributo)
+                .filter(models.ProductoAtributo.producto_id == producto.id)
+                .order_by(models.ProductoAtributo.orden)
+                .all()
+            )
+
+        valor_ids = []
+        for pa in configurados:
+            va = atributos_fila.get(pa.atributo_id)
+            if va is None:
+                atributo = db.get(models.Atributo, pa.atributo_id)
+                return None, f"Este producto tiene variantes: falta indicar valor de '{atributo.nombre}' para esta fila."
+            valor_ids.append(va.id)
+
+        variante = calculations.resolver_o_crear_variante(db, producto.id, valor_ids)
+        return variante.id, None
 
     for n, fila in enumerate(filas[1:], start=2):
         nombre = _norm(val(fila, "Producto"))
@@ -111,6 +232,24 @@ async def procesar(file: UploadFile = File(...), db: Session = Depends(get_db)):
             cantidad = int(cantidad_raw)
             if cantidad <= 0:
                 errores.append({"fila": n, "producto": nombre, "motivo": "La cantidad debe ser mayor a 0."})
+                continue
+
+            atributos_fila = {}
+            error_atributo = None
+            for col_index, atributo in columnas_atributo:
+                crudo = _norm(valor_columna(fila, col_index))
+                if not crudo:
+                    continue
+                va = valor_atributo_por_texto(atributo.id, crudo.lower())
+                if va is None:
+                    error_atributo = (
+                        f"El valor '{crudo}' no existe para el atributo '{atributo.nombre}' "
+                        "(revisá mayúsculas/tildes o cargalo primero en Atributos)."
+                    )
+                    break
+                atributos_fila[atributo.id] = va
+            if error_atributo:
+                errores.append({"fila": n, "producto": nombre, "motivo": error_atributo})
                 continue
 
             descuento_raw = val(fila, "Descuento")
@@ -159,8 +298,15 @@ async def procesar(file: UploadFile = File(...), db: Session = Depends(get_db)):
                 productos_cache[clave] = producto
                 productos_nuevos_ids.append(producto.id)
 
+                variante_id, error_variante = resolver_variante_para_fila(producto, atributos_fila)
+                if error_variante:
+                    # No debería pasar para un producto recién creado (el conjunto de atributos
+                    # requerido se define a partir de esta misma fila), pero se cubre por las dudas.
+                    errores.append({"fila": n, "producto": nombre, "motivo": error_variante})
+                    continue
+
                 db.add(models.Compra(
-                    producto_id=producto.id, fecha=fecha, cantidad=cantidad,
+                    producto_id=producto.id, variante_id=variante_id, fecha=fecha, cantidad=cantidad,
                     costo_unitario=costo_final, proveedor="Importación Excel",
                 ))
                 db.flush()
@@ -169,13 +315,27 @@ async def procesar(file: UploadFile = File(...), db: Session = Depends(get_db)):
                     "producto_id": producto.id, "producto": nombre,
                     "categoria": categoria.nombre if categoria else "Sin categoría",
                     "stock_inicial": cantidad, "costo": float(costo_final), "precio_venta": float(precio_venta),
+                    "variante_id": variante_id,
+                    "variante_descripcion": descripcion_variante(variante_id),
                 })
             else:
+                variante_id, error_variante = resolver_variante_para_fila(producto, atributos_fila)
+                if error_variante:
+                    errores.append({"fila": n, "producto": nombre, "motivo": error_variante})
+                    continue
+
                 # Reposición de un producto que ya existe en el catálogo.
                 costo_promedio_antes = float(producto.costo)
+                ultima_compra_previa = (
+                    db.query(models.Compra)
+                    .filter(models.Compra.producto_id == producto.id)
+                    .order_by(models.Compra.fecha.desc(), models.Compra.id.desc())
+                    .first()
+                )
+                costo_ultima_compra = float(ultima_compra_previa.costo_unitario) if ultima_compra_previa else None
 
                 db.add(models.Compra(
-                    producto_id=producto.id, fecha=fecha, cantidad=cantidad,
+                    producto_id=producto.id, variante_id=variante_id, fecha=fecha, cantidad=cantidad,
                     costo_unitario=costo_final, proveedor="Importación Excel",
                 ))
                 db.flush()
@@ -186,22 +346,32 @@ async def procesar(file: UploadFile = File(...), db: Session = Depends(get_db)):
                 compras_registradas.append({
                     "producto_id": producto.id, "producto": nombre, "cantidad": cantidad,
                     "costo_unitario": float(costo_final), "fecha": fecha.isoformat(),
+                    "variante_id": variante_id,
+                    "variante_descripcion": descripcion_variante(variante_id),
                 })
 
-                diferencia_pct = (
+                # El aviso se dispara comparando contra el costo de reposición (última compra
+                # previa), no contra el promedio ponderado — ver simular_compra() en calculations.py.
+                diferencia_vs_promedio_pct = (
                     round((costo_promedio_despues - costo_promedio_antes) / costo_promedio_antes * 100, 2)
                     if costo_promedio_antes else 0.0
                 )
-                if abs(diferencia_pct) > calculations.UMBRAL_CAMBIO_COSTO_PCT:
+                diferencia_vs_ultima_compra_pct = (
+                    round((float(costo_final) - costo_ultima_compra) / costo_ultima_compra * 100, 2)
+                    if costo_ultima_compra else None
+                )
+                if diferencia_vs_ultima_compra_pct is not None and abs(diferencia_vs_ultima_compra_pct) > calculations.UMBRAL_CAMBIO_COSTO_PCT:
                     precio_actual = float(producto.precio_venta)
                     cambios_costo.append({
                         "producto_id": producto.id,
                         "producto": nombre,
                         "costo_anterior": costo_promedio_antes,
                         "costo_nuevo": costo_promedio_despues,
-                        "diferencia_pct": diferencia_pct,
+                        "costo_ultima_compra": costo_ultima_compra,
+                        "diferencia_vs_ultima_compra_pct": diferencia_vs_ultima_compra_pct,
+                        "diferencia_vs_promedio_pct": diferencia_vs_promedio_pct,
                         "precio_venta_actual": precio_actual,
-                        "precio_venta_sugerido": round(precio_actual * (1 + diferencia_pct / 100), 2),
+                        "precio_venta_sugerido": round(precio_actual * (1 + diferencia_vs_ultima_compra_pct / 100), 2),
                     })
 
         except (InvalidOperation, ValueError) as e:

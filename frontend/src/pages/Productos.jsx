@@ -1,7 +1,11 @@
 import { useEffect, useState } from 'react'
 import api, { getErrorMessage } from '../api'
+import { aplanarArbol, etiquetaIndentada } from '../utils/categorias'
 
-const empty = { nombre: '', codigo: '', categoria_id: '', precio_venta: '', costo: '', mix_pct: '', lead_time_dias: '' }
+const empty = {
+  nombre: '', codigo: '', categoria_id: '', precio_venta: '', costo: '', mix_pct: '', lead_time_dias: '',
+  tiene_variantes: false,
+}
 
 const estadoColor = {
   'Sin stock': 'text-red-400 font-bold',
@@ -22,9 +26,14 @@ export default function Productos() {
   const [editandoMarkup, setEditandoMarkup] = useState(null) // producto_id en edición inline
   const [markupValor, setMarkupValor] = useState('')
 
+  const [atributosDisponibles, setAtributosDisponibles] = useState([])
+  const [variantesConfig, setVariantesConfig] = useState({}) // atributo_id -> {activo, orden, valor_ids: Set}
+  const [variantesActuales, setVariantesActuales] = useState([])
+
   const cargar = () => {
     api.get('/productos').then((r) => setProductos(r.data))
     api.get('/categorias').then((r) => setCategorias(r.data))
+    api.get('/atributos').then((r) => setAtributosDisponibles(r.data))
     api.get('/stock/productos').then((r) => {
       const mapa = {}
       r.data.forEach((s) => { mapa[s.producto_id] = s })
@@ -35,6 +44,7 @@ export default function Productos() {
     cargar()
   }, [])
 
+  const categoriasArbol = aplanarArbol(categorias)
   const mixTotal = productos.filter((p) => p.activo).reduce((acc, p) => acc + Number(p.mix_pct || 0), 0)
 
   const guardar = async () => {
@@ -47,16 +57,32 @@ export default function Productos() {
       costo: Number(form.costo || 0),
       mix_pct: Number(form.mix_pct || 0),
       lead_time_dias: form.lead_time_dias ? Number(form.lead_time_dias) : null,
+      tiene_variantes: form.tiene_variantes,
     }
     try {
       if (editId) await api.put(`/productos/${editId}`, payload)
       else await api.post('/productos', payload)
       setForm(empty)
       setEditId(null)
+      setVariantesConfig({})
+      setVariantesActuales([])
       cargar()
     } catch (e) {
       setError(getErrorMessage(e))
     }
+  }
+
+  const cargarConfigVariantes = async (productoId) => {
+    const [{ data: atribs }, { data: variantes }] = await Promise.all([
+      api.get(`/productos/${productoId}/atributos`),
+      api.get(`/productos/${productoId}/variantes`),
+    ])
+    const config = {}
+    atribs.forEach((a) => {
+      config[a.atributo_id] = { activo: true, orden: a.orden, valor_ids: new Set() }
+    })
+    setVariantesConfig(config)
+    setVariantesActuales(variantes)
   }
 
   const editar = (p) => {
@@ -69,7 +95,69 @@ export default function Productos() {
       costo: p.costo,
       mix_pct: p.mix_pct,
       lead_time_dias: p.lead_time_dias || '',
+      tiene_variantes: p.tiene_variantes || false,
     })
+    if (p.tiene_variantes) {
+      cargarConfigVariantes(p.id).catch((e) => setError(getErrorMessage(e)))
+    } else {
+      setVariantesConfig({})
+      setVariantesActuales([])
+    }
+  }
+
+  const toggleAtributo = (atributoId, checked) => {
+    setVariantesConfig((prev) => {
+      const next = { ...prev }
+      if (checked) {
+        const ordenSiguiente = Object.values(prev).filter((c) => c.activo).length + 1
+        next[atributoId] = { activo: true, orden: ordenSiguiente, valor_ids: new Set() }
+      } else {
+        delete next[atributoId]
+      }
+      return next
+    })
+  }
+
+  const setOrdenAtributo = (atributoId, orden) => {
+    setVariantesConfig((prev) => ({ ...prev, [atributoId]: { ...prev[atributoId], orden: Number(orden) } }))
+  }
+
+  const toggleValor = (atributoId, valorId) => {
+    setVariantesConfig((prev) => {
+      const actual = prev[atributoId]
+      const nuevo = new Set(actual.valor_ids)
+      if (nuevo.has(valorId)) nuevo.delete(valorId)
+      else nuevo.add(valorId)
+      return { ...prev, [atributoId]: { ...actual, valor_ids: nuevo } }
+    })
+  }
+
+  const guardarAtributosYGenerar = async () => {
+    setError('')
+    const activos = Object.entries(variantesConfig).filter(([, c]) => c.activo)
+    if (activos.length === 0) {
+      setError('Elegí al menos un atributo para este producto.')
+      return
+    }
+    if (activos.some(([, c]) => c.valor_ids.size === 0)) {
+      setError('Elegí al menos un valor para cada atributo marcado.')
+      return
+    }
+    try {
+      await api.post(`/productos/${editId}/atributos`, {
+        atributos: activos.map(([atributo_id, c]) => ({ atributo_id: Number(atributo_id), orden: c.orden })),
+      })
+      await api.post(`/productos/${editId}/variantes/generar`, {
+        selecciones: activos.map(([atributo_id, c]) => ({
+          atributo_id: Number(atributo_id),
+          valor_ids: [...c.valor_ids],
+        })),
+      })
+      await cargarConfigVariantes(editId)
+      cargar()
+    } catch (e) {
+      setError(getErrorMessage(e))
+    }
   }
 
   const borrar = async (id) => {
@@ -147,9 +235,9 @@ export default function Productos() {
             onChange={(e) => setForm({ ...form, categoria_id: e.target.value })}
           >
             <option value="">Sin categoría</option>
-            {categorias.map((c) => (
+            {categoriasArbol.map((c) => (
               <option key={c.id} value={c.id}>
-                {c.nombre}
+                {etiquetaIndentada(c)}
               </option>
             ))}
           </select>
@@ -182,10 +270,19 @@ export default function Productos() {
             onChange={(e) => setForm({ ...form, lead_time_dias: e.target.value })}
           />
         </div>
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={form.tiene_variantes}
+            onChange={(e) => setForm({ ...form, tiene_variantes: e.target.checked })}
+          />
+          ¿Tiene variantes? (talle, color, etc.)
+        </label>
         <p className="text-xs text-gray-500">
           El costo se puede dejar en 0 al principio — en cuanto cargues la primera Compra de este producto, se va a
           recalcular solo como promedio ponderado. El lead time se usa para la alerta de "próximo a agotarse" en
-          Stock (si no lo cargás, se asume 7 días).
+          Stock (si no lo cargás, se asume 7 días). Si activás variantes, guardá el producto y despues configurá sus
+          atributos acá abajo.
         </p>
         <div className="flex gap-2">
           <button onClick={guardar} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg font-medium">
@@ -196,6 +293,8 @@ export default function Productos() {
               onClick={() => {
                 setEditId(null)
                 setForm(empty)
+                setVariantesConfig({})
+                setVariantesActuales([])
               }}
               className="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded-lg"
             >
@@ -204,6 +303,102 @@ export default function Productos() {
           )}
         </div>
       </div>
+
+      {editId && form.tiene_variantes && (
+        <div className="bg-[#151b2b] rounded-xl p-5 space-y-4">
+          <h2 className="font-bold">Variantes de "{form.nombre}"</h2>
+          <p className="text-xs text-gray-500">
+            Elegí qué atributos aplican a este producto y en qué orden (el primero agrupa el stock en subtotales,
+            ej. Talle). Después elegí los valores de cada uno para generar la grilla de combinaciones — cada
+            combinación nueva arranca con 0 de stock hasta que le cargues una Compra.
+          </p>
+          <div className="space-y-3">
+            {atributosDisponibles.map((a) => {
+              const config = variantesConfig[a.id]
+              return (
+                <div key={a.id} className="border border-gray-800 rounded-lg p-3">
+                  <label className="flex items-center gap-2 font-medium">
+                    <input
+                      type="checkbox"
+                      checked={!!config?.activo}
+                      onChange={(e) => toggleAtributo(a.id, e.target.checked)}
+                    />
+                    {a.nombre}
+                    {config?.activo && (
+                      <input
+                        type="number"
+                        min="1"
+                        className="w-16 bg-[#0b0f19] border border-gray-700 rounded p-1 text-sm ml-2"
+                        value={config.orden}
+                        onChange={(e) => setOrdenAtributo(a.id, e.target.value)}
+                        title="Orden (1 = agrupa el stock en subtotales)"
+                      />
+                    )}
+                  </label>
+                  {config?.activo && (
+                    <div className="flex flex-wrap gap-2 mt-2 ml-6">
+                      {a.valores.map((v) => (
+                        <label
+                          key={v.id}
+                          className="flex items-center gap-1 text-sm bg-[#0b0f19] border border-gray-700 rounded-full px-2 py-1"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={config.valor_ids.has(v.id)}
+                            onChange={() => toggleValor(a.id, v.id)}
+                          />
+                          {v.valor}
+                        </label>
+                      ))}
+                      {a.valores.length === 0 && (
+                        <span className="text-gray-500 text-xs">Sin valores cargados (andá a Atributos).</span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+            {atributosDisponibles.length === 0 && (
+              <p className="text-gray-500 text-sm">
+                Todavía no cargaste atributos. Andá a la página "Atributos" para crear Talle, Color, etc.
+              </p>
+            )}
+          </div>
+          <button
+            onClick={guardarAtributosYGenerar}
+            className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg font-medium text-sm"
+          >
+            Guardar atributos y generar variantes
+          </button>
+
+          {variantesActuales.length > 0 && (
+            <div className="mt-4">
+              <h3 className="font-medium mb-2 text-sm text-gray-300">
+                Variantes generadas ({variantesActuales.length})
+              </h3>
+              <p className="text-xs text-gray-500 mb-2">
+                El costo es único para todo el producto (no varía por talle/color) — se muestra en la tabla de abajo.
+              </p>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-gray-400 border-b border-gray-700">
+                      <th className="py-1">Combinación</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {variantesActuales.map((v) => (
+                      <tr key={v.id} className="border-b border-gray-800">
+                        <td className="py-1">{v.valores.map((x) => x.valor).join(' / ')}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="bg-[#151b2b] rounded-xl p-5 overflow-x-auto">
         <table className="w-full text-sm">
@@ -229,6 +424,11 @@ export default function Productos() {
                   <td className="py-2">
                     {p.nombre}
                     {p.codigo && <span className="text-gray-500"> ({p.codigo})</span>}
+                    {p.tiene_variantes && (
+                      <span className="ml-2 text-xs bg-blue-900/50 text-blue-300 px-2 py-0.5 rounded-full">
+                        variantes
+                      </span>
+                    )}
                   </td>
                   <td>{p.categoria?.nombre || '—'}</td>
                   <td>${p.precio_venta}</td>

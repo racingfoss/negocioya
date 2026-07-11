@@ -14,8 +14,16 @@ def _validar(mov: schemas.MovimientoBase, db: Session):
         raise HTTPException(400, "El tipo debe ser 'Venta', 'Ingreso' o 'Egreso'.")
     if mov.tipo == "Venta" and not mov.producto_id:
         raise HTTPException(400, "Una Venta debe tener un producto asociado.")
-    if mov.producto_id is not None and not db.get(models.Producto, mov.producto_id):
-        raise HTTPException(400, "El producto indicado no existe.")
+    if mov.producto_id is not None:
+        producto = db.get(models.Producto, mov.producto_id)
+        if not producto:
+            raise HTTPException(400, "El producto indicado no existe.")
+        if mov.tipo == "Venta" and producto.tiene_variantes and not mov.variante_id:
+            raise HTTPException(400, "Este producto tiene variantes: especificá la variante de la venta.")
+        if mov.variante_id is not None:
+            variante = db.get(models.Variante, mov.variante_id)
+            if not variante or variante.producto_id != mov.producto_id:
+                raise HTTPException(400, "La variante indicada no corresponde a este producto.")
 
 
 @router.get("/", response_model=list[schemas.Movimiento])

@@ -16,6 +16,19 @@ def _aplicar_precio_si_corresponde(db: Session, producto_id: int, nuevo_precio) 
         db.commit()
 
 
+def _validar_producto_y_variante(db: Session, producto_id: int, variante_id: int | None) -> models.Producto:
+    producto = db.get(models.Producto, producto_id)
+    if not producto:
+        raise HTTPException(400, "El producto indicado no existe.")
+    if producto.tiene_variantes and not variante_id:
+        raise HTTPException(400, "Este producto tiene variantes: especificá la variante de la compra.")
+    if variante_id is not None:
+        variante = db.get(models.Variante, variante_id)
+        if not variante or variante.producto_id != producto_id:
+            raise HTTPException(400, "La variante indicada no corresponde a este producto.")
+    return producto
+
+
 @router.get("/", response_model=list[schemas.Compra])
 def listar(db: Session = Depends(get_db), producto_id: int | None = None, limit: int = 300):
     q = db.query(models.Compra).options(joinedload(models.Compra.producto))
@@ -34,8 +47,7 @@ def simular(payload: schemas.CompraSimularRequest, db: Session = Depends(get_db)
 
 @router.post("/", response_model=schemas.Compra)
 def crear(compra: schemas.CompraCreate, db: Session = Depends(get_db)):
-    if not db.get(models.Producto, compra.producto_id):
-        raise HTTPException(400, "El producto indicado no existe.")
+    _validar_producto_y_variante(db, compra.producto_id, compra.variante_id)
     data = compra.model_dump()
     nuevo_precio = data.pop("actualizar_precio_venta", None)
     if data.get("fecha") is None:
@@ -55,6 +67,7 @@ def actualizar(compra_id: int, compra: schemas.CompraCreate, db: Session = Depen
     obj = db.get(models.Compra, compra_id)
     if not obj:
         raise HTTPException(404, "Compra no encontrada.")
+    _validar_producto_y_variante(db, compra.producto_id, compra.variante_id)
     data = compra.model_dump()
     nuevo_precio = data.pop("actualizar_precio_venta", None)
     if data.get("fecha") is None:

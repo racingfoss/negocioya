@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import api, { getErrorMessage } from '../api'
 
 export default function Importar() {
@@ -7,7 +7,12 @@ export default function Importar() {
   const [resultado, setResultado] = useState(null)
   const [error, setError] = useState('')
   const [cambiosResueltos, setCambiosResueltos] = useState({}) // producto_id -> "aceptado" | "rechazado"
+  const [atributos, setAtributos] = useState([])
   const inputRef = useRef(null)
+
+  useEffect(() => {
+    api.get('/atributos').then((r) => setAtributos(r.data))
+  }, [])
 
   const descargarPlantilla = () => {
     window.open(`${api.defaults.baseURL}/importacion/plantilla`, '_blank')
@@ -74,6 +79,15 @@ export default function Importar() {
             (para productos nuevos), Descuento (%, opcional, se aplica sobre Costo), FechaCompra (si falta, usa hoy),
             PrecioVenta (obligatoria solo para productos nuevos).
           </p>
+          {atributos.length > 0 && (
+            <p className="text-sm text-gray-400 mt-2">
+              Para productos con variantes, podés agregar una columna por cada atributo ya definido en el sistema:{' '}
+              <b>{atributos.map((a) => a.nombre).join(', ')}</b>. El valor de la celda tiene que ser uno de los ya
+              cargados en Atributos (ej. "M", "Verde") — si el producto no existe todavía, se crea directamente con
+              esa variante; si ya existe, se le activan variantes y se le suma stock a esa variante puntual. El orden
+              de las columnas importa: la primera define el subtotal en la pantalla de Stock.
+            </p>
+          )}
           <button onClick={descargarPlantilla} className="text-blue-400 hover:underline text-sm mt-2">
             ⬇️ Descargar plantilla de ejemplo (.xlsx)
           </button>
@@ -123,7 +137,7 @@ export default function Importar() {
           {resultado.cambios_costo.length > 0 && (
             <div>
               <div className="flex items-center justify-between mb-2">
-                <h2 className="text-xl font-bold">💰 Productos con cambio de costo promedio</h2>
+                <h2 className="text-xl font-bold">💰 Productos con cambio de costo</h2>
                 <button onClick={aceptarTodos} className="bg-green-700 hover:bg-green-600 px-3 py-1.5 rounded-lg text-sm">
                   Aceptar todos
                 </button>
@@ -133,9 +147,10 @@ export default function Importar() {
                   <thead>
                     <tr className="text-left text-gray-400 border-b border-gray-700">
                       <th className="py-2">Producto</th>
-                      <th>Costo Anterior</th>
-                      <th>Costo Nuevo</th>
-                      <th>Diferencia</th>
+                      <th>Costo Anterior (prom.)</th>
+                      <th>Costo Nuevo (prom.)</th>
+                      <th>% Promedio</th>
+                      <th>% vs Última Compra</th>
                       <th>Precio Actual</th>
                       <th>Precio Sugerido</th>
                       <th></th>
@@ -149,9 +164,13 @@ export default function Importar() {
                           <td className="py-2">{item.producto}</td>
                           <td>${item.costo_anterior.toLocaleString('es-AR')}</td>
                           <td>${item.costo_nuevo.toLocaleString('es-AR')}</td>
-                          <td className={item.diferencia_pct > 0 ? 'text-red-400' : 'text-green-400'}>
-                            {item.diferencia_pct > 0 ? '+' : ''}
-                            {item.diferencia_pct}%
+                          <td className="text-gray-400">
+                            {item.diferencia_vs_promedio_pct > 0 ? '+' : ''}
+                            {item.diferencia_vs_promedio_pct}%
+                          </td>
+                          <td className={item.diferencia_vs_ultima_compra_pct > 0 ? 'text-red-400' : 'text-green-400'}>
+                            {item.diferencia_vs_ultima_compra_pct > 0 ? '+' : ''}
+                            {item.diferencia_vs_ultima_compra_pct}%
                           </td>
                           <td>${item.precio_venta_actual.toLocaleString('es-AR')}</td>
                           <td>${item.precio_venta_sugerido.toLocaleString('es-AR')}</td>
@@ -192,6 +211,7 @@ export default function Importar() {
                   <thead>
                     <tr className="text-left text-gray-400 border-b border-gray-700">
                       <th className="py-2">Producto</th>
+                      <th>Variante</th>
                       <th>Categoría</th>
                       <th>Stock Inicial</th>
                       <th>Costo</th>
@@ -202,6 +222,7 @@ export default function Importar() {
                     {resultado.productos_creados.map((p) => (
                       <tr key={p.producto_id} className="border-b border-gray-800">
                         <td className="py-2">{p.producto}</td>
+                        <td className="text-gray-400">{p.variante_descripcion || '—'}</td>
                         <td>{p.categoria}</td>
                         <td>{p.stock_inicial}</td>
                         <td>${p.costo.toLocaleString('es-AR')}</td>
@@ -222,6 +243,7 @@ export default function Importar() {
                   <thead>
                     <tr className="text-left text-gray-400 border-b border-gray-700">
                       <th className="py-2">Producto</th>
+                      <th>Variante</th>
                       <th>Fecha</th>
                       <th>Cantidad</th>
                       <th>Costo Unit.</th>
@@ -231,6 +253,7 @@ export default function Importar() {
                     {resultado.compras_registradas.map((c, idx) => (
                       <tr key={idx} className="border-b border-gray-800">
                         <td className="py-2">{c.producto}</td>
+                        <td className="text-gray-400">{c.variante_descripcion || '—'}</td>
                         <td>{c.fecha}</td>
                         <td>{c.cantidad}</td>
                         <td>${c.costo_unitario.toLocaleString('es-AR')}</td>

@@ -25,8 +25,8 @@ def bcg(dias: int = 30, db: Session = Depends(get_db)):
 
 
 @router.get("/analisis")
-def analisis(dias: int = 30, db: Session = Depends(get_db)):
-    return calculations.analisis_combinado(db, dias=dias)
+def analisis(dias: int = 30, rollup: bool = False, db: Session = Depends(get_db)):
+    return calculations.analisis_combinado(db, dias=dias, rollup=rollup)
 
 
 @router.get("/sell-through", response_model=list[dict])
@@ -35,5 +35,5 @@ def sellthrough(db: Session = Depends(get_db)):
 
 
 @router.get("/contribucion-categorias")
-def contribucion(dias: Optional[int] = None, db: Session = Depends(get_db)):
-    return calculations.contribucion_por_categoria(db, dias=dias)
+def contribucion(dias: Optional[int] = None, rollup: bool = False, db: Session = Depends(get_db)):
+    return calculations.contribucion_por_categoria(db, dias=dias, rollup=rollup)

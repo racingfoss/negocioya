@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .database import Base, engine
-from .routers import categorias, compras, costos_fijos, dashboard, importacion, movimientos, productos, stock
+from .routers import atributos, categorias, compras, costos_fijos, dashboard, importacion, movimientos, productos, stock
 
 Base.metadata.create_all(bind=engine)
 
@@ -18,6 +18,7 @@ app.add_middleware(
 
 app.include_router(categorias.router)
 app.include_router(productos.router)
+app.include_router(atributos.router)
 app.include_router(compras.router)
 app.include_router(stock.router)
 app.include_router(costos_fijos.router)

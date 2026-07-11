@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 class CategoriaBase(BaseModel):
     nombre: str
     descripcion: Optional[str] = None
+    parent_id: Optional[int] = None
 
 
 class CategoriaCreate(CategoriaBase):
@@ -28,6 +29,7 @@ class ProductoBase(BaseModel):
     mix_pct: Decimal = Decimal("0")
     lead_time_dias: Optional[int] = None
     activo: bool = True
+    tiene_variantes: bool = False
 
 
 class ProductoCreate(ProductoBase):
@@ -43,6 +45,7 @@ class ProductoUpdate(BaseModel):
     mix_pct: Optional[Decimal] = None
     lead_time_dias: Optional[int] = None
     activo: Optional[bool] = None
+    tiene_variantes: Optional[bool] = None
 
 
 class Producto(ProductoBase):
@@ -53,6 +56,7 @@ class Producto(ProductoBase):
 
 class CompraBase(BaseModel):
     producto_id: int
+    variante_id: Optional[int] = None
     fecha: Optional[date] = None
     cantidad: int
     costo_unitario: Decimal
@@ -72,8 +76,57 @@ class Compra(CompraBase):
 
 class CompraSimularRequest(BaseModel):
     producto_id: int
+    variante_id: Optional[int] = None
     cantidad: int
     costo_unitario: Decimal
+
+
+# --- Atributos y variantes (talle, color, etc. definidos por la usuaria) ---
+
+class ValorAtributoBase(BaseModel):
+    valor: str
+
+
+class ValorAtributoCreate(ValorAtributoBase):
+    pass
+
+
+class ValorAtributo(ValorAtributoBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    atributo_id: int
+
+
+class AtributoBase(BaseModel):
+    nombre: str
+
+
+class AtributoCreate(AtributoBase):
+    pass
+
+
+class Atributo(AtributoBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    valores: list[ValorAtributo] = []
+
+
+class ProductoAtributoIn(BaseModel):
+    atributo_id: int
+    orden: int
+
+
+class ProductoAtributosRequest(BaseModel):
+    atributos: list[ProductoAtributoIn]
+
+
+class SeleccionAtributo(BaseModel):
+    atributo_id: int
+    valor_ids: list[int]
+
+
+class GenerarVariantesRequest(BaseModel):
+    selecciones: list[SeleccionAtributo]
 
 
 class CostoFijoBase(BaseModel):
@@ -96,6 +149,7 @@ class MovimientoBase(BaseModel):
     cantidad: Optional[int] = 1
     monto: Decimal
     producto_id: Optional[int] = None
+    variante_id: Optional[int] = None
     costo_fijo_id: Optional[int] = None
     fecha: Optional[datetime] = None  # si no se manda, se usa el momento actual
 

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import api, { getErrorMessage } from '../api'
+import { aplanarArbol, etiquetaIndentada } from '../utils/categorias'
 
 const nowLocal = () => {
   const d = new Date()
@@ -26,6 +27,13 @@ export default function Movimientos() {
   const [montoEditadoManualmente, setMontoEditadoManualmente] = useState(false)
   const [error, setError] = useState('')
 
+  // Selectores en cascada para resolver la variante (si el producto elegido tiene variantes)
+  const [atributosProducto, setAtributosProducto] = useState([])
+  const [variantesProducto, setVariantesProducto] = useState([])
+  const [valoresElegidos, setValoresElegidos] = useState({}) // atributo_id -> valor_id
+  const [edicionVarianteId, setEdicionVarianteId] = useState(null)
+  const [varianteIdOriginal, setVarianteIdOriginal] = useState(null)
+
   const cargar = () => {
     api.get('/movimientos').then((r) => setMovimientos(r.data))
     api.get('/productos', { params: { solo_activos: true } }).then((r) => setProductos(r.data))
@@ -35,10 +43,52 @@ export default function Movimientos() {
     cargar()
   }, [])
 
+  const categoriasArbol = aplanarArbol(categorias)
   const productoSeleccionado = productos.find((p) => String(p.id) === String(form.producto_id))
   const productosFiltrados = form.categoria_id
     ? productos.filter((p) => String(p.categoria_id) === String(form.categoria_id))
     : productos
+
+  useEffect(() => {
+    setValoresElegidos({})
+    if (form.tipo === 'Venta' && productoSeleccionado?.tiene_variantes) {
+      Promise.all([
+        api.get(`/productos/${productoSeleccionado.id}/atributos`),
+        api.get(`/productos/${productoSeleccionado.id}/variantes`),
+      ]).then(([{ data: atribs }, { data: variantes }]) => {
+        setAtributosProducto(atribs)
+        setVariantesProducto(variantes)
+      })
+    } else {
+      setAtributosProducto([])
+      setVariantesProducto([])
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.producto_id, form.tipo])
+
+  const varianteResuelta =
+    atributosProducto.length > 0 && atributosProducto.every((a) => valoresElegidos[a.atributo_id])
+      ? variantesProducto.find((v) =>
+          atributosProducto.every((a) =>
+            v.valores.some(
+              (x) => x.atributo_id === a.atributo_id && x.valor_atributo_id === Number(valoresElegidos[a.atributo_id])
+            )
+          )
+        )
+      : null
+
+  // al editar un movimiento ya cargado, prellenar los selectores con la variante que tenía
+  useEffect(() => {
+    if (edicionVarianteId && variantesProducto.length > 0) {
+      const v = variantesProducto.find((x) => x.id === edicionVarianteId)
+      if (v) {
+        const elegidos = {}
+        v.valores.forEach((x) => { elegidos[x.atributo_id] = x.valor_atributo_id })
+        setValoresElegidos(elegidos)
+      }
+      setEdicionVarianteId(null)
+    }
+  }, [variantesProducto, edicionVarianteId])
 
   // Auto-calcula el monto = cantidad x precio de venta del producto, mientras el usuario no lo haya tocado a mano.
   useEffect(() => {
@@ -51,17 +101,23 @@ export default function Movimientos() {
 
   const cambiarTipo = (tipo) => {
     setMontoEditadoManualmente(false)
+    setValoresElegidos({})
     setForm({ ...empty, tipo, fecha: form.fecha })
   }
 
   const guardar = async () => {
     setError('')
+    if (form.tipo === 'Venta' && atributosProducto.length > 0 && !varianteResuelta && !editId) {
+      setError('Elegí un valor para cada atributo, así se puede resolver la variante de la venta.')
+      return
+    }
     const payload = {
       tipo: form.tipo,
       concepto: form.concepto || null,
       cantidad: form.tipo === 'Venta' ? Number(form.cantidad || 1) : null,
       monto: Number(form.monto),
       producto_id: form.tipo === 'Venta' ? Number(form.producto_id) : null,
+      variante_id: form.tipo === 'Venta' ? varianteResuelta?.id || (editId ? varianteIdOriginal : null) : null,
       fecha: form.fecha ? new Date(form.fecha).toISOString() : null,
     }
     try {
@@ -70,6 +126,7 @@ export default function Movimientos() {
       setForm({ ...empty, fecha: nowLocal() })
       setMontoEditadoManualmente(false)
       setEditId(null)
+      setVarianteIdOriginal(null)
       cargar()
     } catch (e) {
       setError(getErrorMessage(e))
@@ -79,6 +136,8 @@ export default function Movimientos() {
   const editar = (m) => {
     setEditId(m.id)
     setMontoEditadoManualmente(true) // no pisar el monto ya guardado al editar
+    setEdicionVarianteId(m.variante_id || null)
+    setVarianteIdOriginal(m.variante_id || null)
     const fechaLocal = new Date(m.fecha)
     fechaLocal.setMinutes(fechaLocal.getMinutes() - fechaLocal.getTimezoneOffset())
     setForm({
@@ -135,9 +194,9 @@ export default function Movimientos() {
                 onChange={(e) => setForm({ ...form, categoria_id: e.target.value, producto_id: '' })}
               >
                 <option value="">Todas las categorías</option>
-                {categorias.map((c) => (
+                {categoriasArbol.map((c) => (
                   <option key={c.id} value={c.id}>
-                    {c.nombre}
+                    {etiquetaIndentada(c)}
                   </option>
                 ))}
               </select>
@@ -156,6 +215,21 @@ export default function Movimientos() {
                   </option>
                 ))}
               </select>
+              {atributosProducto.map((a) => (
+                <select
+                  key={a.atributo_id}
+                  className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
+                  value={valoresElegidos[a.atributo_id] || ''}
+                  onChange={(e) => setValoresElegidos({ ...valoresElegidos, [a.atributo_id]: e.target.value })}
+                >
+                  <option value="">{a.atributo}...</option>
+                  {a.valores.map((v) => (
+                    <option key={v.id} value={v.id}>
+                      {v.valor}
+                    </option>
+                  ))}
+                </select>
+              ))}
               <input
                 type="number"
                 min="1"
@@ -198,6 +272,11 @@ export default function Movimientos() {
           <p className="text-xs text-gray-500">
             Precio de venta del producto: ${productoSeleccionado.precio_venta} · el monto se calcula solo
             (cantidad × precio), pero lo podés pisar a mano si vendiste con descuento.
+          </p>
+        )}
+        {form.tipo === 'Venta' && atributosProducto.length > 0 && !varianteResuelta && !editId && (
+          <p className="text-xs text-amber-400">
+            Elegí un valor para cada atributo para resolver la variante puntual de esta venta.
           </p>
         )}
 

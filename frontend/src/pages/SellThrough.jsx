@@ -18,12 +18,16 @@ function Badge({ estado }) {
   )
 }
 
+const sellThroughPct = (vendido, comprado) => (comprado ? Math.round((vendido / comprado) * 1000) / 10 : null)
+
 export default function Stock() {
   const [data, setData] = useState([])
+  const [arbol, setArbol] = useState([])
   const [porCategoria, setPorCategoria] = useState([])
 
   useEffect(() => {
     api.get('/dashboard/sell-through').then((r) => setData(r.data))
+    api.get('/stock/productos/arbol').then((r) => setArbol(r.data))
     api.get('/stock/categorias').then((r) => setPorCategoria(r.data))
   }, [])
 
@@ -31,6 +35,19 @@ export default function Stock() {
     .filter((p) => p.stock_actual > 0 && p.dias_cobertura !== null)
     .sort((a, b) => a.dias_cobertura - b.dias_cobertura)
     .slice(0, 5)
+
+  // aplana el árbol de 3 niveles (producto > subtotal de atributo primario > variante) en filas con indentación,
+  // para no forzar niveles vacíos en productos sin variantes o con un solo atributo configurado
+  const filas = []
+  for (const p of arbol) {
+    filas.push({ ...p, nivel: 0, key: `p-${p.producto_id}` })
+    for (const g of p.grupos || []) {
+      filas.push({ ...g, nivel: 1, key: `p-${p.producto_id}-g-${g.nombre}` })
+      for (const v of g.variantes || []) {
+        filas.push({ ...v, nivel: 2, key: `v-${v.variante_id}` })
+      }
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -108,26 +125,32 @@ export default function Stock() {
             </tr>
           </thead>
           <tbody>
-            {data.map((p) => (
-              <tr
-                key={p.producto_id}
-                className={`border-b border-gray-800 ${p.necesita_reponer ? 'bg-red-950/30' : ''}`}
-              >
-                <td className="py-2">{p.producto}</td>
-                <td>{p.categoria}</td>
-                <td>{p.stock_actual}</td>
-                <td>{p.demanda_media_diaria} u./día</td>
-                <td>{p.dias_cobertura !== null ? `${p.dias_cobertura} días` : '—'}</td>
-                <td>{p.sell_through_pct !== null ? `${p.sell_through_pct}%` : '—'}</td>
-                <td className={p.alerta_rotacion_90_dias ? 'text-red-400 font-bold' : ''}>
-                  {p.dias_en_stock !== null ? `${p.dias_en_stock} días` : '—'}
-                </td>
-                <td>
-                  <Badge estado={p.estado_stock} />
-                </td>
-              </tr>
-            ))}
-            {data.length === 0 && (
+            {filas.map((f) => {
+              const esDetalle = f.nivel > 0
+              const sellThrough = sellThroughPct(f.total_vendido, f.total_comprado)
+              return (
+                <tr
+                  key={f.key}
+                  className={`border-b border-gray-800 ${f.nivel === 0 && f.necesita_reponer ? 'bg-red-950/30' : ''} ${
+                    esDetalle ? 'text-gray-400' : ''
+                  }`}
+                >
+                  <td className="py-2" style={{ paddingLeft: `${f.nivel * 1.5}rem` }}>
+                    {f.nivel > 0 ? `${'—'.repeat(f.nivel)} ${f.nombre}` : f.producto}
+                  </td>
+                  <td>{f.nivel === 0 ? f.categoria : ''}</td>
+                  <td>{f.stock_actual} u.</td>
+                  <td>{f.nivel < 2 ? '—' : `${f.demanda_media_diaria} u./día`}</td>
+                  <td>{f.nivel < 2 ? '—' : f.dias_cobertura !== null ? `${f.dias_cobertura} días` : '—'}</td>
+                  <td>{sellThrough !== null ? `${sellThrough}%` : '—'}</td>
+                  <td className={f.alerta_rotacion_90_dias ? 'text-red-400 font-bold' : ''}>
+                    {f.nivel < 2 ? '—' : f.dias_en_stock !== null ? `${f.dias_en_stock} días` : '—'}
+                  </td>
+                  <td>{f.nivel < 2 ? (f.nivel === 0 ? <Badge estado={f.estado_stock} /> : '—') : <Badge estado={f.estado_stock} />}</td>
+                </tr>
+              )
+            })}
+            {filas.length === 0 && (
               <tr>
                 <td colSpan={8} className="text-gray-500 py-4 text-center">
                   No hay productos activos cargados.
