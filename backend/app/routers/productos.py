@@ -200,6 +200,9 @@ def listar_variantes(producto_id: int, db: Session = Depends(get_db)):
     if not db.get(models.Producto, producto_id):
         raise HTTPException(404, "Producto no encontrado.")
     variantes = db.query(models.Variante).filter(models.Variante.producto_id == producto_id).all()
+    # stock_actual por variante: mismo cálculo que usa la pantalla de Stock (stock_por_variante),
+    # reusado acá para que Ventas pueda deshabilitar combinaciones sin stock sin duplicar la fórmula.
+    stock_por_id = {s["variante_id"]: s["stock_actual"] for s in calculations.stock_por_variante(db)}
     resultado = []
     for v in variantes:
         valores = (
@@ -213,6 +216,7 @@ def listar_variantes(producto_id: int, db: Session = Depends(get_db)):
             "id": v.id,
             "producto_id": v.producto_id,
             "activo": v.activo,
+            "stock_actual": stock_por_id.get(v.id, 0),
             "valores": [
                 {"atributo_id": a.id, "atributo": a.nombre, "valor_atributo_id": va.id, "valor": va.valor}
                 for va, a in valores

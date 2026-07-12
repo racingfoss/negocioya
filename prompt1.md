@@ -1,98 +1,62 @@
-Dos cosas relacionadas: centralizar los "números mágicos" que hoy
-están hardcodeados como constantes en `calculations.py` en una pantalla de Configuración editable, y
-agregar snapshots periódicos del mix real (para poder ver su evolución en el tiempo).
+En Caja > Ventas: al elegir un producto con variantes, los combos de atributo tienen que reflejar stock
+disponible, no solo qué combinaciones existen.
 
-## Parte 1: Configuración del negocio
+Antes de tocar nada, revisá el estado actual de `Movimientos.jsx` — no doy por sentado que ya tenga el
+mismo filtro por existencia que `Compras.jsx` (con su función `opcionesParaAtributo` y los datos de
+`variantesProducto`). Puede que Movimientos todavía muestre TODOS los atributos/valores del sistema sin
+filtrar nada, o puede que ya tenga el filtro por existencia pero le falte el de stock. Confirmalo primero.
 
-### Backend
+## Comportamiento esperado (destino final, sin importar de qué estado parta)
 
-- Nueva tabla `configuracion`: una sola fila (singleton, id fijo), con estas columnas (usá como default
-  el valor que ya tiene hoy la constante equivalente en `calculations.py`, para que nadie note un cambio
-  de comportamiento el día que se aplique esto):
-  - `demanda_ventana_dias` (hoy `DEMANDA_VENTANA_DIAS`, default 90)
-  - `lead_time_default_dias` (hoy `LEAD_TIME_DEFAULT_DIAS`, default 7)
-  - `safety_days` (hoy `SAFETY_DAYS`, default 3)
-  - `stock_dias_verde` (hoy el 30 hardcodeado en `_estado_stock`)
-  - `stock_dias_rojo` (hoy el 7 hardcodeado en `_estado_stock`)
-  - `rotacion_alerta_dias` (hoy el 90 hardcodeado en la alerta FIFO de `stock_por_producto`)
-  - `umbral_cambio_costo_pct` (hoy `UMBRAL_CAMBIO_COSTO_PCT`, default 2.0)
-  - `renegociacion_margen_umbral_pct` (hoy el 15 hardcodeado en `analisis_combinado`)
-  - `renegociacion_percentil_volumen` (hoy el 0.7 hardcodeado en `analisis_combinado`)
-  - `motor_decoracion_pareto_pct` (hoy el 80 hardcodeado como fallback en `analisis_combinado`)
-  - `mix_real_ventana_dias_default` (hoy el 30 que quedó de default en punto de equilibrio)
-  - `snapshot_periodo_dias` (nuevo, para la Parte 2, default 30)
-- Función `get_configuracion(db)`: devuelve la fila única, creándola con los defaults de arriba si todavía
-  no existe (bootstrap en el primer uso, no hace falta migración de datos).
-- Recorrer `calculations.py` y reemplazar CADA referencia a las constantes de módulo listadas arriba por
-  una lectura de `get_configuracion(db)` al principio de la función que las use (todas ya reciben `db`
-  como parámetro, así que no hace falta cambiar firmas ni tocar los routers que las llaman). No cambies
-  ninguna fórmula ni la lógica de negocio en sí — el valor que usaban antes como constante fija ahora sale
-  de la config, nada más.
-- Endpoints: `GET /configuracion` (devuelve la fila, la crea si no existe) y `PUT /configuracion`
-  (actualiza los campos que se manden).
+- Igual que ya hace `Compras.jsx`: el combo del primer atributo (ej. Talle) solo lista valores que forman
+  parte de alguna `Variante` real de ESE producto — no todos los `valores_atributo` del sistema. El
+  siguiente combo (ej. Color) se filtra además a lo que, combinado con el valor ya elegido, corresponda a
+  una variante real.
+- Encima de eso (esto es lo nuevo, específico de Ventas, no aplica a Compras): de esas opciones que sí
+  existen, hay que distinguir cuáles tienen stock:
+  - Si al menos una variante con ese valor tiene `stock_actual > 0`: opción habilitada, normal.
+  - Si NINGUNA variante con ese valor tiene stock: la opción se sigue mostrando (no se oculta — tiene
+    sentido que la vendedora vea que el producto "existe" en ese talle aunque no haya ahora), pero con
+    `disabled` en el `<option>` y agregale " (sin stock)" al texto.
+  - Mismo criterio en cascada para el segundo combo, evaluando el `stock_actual` de la combinación
+    puntual (ej. Talle+Color), no solo del primer atributo.
+- Si se cambia la selección del primer atributo, resetear la del segundo.
+- Si TODAS las opciones del primer combo quedan deshabilitadas (sin stock en ninguna variante), mostrar
+  un mensaje explícito arriba del formulario ("Este producto no tiene stock disponible en ninguna
+  variante") en vez de un combo lleno de opciones grises sin contexto.
+- Si el producto tiene `tiene_variantes=True` pero cero `Variante` cargadas todavía, replicá el mismo
+  aviso que ya usa Compras para ese caso ("Este producto no tiene variantes cargadas todavía...").
 
-### Frontend
+## Backend: extender, no duplicar
 
-- Página nueva `Configuracion.jsx`, con los campos agrupados en las mismas categorías que usé para
-  explicarte esto (Stock y Reposición / Compras / Análisis / Punto de Equilibrio), cada campo con su
-  etiqueta en criollo (nada de nombres de variable Python) y una ayuda corta debajo explicando qué efecto
-  tiene. Un solo botón "Guardar cambios" al final que hace el `PUT`.
-- Link de navegación nuevo "⚙️ Configuración".
-- Aclaración importante para el campo `mix_real_ventana_dias_default`: sigue siendo solo el valor inicial
-  con el que abre la pantalla de Punto de Equilibrio — el selector de ventana (7/30/90) que ya existe ahí
-  para elegirla al vuelo NO se elimina ni se reemplaza, esto solo cambia cuál viene tildado por defecto.
+`stock_por_variante()` ya existe en `calculations.py` (mismo cálculo que `stock_por_producto`, agrupado
+por `variante_id`). Identificá qué endpoint alimenta hoy a `variantesProducto` en `Compras.jsx` y
+extendé ESA respuesta para que cada variante incluya su `stock_actual` (usando `stock_por_variante`) —
+no crees un endpoint paralelo. Ventas y Compras terminan consumiendo la misma fuente de datos; la
+diferencia de comportamiento (Compras ignora `stock_actual` al habilitar/deshabilitar, Ventas no) queda
+del lado del frontend de cada pantalla, no del backend. NO toques el comportamiento de `Compras.jsx`
+— sigue mostrando todas las variantes existentes como seleccionables, tengan o no stock.
 
-## Parte 2: Snapshots del mix real
+## Dos agregados que no pediste explícitamente pero salen del mismo bug — decidí antes de tirar el prompt si los querés en esta pasada o los dejamos para después
 
-### Backend
+1. **Tope de cantidad en el frontend**: aunque el combo ya no deje elegir una variante sin stock, nada
+   impide cargar una Cantidad mayor al `stock_actual` de la variante elegida (ej. hay 3, cargás 10).
+2. **Validación real en el backend**: confirmado en el CLAUDE.md que `POST /movimientos` (tipo Venta) hoy
+   solo valida que venga `variante_id` y que pertenezca al producto — no valida que la `cantidad` no
+   supere el `stock_actual` de esa variante (ni, para productos sin variantes, el `stock_actual` del
+   producto). El punto 1 es solo cosmético del lado del frontend, se puede saltear llamando a la API
+   directo — si querés blindarlo de verdad, el backend tiene que rechazar la Venta en ese caso.
 
-- Nueva tabla `mix_snapshots`: `id`, `fecha` (cuándo se tomó), `ventana_dias` (la ventana usada en ese
-  cálculo), `producto_id` (FK nullable — el snapshot no debe depender de que el producto siga existiendo
-  después), `producto_nombre` y `categoria_nombre` (guardados como texto plano en el momento del
-  snapshot, no como referencia — así el histórico se mantiene legible aunque el producto se borre, se
-  renombre o cambie de categoría más adelante), `mix_pct`, `facturacion`.
-- Función `verificar_y_tomar_snapshot_si_corresponde(db)`:
-  1. Lee `snapshot_periodo_dias` de la configuración.
-  2. Busca la fecha del snapshot más reciente en `mix_snapshots` (si no hay ninguno, corresponde tomar
-     uno ya).
-  3. Si pasaron `snapshot_periodo_dias` o más desde ese último snapshot (o si nunca se tomó ninguno):
-     calcular el mix real de todos los productos activos con la MISMA función `facturacion_por_producto`
-     que ya se usa en el Punto de Equilibrio (no dupliques esa lógica), usando `ventana_dias` = el mismo
-     `snapshot_periodo_dias` de la config, e insertar una fila por producto activo con facturación > 0 en
-     esa ventana.
-  4. No hace falta que sea perfectamente puntual en la fecha — alcanza con que se dispare la primera vez
-     que se detecta que ya tocaba, no hace falta agregar un scheduler/cron nuevo al proyecto.
-- Llamar a esta función al principio de `GET /dashboard/resumen` y de `GET /dashboard/punto-equilibrio`
-  (son las pantallas que más se van a abrir de rutina, así que entre las dos cubren bien la detección) —
-  que corra en segundo plano respecto a la respuesta del endpoint (no debe hacer más lenta la carga del
-  Dashboard si ya le tocaba tomar snapshot en ese momento; usá un
-  [BackgroundTask](https://fastapi.tiangolo.com/tutorial/background-tasks/) de FastAPI para esto, no lo
-  hagas bloqueante).
-- Endpoint `POST /mix-snapshots/tomar`: fuerza un snapshot ahora mismo, sin importar si "tocaba" o no
-  (para que la usuaria pueda tomar uno manual cuando quiera, además de los automáticos).
-- Endpoint `GET /mix-snapshots?producto_id=&categoria=`: devuelve el historial (opcionalmente filtrado)
-  ordenado por fecha, para graficar la evolución.
-
-### Frontend
-
-- Sección nueva (dentro de la pantalla de Punto de Equilibrio en el Dashboard, o una pestaña aparte si te
-  parece que queda más prolijo — decidilo vos según cómo se vea) con:
-  - Un botón "Tomar snapshot ahora".
-  - Un gráfico de líneas (Recharts, mismo estilo que el resto de la app) mostrando la evolución del mix%
-    a lo largo del tiempo — como mínimo por categoría (más legible que por cada producto individual si
-    hay muchos); si querés agregar un selector para ver el detalle por producto también, mejor.
+Si los querés a los dos, agregalo explícito en el prompt antes de pegárselo a Claude Code. Si no, decile
+que se enfoque solo en los combos de Ventas y te muestre plan para estos dos antes de tocar nada.
 
 ## Qué NO cambiar
 
-No toques la fórmula de ningún cálculo (BCG, Days-of-Cover, costo promedio, etc.) — esto es mover de
-dónde sale el número de configuración, no cambiar qué hace cada número. Tampoco toques Compras,
-Movimientos, Importación ni Catálogo más allá de leer la config donde ya usan alguna de estas constantes.
+`Compras.jsx` y su filtro por existencia (sin tocar). Stock, Análisis, Catálogo, Importación.
 
 ## Antes de terminar
 
-Probá que cambiar un valor en Configuración (por ejemplo `umbral_cambio_costo_pct`) efectivamente cambia
-el comportamiento del aviso en Compras, sin reiniciar nada. Probá el snapshot: simulá que pasó el período
-configurado (podés insertar un `mix_snapshots` viejo a mano en la prueba) y confirmá que
-`verificar_y_tomar_snapshot_si_corresponde` toma uno nuevo al abrir el Dashboard. Actualizá el CLAUDE.md
-agregando la tabla de configuración y sus defaults, y la decisión de snapshot "lazy" (sin scheduler) con
-el motivo.
+Probá con un producto con Talle S sin stock en ningún color, Talle M con stock solo en un color, Talle L
+con stock en todos — confirmá que el combo de Talle muestra S deshabilitado y que, al elegir M, el combo
+de Color deja seleccionable solo el color con stock. Actualizá el CLAUDE.md (sección "Variantes de
+producto", junto al punto de Compras ya documentado) con este comportamiento de Ventas.

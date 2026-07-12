@@ -608,6 +608,27 @@ def stock_por_variante(db: Session) -> list:
     return resultado
 
 
+def stock_disponible(db: Session, producto_id: int, variante_id: Optional[int] = None) -> int:
+    """Unidades disponibles ahora mismo (total comprado - total vendido), acotado a un producto o
+    a una variante puntual. Mismo cálculo que stock_por_producto/stock_por_variante, pero sin
+    recorrer todo el catálogo — pensado para validar una Venta puntual (POST/PUT /movimientos)."""
+    if variante_id is not None:
+        total_comprado = db.query(func.coalesce(func.sum(models.Compra.cantidad), 0)).filter(
+            models.Compra.variante_id == variante_id
+        ).scalar()
+        total_vendido = db.query(func.coalesce(func.sum(models.Movimiento.cantidad), 0)).filter(
+            models.Movimiento.tipo == "Venta", models.Movimiento.variante_id == variante_id
+        ).scalar()
+    else:
+        total_comprado = db.query(func.coalesce(func.sum(models.Compra.cantidad), 0)).filter(
+            models.Compra.producto_id == producto_id
+        ).scalar()
+        total_vendido = db.query(func.coalesce(func.sum(models.Movimiento.cantidad), 0)).filter(
+            models.Movimiento.tipo == "Venta", models.Movimiento.producto_id == producto_id
+        ).scalar()
+    return int(total_comprado) - int(total_vendido)
+
+
 # ---------------------------------------------------------------------------
 # Árbol de stock de 3 niveles para productos con variantes: Producto (total) >
 # valor del atributo con orden=1 (subtotal, ej. Talle) > variante individual con

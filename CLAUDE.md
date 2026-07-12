@@ -192,6 +192,37 @@ columnas fijas.
   Compras lo avisa explícitamente ("Este producto no tiene variantes cargadas todavía, configuralas en
   Catálogo antes de registrar stock") en vez de mostrar combos vacíos, tanto al elegir el producto como
   si se intenta guardar la compra igual.
+- **Movimientos (Ventas) replica el mismo filtro por existencia que Compras, y encima le suma stock**
+  (`frontend/src/pages/Movimientos.jsx`, misma función `opcionesParaAtributo` que en `Compras.jsx`): los
+  combos de atributo al cargar una Venta solo listan valores que existen en alguna `Variante` real del
+  producto (mismo criterio, misma cascada). La diferencia con Compras (que sigue sin tocarse) es que acá
+  cada opción se marca además con `conStock` — `true` si al menos una `Variante` candidata con ese valor
+  tiene `stock_actual > 0`. Las opciones sin stock **no se ocultan**, quedan como `<option disabled>` con
+  " (sin stock)" en el texto (la vendedora ve que el talle "existe" aunque hoy no haya). Elegir un valor
+  en un atributo resetea la selección de los atributos siguientes (mismo `elegirValorAtributo` que
+  Compras). Si TODAS las opciones del primer atributo quedan sin stock, se oculta el bloque de combos
+  entero y se muestra un mensaje único ("Este producto no tiene stock disponible en ninguna variante") en
+  vez de un combo lleno de opciones grises. El aviso de "variantes no cargadas todavía" (mismo texto que
+  Compras) también se replicó acá. **Backend**: no hay endpoint paralelo — se extendió
+  `GET /productos/{id}/variantes` (`backend/app/routers/productos.py`, `listar_variantes`) para que cada
+  variante devuelta incluya `stock_actual`, calculado con `calculations.stock_por_variante()` (la misma
+  función que ya usaba la pantalla de Stock). Compras consume el mismo endpoint y sigue ignorando ese
+  campo — el criterio de habilitar/deshabilitar por stock queda 100% del lado del frontend de Ventas, no
+  del backend. **Tope de cantidad contra stock, en frontend y backend** (agregado en la misma ronda):
+  el input de cantidad de `Movimientos.jsx` tiene `max={stockDisponible}` — `stock_actual` de la variante
+  elegida si el producto tiene variantes, o `stock_actual` del producto entero (`GET /stock/productos`,
+  ya cargado en `cargar()`) si no. `guardar()` valida lo mismo antes de pegarle a la API y muestra un
+  aviso si la cantidad cargada supera el disponible. Al **editar** una Venta ya registrada, se le suma de
+  vuelta su propia `cantidad` original (`ventaOriginal`, capturado en `editar()`) antes de comparar,
+  porque esa cantidad ya está descontada del `stock_actual` actual — si no, no se podría ni re-guardar el
+  mismo registro sin tocarlo. Esto es solo cosmético (se puede saltear llamando a la API directo), así
+  que la validación real está en el **backend**: `calculations.stock_disponible(db, producto_id,
+  variante_id)` (nueva función, mismo cálculo `total_comprado - total_vendido` que `stock_por_producto`/
+  `stock_por_variante` pero acotado a un solo id, sin recorrer todo el catálogo) es usada por `_validar()`
+  en `backend/app/routers/movimientos.py` para rechazar con 400 cualquier Venta (`POST` o `PUT`) cuya
+  `cantidad` supere el stock disponible. En el `PUT` (edición), `_validar` recibe el `Movimiento` original
+  (`actual`) y le sobresuma su `cantidad` vieja si el `producto_id`/`variante_id` no cambiaron, mismo
+  criterio que el frontend, para no bloquear la edición de una Venta ya existente por su propia cantidad.
 - **Alta de producto nuevo con variantes es atómica, en un solo paso** (antes había que guardar el
   producto primero y recién en la edición aparecía el apartado de atributos/variantes — mal UX, dos
   pantallas para una sola operación lógica). En el formulario de ALTA de `frontend/src/pages/Productos.jsx`,

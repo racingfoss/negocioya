@@ -22,6 +22,7 @@ export default function Movimientos() {
   const [movimientos, setMovimientos] = useState([])
   const [productos, setProductos] = useState([])
   const [categorias, setCategorias] = useState([])
+  const [stockProductos, setStockProductos] = useState([])
   const [form, setForm] = useState(empty)
   const [editId, setEditId] = useState(null)
   const [montoEditadoManualmente, setMontoEditadoManualmente] = useState(false)
@@ -33,11 +34,14 @@ export default function Movimientos() {
   const [valoresElegidos, setValoresElegidos] = useState({}) // atributo_id -> valor_id
   const [edicionVarianteId, setEdicionVarianteId] = useState(null)
   const [varianteIdOriginal, setVarianteIdOriginal] = useState(null)
+  // venta original en edición: para no contar su propia cantidad como "ya vendida" al topear stock
+  const [ventaOriginal, setVentaOriginal] = useState(null) // { productoId, varianteId, cantidad }
 
   const cargar = () => {
     api.get('/movimientos').then((r) => setMovimientos(r.data))
     api.get('/productos', { params: { solo_activos: true } }).then((r) => setProductos(r.data))
     api.get('/categorias').then((r) => setCategorias(r.data))
+    api.get('/stock/productos').then((r) => setStockProductos(r.data))
   }
   useEffect(() => {
     cargar()
@@ -77,6 +81,58 @@ export default function Movimientos() {
         )
       : null
 
+  // Igual que Compras.jsx: el combo de un atributo solo ofrece valores que ya existen en alguna
+  // Variante real de este producto, filtrado en cascada por lo elegido en los atributos anteriores.
+  // A diferencia de Compras, acá además se marca cada opción con si tiene stock (conStock): en Ventas
+  // no tiene sentido dejar elegir a ciegas una combinación sin unidades disponibles.
+  const opcionesParaAtributo = (atributo, index) => {
+    const previos = atributosProducto.slice(0, index)
+    const candidatas = variantesProducto.filter((v) =>
+      previos.every((pa) => {
+        const elegido = valoresElegidos[pa.atributo_id]
+        if (!elegido) return true
+        return v.valores.some((x) => x.atributo_id === pa.atributo_id && x.valor_atributo_id === Number(elegido))
+      })
+    )
+    const vistos = new Map()
+    candidatas.forEach((v) => {
+      const match = v.valores.find((x) => x.atributo_id === atributo.atributo_id)
+      if (match) {
+        const previo = vistos.get(match.valor_atributo_id)
+        const conStock = Number(v.stock_actual) > 0 || (previo?.conStock ?? false)
+        vistos.set(match.valor_atributo_id, { id: match.valor_atributo_id, valor: match.valor, conStock })
+      }
+    })
+    return Array.from(vistos.values())
+  }
+
+  const elegirValorAtributo = (atributoId, index, valor) => {
+    const nuevos = { ...valoresElegidos, [atributoId]: valor }
+    // si cambia un atributo, los siguientes (en orden) pueden dejar de corresponder a una variante real
+    atributosProducto.slice(index + 1).forEach((a) => delete nuevos[a.atributo_id])
+    setValoresElegidos(nuevos)
+  }
+
+  const opcionesPrimerAtributo = atributosProducto.length > 0 ? opcionesParaAtributo(atributosProducto[0], 0) : []
+  const sinStockEnNinguna =
+    atributosProducto.length > 0 &&
+    opcionesPrimerAtributo.length > 0 &&
+    opcionesPrimerAtributo.every((o) => !o.conStock)
+
+  // Tope de cantidad: stock_actual de la variante elegida (si el producto tiene variantes) o del
+  // producto entero (si no). Al editar una Venta ya cargada, se le suma de vuelta su propia cantidad
+  // original (ya está descontada del stock actual) para no bloquear la edición de su propio registro.
+  const stockActualBase = productoSeleccionado?.tiene_variantes
+    ? varianteResuelta?.stock_actual
+    : stockProductos.find((s) => s.producto_id === productoSeleccionado?.id)?.stock_actual
+  const esLaVentaOriginal =
+    editId &&
+    ventaOriginal &&
+    String(form.producto_id) === String(ventaOriginal.productoId) &&
+    (varianteResuelta?.id || null) === ventaOriginal.varianteId
+  const stockDisponible =
+    stockActualBase == null ? null : stockActualBase + (esLaVentaOriginal ? ventaOriginal.cantidad : 0)
+
   // al editar un movimiento ya cargado, prellenar los selectores con la variante que tenía
   useEffect(() => {
     if (edicionVarianteId && variantesProducto.length > 0) {
@@ -102,13 +158,22 @@ export default function Movimientos() {
   const cambiarTipo = (tipo) => {
     setMontoEditadoManualmente(false)
     setValoresElegidos({})
+    setVentaOriginal(null)
     setForm({ ...empty, tipo, fecha: form.fecha })
   }
 
   const guardar = async () => {
     setError('')
+    if (form.tipo === 'Venta' && productoSeleccionado?.tiene_variantes && variantesProducto.length === 0 && !editId) {
+      setError('Este producto no tiene variantes cargadas todavía, configuralas en Catálogo antes de registrar la venta.')
+      return
+    }
     if (form.tipo === 'Venta' && atributosProducto.length > 0 && !varianteResuelta && !editId) {
       setError('Elegí un valor para cada atributo, así se puede resolver la variante de la venta.')
+      return
+    }
+    if (form.tipo === 'Venta' && stockDisponible != null && Number(form.cantidad || 0) > stockDisponible) {
+      setError(`No hay stock suficiente: disponible ${stockDisponible}, pediste ${form.cantidad}.`)
       return
     }
     const payload = {
@@ -127,6 +192,7 @@ export default function Movimientos() {
       setMontoEditadoManualmente(false)
       setEditId(null)
       setVarianteIdOriginal(null)
+      setVentaOriginal(null)
       cargar()
     } catch (e) {
       setError(getErrorMessage(e))
@@ -138,6 +204,11 @@ export default function Movimientos() {
     setMontoEditadoManualmente(true) // no pisar el monto ya guardado al editar
     setEdicionVarianteId(m.variante_id || null)
     setVarianteIdOriginal(m.variante_id || null)
+    setVentaOriginal(
+      m.tipo === 'Venta'
+        ? { productoId: m.producto_id, varianteId: m.variante_id || null, cantidad: m.cantidad || 0 }
+        : null
+    )
     const fechaLocal = new Date(m.fecha)
     fechaLocal.setMinutes(fechaLocal.getMinutes() - fechaLocal.getTimezoneOffset())
     setForm({
@@ -215,24 +286,27 @@ export default function Movimientos() {
                   </option>
                 ))}
               </select>
-              {atributosProducto.map((a) => (
-                <select
-                  key={a.atributo_id}
-                  className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
-                  value={valoresElegidos[a.atributo_id] || ''}
-                  onChange={(e) => setValoresElegidos({ ...valoresElegidos, [a.atributo_id]: e.target.value })}
-                >
-                  <option value="">{a.atributo}...</option>
-                  {a.valores.map((v) => (
-                    <option key={v.id} value={v.id}>
-                      {v.valor}
-                    </option>
-                  ))}
-                </select>
-              ))}
+              {!sinStockEnNinguna &&
+                atributosProducto.map((a, i) => (
+                  <select
+                    key={a.atributo_id}
+                    className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
+                    value={valoresElegidos[a.atributo_id] || ''}
+                    onChange={(e) => elegirValorAtributo(a.atributo_id, i, e.target.value)}
+                  >
+                    <option value="">{a.atributo}...</option>
+                    {opcionesParaAtributo(a, i).map((v) => (
+                      <option key={v.id} value={v.id} disabled={!v.conStock}>
+                        {v.valor}
+                        {!v.conStock ? ' (sin stock)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                ))}
               <input
                 type="number"
                 min="1"
+                max={stockDisponible ?? undefined}
                 className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
                 placeholder="Cantidad vendida"
                 value={form.cantidad}
@@ -274,9 +348,24 @@ export default function Movimientos() {
             (cantidad × precio), pero lo podés pisar a mano si vendiste con descuento.
           </p>
         )}
-        {form.tipo === 'Venta' && atributosProducto.length > 0 && !varianteResuelta && !editId && (
+        {form.tipo === 'Venta' && productoSeleccionado?.tiene_variantes && variantesProducto.length === 0 && (
+          <p className="text-sm text-amber-400 bg-amber-950/30 border border-amber-800 rounded-lg p-3">
+            Este producto no tiene variantes cargadas todavía, configuralas en Catálogo antes de registrar la venta.
+          </p>
+        )}
+        {form.tipo === 'Venta' && sinStockEnNinguna && (
+          <p className="text-sm text-red-400 bg-red-950/30 border border-red-800 rounded-lg p-3">
+            Este producto no tiene stock disponible en ninguna variante.
+          </p>
+        )}
+        {form.tipo === 'Venta' && atributosProducto.length > 0 && !sinStockEnNinguna && !varianteResuelta && !editId && (
           <p className="text-xs text-amber-400">
             Elegí un valor para cada atributo para resolver la variante puntual de esta venta.
+          </p>
+        )}
+        {form.tipo === 'Venta' && stockDisponible != null && Number(form.cantidad || 0) > stockDisponible && (
+          <p className="text-xs text-red-400">
+            Stock disponible: {stockDisponible}. La cantidad cargada lo supera.
           </p>
         )}
 
@@ -289,6 +378,7 @@ export default function Movimientos() {
               onClick={() => {
                 setEditId(null)
                 setMontoEditadoManualmente(false)
+                setVentaOriginal(null)
                 setForm({ ...empty, fecha: nowLocal() })
               }}
               className="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded-lg"
