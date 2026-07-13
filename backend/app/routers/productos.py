@@ -1,12 +1,20 @@
 import itertools
+import os
+import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from .. import calculations, models, schemas
 from ..database import get_db
 
 router = APIRouter(prefix="/productos", tags=["Productos"])
+
+# Fotos de producto para el catálogo de e-commerce (ver sección "E-commerce" en CLAUDE.md).
+FOTOS_DIR = os.getenv("FOTOS_PRODUCTOS_DIR", "/app/fotos_productos")
+EXTENSIONES_FOTO_VALIDAS = {"jpg", "jpeg", "png", "webp"}
+FOTO_TAMANO_MAXIMO_BYTES = 5 * 1024 * 1024
 
 
 @router.get("/", response_model=list[schemas.Producto])
@@ -195,14 +203,11 @@ def listar_atributos(producto_id: int, db: Session = Depends(get_db)):
     ]
 
 
-@router.get("/{producto_id}/variantes", response_model=list[dict])
-def listar_variantes(producto_id: int, db: Session = Depends(get_db)):
-    if not db.get(models.Producto, producto_id):
-        raise HTTPException(404, "Producto no encontrado.")
+def _formatear_variantes(db: Session, producto_id: int, stock_por_id: dict) -> list[dict]:
+    """Arma la lista de variantes de un producto con su stock, a partir de un mapa de stock ya
+    calculado (stock_por_variante(db)) — separado de listar_variantes para que GET /ecommerce/catalogo
+    pueda calcular ese mapa UNA sola vez para todo el catálogo en vez de por cada producto."""
     variantes = db.query(models.Variante).filter(models.Variante.producto_id == producto_id).all()
-    # stock_actual por variante: mismo cálculo que usa la pantalla de Stock (stock_por_variante),
-    # reusado acá para que Ventas pueda deshabilitar combinaciones sin stock sin duplicar la fórmula.
-    stock_por_id = {s["variante_id"]: s["stock_actual"] for s in calculations.stock_por_variante(db)}
     resultado = []
     for v in variantes:
         valores = (
@@ -225,6 +230,16 @@ def listar_variantes(producto_id: int, db: Session = Depends(get_db)):
     return resultado
 
 
+@router.get("/{producto_id}/variantes", response_model=list[dict])
+def listar_variantes(producto_id: int, db: Session = Depends(get_db)):
+    if not db.get(models.Producto, producto_id):
+        raise HTTPException(404, "Producto no encontrado.")
+    # stock_actual por variante: mismo cálculo que usa la pantalla de Stock (stock_por_variante),
+    # reusado acá para que Ventas pueda deshabilitar combinaciones sin stock sin duplicar la fórmula.
+    stock_por_id = {s["variante_id"]: s["stock_actual"] for s in calculations.stock_por_variante(db)}
+    return _formatear_variantes(db, producto_id, stock_por_id)
+
+
 @router.post("/{producto_id}/variantes/generar", response_model=list[dict])
 def generar_variantes(producto_id: int, payload: schemas.GenerarVariantesRequest, db: Session = Depends(get_db)):
     producto = db.get(models.Producto, producto_id)
@@ -237,3 +252,67 @@ def generar_variantes(producto_id: int, payload: schemas.GenerarVariantesRequest
     db.commit()
 
     return listar_variantes(producto_id, db)
+
+
+# --- Fotos de producto (catálogo de e-commerce) ---
+
+@router.post("/{producto_id}/fotos", response_model=schemas.FotoProducto)
+async def subir_foto(producto_id: int, archivo: UploadFile = File(...), db: Session = Depends(get_db)):
+    if not db.get(models.Producto, producto_id):
+        raise HTTPException(404, "Producto no encontrado.")
+
+    ext = (archivo.filename or "").rsplit(".", 1)[-1].lower()
+    if ext not in EXTENSIONES_FOTO_VALIDAS:
+        raise HTTPException(400, "Formato inválido: solo se aceptan JPG, PNG o WEBP.")
+
+    contenido = await archivo.read()
+    if len(contenido) > FOTO_TAMANO_MAXIMO_BYTES:
+        raise HTTPException(400, "La foto no puede superar los 5MB.")
+
+    carpeta = os.path.join(FOTOS_DIR, str(producto_id))
+    os.makedirs(carpeta, exist_ok=True)
+    nombre_archivo = f"{uuid.uuid4().hex}.{ext}"
+    with open(os.path.join(carpeta, nombre_archivo), "wb") as f:
+        f.write(contenido)
+
+    siguiente_orden = (
+        db.query(func.coalesce(func.max(models.ProductoFoto.orden), 0))
+        .filter(models.ProductoFoto.producto_id == producto_id)
+        .scalar()
+    ) + 1
+    foto = models.ProductoFoto(
+        producto_id=producto_id, ruta_archivo=f"{producto_id}/{nombre_archivo}", orden=siguiente_orden
+    )
+    db.add(foto)
+    db.commit()
+    db.refresh(foto)
+    return foto
+
+
+@router.delete("/{producto_id}/fotos/{foto_id}")
+def borrar_foto(producto_id: int, foto_id: int, db: Session = Depends(get_db)):
+    foto = db.get(models.ProductoFoto, foto_id)
+    if not foto or foto.producto_id != producto_id:
+        raise HTTPException(404, "Foto no encontrada.")
+    ruta_completa = os.path.join(FOTOS_DIR, foto.ruta_archivo)
+    db.delete(foto)
+    db.commit()
+    if os.path.exists(ruta_completa):
+        os.remove(ruta_completa)  # se borra el archivo DESPUÉS del commit: si el remove falla, la BD ya quedó consistente
+    return {"ok": True}
+
+
+@router.put("/{producto_id}/fotos/orden", response_model=list[schemas.FotoProducto])
+def reordenar_fotos(producto_id: int, payload: schemas.ReordenarFotosRequest, db: Session = Depends(get_db)):
+    fotos = {
+        f.id: f
+        for f in db.query(models.ProductoFoto).filter(models.ProductoFoto.producto_id == producto_id).all()
+    }
+    if not fotos:
+        raise HTTPException(404, "Este producto no tiene fotos cargadas.")
+    if set(payload.orden_ids) != set(fotos.keys()):
+        raise HTTPException(400, "La lista de IDs no coincide con las fotos actuales del producto.")
+    for pos, foto_id in enumerate(payload.orden_ids, start=1):
+        fotos[foto_id].orden = pos
+    db.commit()
+    return sorted(fotos.values(), key=lambda f: f.orden)

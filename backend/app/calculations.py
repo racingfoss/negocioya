@@ -1,8 +1,10 @@
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from statistics import median
 from typing import Optional
 
+from fastapi import HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
@@ -627,6 +629,92 @@ def stock_disponible(db: Session, producto_id: int, variante_id: Optional[int] =
             models.Movimiento.tipo == "Venta", models.Movimiento.producto_id == producto_id
         ).scalar()
     return int(total_comprado) - int(total_vendido)
+
+
+TIPOS_MOVIMIENTO_VALIDOS = ("Venta", "Ingreso", "Egreso")
+
+
+# ---------------------------------------------------------------------------
+# Única función de este módulo que lanza HTTPException — excepción deliberada a
+# la convención "los routers validan, calculations calcula". Se justifica porque
+# POST/PUT /movimientos (Caja) y POST /ecommerce/ordenes necesitan literalmente
+# la misma regla de negocio para dar de alta una Venta; duplicarla en dos
+# routers era peor que la inconsistencia de estilo. `actual` solo lo usa el PUT
+# de edición de un Movimiento ya existente (le suma de vuelta su propia
+# cantidad vieja antes de comparar, porque ya está descontada del stock actual)
+# — en toda alta (POST /movimientos y cada línea de una orden de e-commerce)
+# queda en None.
+# ---------------------------------------------------------------------------
+def validar_movimiento(
+    db: Session,
+    tipo: str,
+    producto_id: Optional[int],
+    variante_id: Optional[int],
+    cantidad: Optional[int],
+    actual: Optional["models.Movimiento"] = None,
+) -> None:
+    if tipo not in TIPOS_MOVIMIENTO_VALIDOS:
+        raise HTTPException(400, "El tipo debe ser 'Venta', 'Ingreso' o 'Egreso'.")
+    if tipo == "Venta" and not producto_id:
+        raise HTTPException(400, "Una Venta debe tener un producto asociado.")
+    if producto_id is not None:
+        producto = db.get(models.Producto, producto_id)
+        if not producto:
+            raise HTTPException(400, "El producto indicado no existe.")
+        if tipo == "Venta" and producto.tiene_variantes and not variante_id:
+            raise HTTPException(400, "Este producto tiene variantes: especificá la variante de la venta.")
+        if variante_id is not None:
+            variante = db.get(models.Variante, variante_id)
+            if not variante or variante.producto_id != producto_id:
+                raise HTTPException(400, "La variante indicada no corresponde a este producto.")
+        if tipo == "Venta":
+            disponible = stock_disponible(db, producto_id, variante_id)
+            # al editar una Venta ya registrada del mismo producto/variante, su cantidad vieja ya está
+            # descontada del stock actual — se sube de vuelta antes de comparar contra la cantidad nueva
+            if (
+                actual is not None
+                and actual.tipo == "Venta"
+                and actual.producto_id == producto_id
+                and actual.variante_id == variante_id
+            ):
+                disponible += actual.cantidad or 0
+            if (cantidad or 0) > disponible:
+                referencia = "esta variante" if variante_id else "este producto"
+                raise HTTPException(
+                    400,
+                    f"No hay stock suficiente para {referencia}: disponible {disponible}, "
+                    f"pediste {cantidad}.",
+                )
+
+
+def registrar_venta(
+    db: Session,
+    producto_id: int,
+    variante_id: Optional[int],
+    cantidad: int,
+    monto: Decimal,
+    concepto: Optional[str] = None,
+    fecha: Optional[datetime] = None,
+    costo_fijo_id: Optional[int] = None,
+) -> models.Movimiento:
+    """Valida (vía validar_movimiento) y arma un Movimiento tipo Venta — único camino de alta de una
+    Venta, usado por POST /movimientos y por cada línea de POST /ecommerce/ordenes. No hace commit ni
+    refresh: el caller controla la transacción (en e-commerce, junto con la Orden y sus items)."""
+    validar_movimiento(db, "Venta", producto_id, variante_id, cantidad, actual=None)
+    mov = models.Movimiento(
+        tipo="Venta",
+        concepto=concepto,
+        cantidad=cantidad,
+        monto=monto,
+        producto_id=producto_id,
+        variante_id=variante_id,
+        costo_fijo_id=costo_fijo_id,
+    )
+    if fecha is not None:
+        mov.fecha = fecha
+    db.add(mov)
+    db.flush()  # mov.id disponible sin comprometer la transacción — mismo patrón que resolver_o_crear_variante
+    return mov
 
 
 # ---------------------------------------------------------------------------

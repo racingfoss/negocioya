@@ -45,6 +45,8 @@ class Producto(Base):
     lead_time_dias = Column(Integer, nullable=True)  # plazo medio de reposición del proveedor, opcional
     activo = Column(Boolean, default=True, nullable=False)
     tiene_variantes = Column(Boolean, default=False, nullable=False)
+    visible_ecommerce = Column(Boolean, default=False, nullable=False)  # opt-in explícito, nada se publica solo
+    descripcion_ecommerce = Column(Text, nullable=True)  # texto para el público, distinto de cualquier dato interno
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     categoria = relationship("Categoria", back_populates="productos")
@@ -52,6 +54,7 @@ class Producto(Base):
     compras = relationship("Compra", back_populates="producto", cascade="all, delete-orphan")
     atributos = relationship("ProductoAtributo", back_populates="producto", cascade="all, delete-orphan", order_by="ProductoAtributo.orden")
     variantes = relationship("Variante", back_populates="producto", cascade="all, delete-orphan")
+    fotos = relationship("ProductoFoto", back_populates="producto", cascade="all, delete-orphan", order_by="ProductoFoto.orden")
 
 
 class Compra(Base):
@@ -221,3 +224,65 @@ class MixSnapshot(Base):
     categoria_nombre = Column(String(100), nullable=True)
     mix_pct = Column(Numeric(6, 3), nullable=False)
     facturacion = Column(Numeric(12, 2), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# E-commerce (Fase 0): base para que un servicio de e-commerce separado (fases
+# posteriores, todavía no existe) consuma el catálogo y registre órdenes. Ver
+# sección "E-commerce" en CLAUDE.md para el detalle completo.
+# ---------------------------------------------------------------------------
+class ProductoFoto(Base):
+    """Fotos de un producto para el catálogo público. `orden` define el orden de
+    visualización — orden=1 es la portada. `ondelete="CASCADE"` a propósito
+    (a diferencia de Compra/Movimiento con SET NULL): una foto sin producto no
+    tiene ningún valor histórico que conservar."""
+    __tablename__ = "producto_fotos"
+
+    id = Column(Integer, primary_key=True, index=True)
+    producto_id = Column(Integer, ForeignKey("productos.id", ondelete="CASCADE"), nullable=False)
+    ruta_archivo = Column(String(255), nullable=False)  # relativo a FOTOS_DIR, ej. "12/3f9a2b1c.jpg"
+    orden = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    producto = relationship("Producto", back_populates="fotos")
+
+
+class OrdenEcommerce(Base):
+    """Orden creada desde el e-commerce. `estado` siempre "Confirmada" en esta fase
+    (no hay más estados todavía — no hay pagos ni logística real que trackear)."""
+    __tablename__ = "ordenes_ecommerce"
+
+    id = Column(Integer, primary_key=True, index=True)
+    fecha = Column(DateTime(timezone=True), nullable=False, default=_now_utc)
+    estado = Column(String(20), nullable=False, default="Confirmada")
+    cliente_nombre = Column(String(150), nullable=False)
+    cliente_email = Column(String(150), nullable=True)
+    cliente_telefono = Column(String(50), nullable=True)
+    forma_entrega = Column(String(20), nullable=False)  # "Retiro en persona" | "Envío"
+    direccion_envio = Column(Text, nullable=True)
+    notas = Column(Text, nullable=True)
+    total = Column(Numeric(12, 2), nullable=False)
+
+    items = relationship("OrdenEcommerceItem", back_populates="orden", cascade="all, delete-orphan")
+
+
+class OrdenEcommerceItem(Base):
+    """Línea de una orden de e-commerce. `precio_unitario` se guarda como valor propio
+    (no se lee del producto por join) — mismo criterio de denormalización deliberada
+    que MixSnapshot, para que el histórico no dependa de que el precio no haya
+    cambiado después. `movimiento_id` referencia el Movimiento tipo Venta que esta
+    línea generó, para trazabilidad."""
+    __tablename__ = "orden_ecommerce_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    orden_id = Column(Integer, ForeignKey("ordenes_ecommerce.id", ondelete="CASCADE"), nullable=False)
+    producto_id = Column(Integer, ForeignKey("productos.id", ondelete="SET NULL"), nullable=True)
+    variante_id = Column(Integer, ForeignKey("variantes.id", ondelete="SET NULL"), nullable=True)
+    cantidad = Column(Integer, nullable=False)
+    precio_unitario = Column(Numeric(12, 2), nullable=False)
+    movimiento_id = Column(Integer, ForeignKey("movimientos.id", ondelete="SET NULL"), nullable=True)
+
+    orden = relationship("OrdenEcommerce", back_populates="items")
+    producto = relationship("Producto")
+    variante = relationship("Variante")
+    movimiento = relationship("Movimiento")

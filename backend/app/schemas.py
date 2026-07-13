@@ -30,6 +30,8 @@ class ProductoBase(BaseModel):
     lead_time_dias: Optional[int] = None
     activo: bool = True
     tiene_variantes: bool = False
+    visible_ecommerce: bool = False
+    descripcion_ecommerce: Optional[str] = None
 
 
 class ProductoCreate(ProductoBase):
@@ -46,12 +48,27 @@ class ProductoUpdate(BaseModel):
     lead_time_dias: Optional[int] = None
     activo: Optional[bool] = None
     tiene_variantes: Optional[bool] = None
+    visible_ecommerce: Optional[bool] = None
+    descripcion_ecommerce: Optional[str] = None
+
+
+class FotoProducto(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    producto_id: int
+    ruta_archivo: str
+    orden: int
+
+
+class ReordenarFotosRequest(BaseModel):
+    orden_ids: list[int]
 
 
 class Producto(ProductoBase):
     model_config = ConfigDict(from_attributes=True)
     id: int
     categoria: Optional[Categoria] = None
+    fotos: list[FotoProducto] = []
 
 
 class CompraBase(BaseModel):
@@ -172,6 +189,65 @@ class Movimiento(MovimientoBase):
     id: int
     fecha: datetime
     producto: Optional[Producto] = None
+
+
+# --- E-commerce (Fase 0): catálogo público y órdenes ---
+# ProductoCatalogoOut es un schema dedicado (no reusa Producto) para garantizar por diseño que
+# costo/mix_pct/lead_time_dias nunca se exponen en el endpoint público, sin depender de que nadie
+# los agregue por error a Producto más adelante.
+
+class ProductoCatalogoOut(BaseModel):
+    id: int
+    nombre: str
+    descripcion_ecommerce: Optional[str] = None
+    precio_venta: Decimal
+    categoria: Optional[str] = None
+    fotos: list[FotoProducto] = []
+    tiene_variantes: bool
+    stock_actual: Optional[int] = None        # solo si NO tiene variantes
+    variantes: Optional[list[dict]] = None     # solo si tiene variantes, mismo shape que GET /productos/{id}/variantes
+
+
+class LineaOrdenIn(BaseModel):
+    producto_id: int
+    variante_id: Optional[int] = None
+    cantidad: int
+
+
+class OrdenEcommerceCreate(BaseModel):
+    cliente_nombre: str
+    cliente_email: Optional[str] = None
+    cliente_telefono: Optional[str] = None
+    forma_entrega: str  # "Retiro en persona" | "Envío"
+    direccion_envio: Optional[str] = None
+    notas: Optional[str] = None
+    lineas: list[LineaOrdenIn]
+
+
+class OrdenEcommerceItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    producto_id: Optional[int]
+    variante_id: Optional[int]
+    cantidad: int
+    precio_unitario: Decimal
+    movimiento_id: Optional[int]
+    producto: Optional[Producto] = None
+
+
+class OrdenEcommerceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    fecha: datetime
+    estado: str
+    cliente_nombre: str
+    cliente_email: Optional[str]
+    cliente_telefono: Optional[str]
+    forma_entrega: str
+    direccion_envio: Optional[str]
+    notas: Optional[str]
+    total: Decimal
+    items: list[OrdenEcommerceItemOut] = []
 
 
 # --- Stock (calculado, no se carga a mano) ---

@@ -1,62 +1,112 @@
-En Caja > Ventas: al elegir un producto con variantes, los combos de atributo tienen que reflejar stock
-disponible, no solo qué combinaciones existen.
+Fase 0 del sub-proyecto de e-commerce: dejar FashBalance listo para que un servicio de e-commerce
+separado (que se construye en fases posteriores, todavía no) lo consuma. Esta ronda es 100% dentro de
+FashBalance — no se toca infraestructura nueva, no hay servicio de e-commerce todavía.
 
-Antes de tocar nada, revisá el estado actual de `Movimientos.jsx` — no doy por sentado que ya tenga el
-mismo filtro por existencia que `Compras.jsx` (con su función `opcionesParaAtributo` y los datos de
-`variantesProducto`). Puede que Movimientos todavía muestre TODOS los atributos/valores del sistema sin
-filtrar nada, o puede que ya tenga el filtro por existencia pero le falte el de stock. Confirmalo primero.
+## Corrección de terminología importante, para que no se cuele un error
 
-## Comportamiento esperado (destino final, sin importar de qué estado parta)
+Cuando se vende algo por el e-commerce, hay que crear un `Movimiento` tipo `"Venta"` — el mismo mecanismo
+que ya existe para cargar una venta a mano en Caja. **NO es una `Compra`** (`Compra` es reposición de
+stock, suma unidades — es lo opuesto de lo que necesitamos acá). Prestale atención especial a esto en
+todo el código de esta ronda.
 
-- Igual que ya hace `Compras.jsx`: el combo del primer atributo (ej. Talle) solo lista valores que forman
-  parte de alguna `Variante` real de ESE producto — no todos los `valores_atributo` del sistema. El
-  siguiente combo (ej. Color) se filtra además a lo que, combinado con el valor ya elegido, corresponda a
-  una variante real.
-- Encima de eso (esto es lo nuevo, específico de Ventas, no aplica a Compras): de esas opciones que sí
-  existen, hay que distinguir cuáles tienen stock:
-  - Si al menos una variante con ese valor tiene `stock_actual > 0`: opción habilitada, normal.
-  - Si NINGUNA variante con ese valor tiene stock: la opción se sigue mostrando (no se oculta — tiene
-    sentido que la vendedora vea que el producto "existe" en ese talle aunque no haya ahora), pero con
-    `disabled` en el `<option>` y agregale " (sin stock)" al texto.
-  - Mismo criterio en cascada para el segundo combo, evaluando el `stock_actual` de la combinación
-    puntual (ej. Talle+Color), no solo del primer atributo.
-- Si se cambia la selección del primer atributo, resetear la del segundo.
-- Si TODAS las opciones del primer combo quedan deshabilitadas (sin stock en ninguna variante), mostrar
-  un mensaje explícito arriba del formulario ("Este producto no tiene stock disponible en ninguna
-  variante") en vez de un combo lleno de opciones grises sin contexto.
-- Si el producto tiene `tiene_variantes=True` pero cero `Variante` cargadas todavía, replicá el mismo
-  aviso que ya usa Compras para ese caso ("Este producto no tiene variantes cargadas todavía...").
+## 1. Catálogo: qué se publica y con qué contenido
 
-## Backend: extender, no duplicar
+- `productos`: agregar `visible_ecommerce` (bool, default `False` — opt-in explícito, nada se publica
+  solo) y `descripcion_ecommerce` (texto largo, nullable — descripción para el público, distinta de
+  cualquier dato interno).
+- Tabla nueva `producto_fotos`: `id`, `producto_id` (FK), `ruta_archivo`, `orden` (entero, define cuál es
+  la foto de portada — la de `orden=1`), `created_at`.
+- Backend: endpoint para subir fotos de un producto (`POST /productos/{id}/fotos`, multipart), que
+  guarde el archivo en un volumen nuevo (agregalo al `docker-compose.yml`, montado en el backend, algo
+  como `fashbalance_fotos_data:/app/fotos_productos`) y sirva esos archivos vía un mount de
+  `StaticFiles` de FastAPI en `/fotos/...`. Validá tipo de archivo (jpg/png/webp) y un tamaño máximo
+  razonable (5MB) antes de guardar. Endpoint para borrar una foto y para reordenarlas
+  (`PUT /productos/{id}/fotos/orden`, recibe el nuevo orden de IDs).
+- Frontend (`Productos.jsx`): checkbox "Visible en e-commerce", textarea "Descripción para e-commerce", y
+  una sección de fotos (subir, ver miniaturas, borrar, subir/bajar orden — no hace falta drag and drop,
+  con botones alcanza).
 
-`stock_por_variante()` ya existe en `calculations.py` (mismo cálculo que `stock_por_producto`, agrupado
-por `variante_id`). Identificá qué endpoint alimenta hoy a `variantesProducto` en `Compras.jsx` y
-extendé ESA respuesta para que cada variante incluya su `stock_actual` (usando `stock_por_variante`) —
-no crees un endpoint paralelo. Ventas y Compras terminan consumiendo la misma fuente de datos; la
-diferencia de comportamiento (Compras ignora `stock_actual` al habilitar/deshabilitar, Ventas no) queda
-del lado del frontend de cada pantalla, no del backend. NO toques el comportamiento de `Compras.jsx`
-— sigue mostrando todas las variantes existentes como seleccionables, tengan o no stock.
+## 2. Autenticación entre servicios
 
-## Dos agregados que no pediste explícitamente pero salen del mismo bug — decidí antes de tirar el prompt si los querés en esta pasada o los dejamos para después
+Los dos endpoints públicos de la sección 3 (no el resto del backend, que sigue sin autenticación como
+hoy) tienen que validar un header `X-API-Key` contra un valor guardado en una variable de entorno nueva
+(`ECOMMERCE_API_KEY` en `docker-compose.yml`/`.env`, NO en la base de datos — es un secreto de
+infraestructura). Si no viene o no matchea, `401`. Armá un dependency de FastAPI reusable para esto, no
+lo repitas a mano en cada endpoint.
 
-1. **Tope de cantidad en el frontend**: aunque el combo ya no deje elegir una variante sin stock, nada
-   impide cargar una Cantidad mayor al `stock_actual` de la variante elegida (ej. hay 3, cargás 10).
-2. **Validación real en el backend**: confirmado en el CLAUDE.md que `POST /movimientos` (tipo Venta) hoy
-   solo valida que venga `variante_id` y que pertenezca al producto — no valida que la `cantidad` no
-   supere el `stock_actual` de esa variante (ni, para productos sin variantes, el `stock_actual` del
-   producto). El punto 1 es solo cosmético del lado del frontend, se puede saltear llamando a la API
-   directo — si querés blindarlo de verdad, el backend tiene que rechazar la Venta en ese caso.
+## 3. Endpoints públicos para el e-commerce (`routers/ecommerce.py`, nuevo)
 
-Si los querés a los dos, agregalo explícito en el prompt antes de pegárselo a Claude Code. Si no, decile
-que se enfoque solo en los combos de Ventas y te muestre plan para estos dos antes de tocar nada.
+### `GET /ecommerce/catalogo`
 
-## Qué NO cambiar
+Devuelve solo productos `activo=True` y `visible_ecommerce=True`, con: nombre, `descripcion_ecommerce`,
+`precio_venta`, nombre de categoría, fotos (ordenadas), y:
+- Si el producto NO tiene variantes: `stock_actual` (reusá `stock_por_producto`, no la reescribas).
+- Si tiene variantes: la lista de variantes con sus valores de atributo y `stock_actual` cada una —
+  mismo dato que ya devuelve `GET /productos/{id}/variantes` (`listar_variantes` en
+  `routers/productos.py`, que ya usa `calculations.stock_por_variante()` para esto desde la ronda de
+  Ventas). Reusá esa misma función/lógica, no la reescribas. Mismo criterio que ya se aplicó en Ventas:
+  la variante se informa igual aunque tenga stock 0 (para que el frontend del e-commerce pueda decidir
+  mostrarla como "sin stock" en vez de ocultarla), no la filtres acá — dejale esa decisión a quien
+  consuma el endpoint.
+- **NO exponer** `costo`, `mix_pct`, `lead_time_dias`, ni ningún otro dato interno de negocio — es un
+  endpoint público, cualquiera puede ver la respuesta JSON en el navegador.
 
-`Compras.jsx` y su filtro por existencia (sin tocar). Stock, Análisis, Catálogo, Importación.
+### `POST /ecommerce/ordenes`
+
+Recibe: datos de contacto del cliente (nombre, email opcional, teléfono opcional), forma de entrega
+("Retiro en persona" o "Envío", si es Envío requiere dirección), notas opcionales, y una lista de líneas
+(producto_id, variante_id si corresponde, cantidad).
+
+Antes de escribir nada en la base, validar CADA línea:
+- El producto existe, está `activo=True` y `visible_ecommerce=True`.
+- Si tiene variantes, viene `variante_id` y pertenece a ese producto.
+- Stock suficiente: usá `calculations.stock_disponible(db, producto_id, variante_id)` (ya existe, de la
+  ronda de Ventas — mismo cálculo `total_comprado - total_vendido` acotado a un solo id, no lo
+  reimplementes) y compará contra la `cantidad` pedida.
+
+Si CUALQUIER línea falla, rechazar la orden completa con `400` y el detalle de qué línea falló — no crear
+nada parcial (mismo criterio atómico que ya se usa en Importación y en el alta de producto con
+variantes). Con todo válido, en una única transacción:
+1. Crear `OrdenEcommerce` (tabla nueva: `id`, `fecha`, `estado` — usá `"Confirmada"` acá, no hace falta
+   más estados por ahora —, `cliente_nombre`, `cliente_email`, `cliente_telefono`, `forma_entrega`,
+   `direccion_envio`, `notas`, `total`).
+2. Por cada línea, crear un `OrdenEcommerceItem` (`orden_id`, `producto_id`, `variante_id`, `cantidad`,
+   `precio_unitario` — el `precio_venta` del producto en ESE momento, guardado como valor propio, no
+   como referencia — mismo criterio de denormalización que ya se usa en `mix_snapshots` para que el
+   histórico no dependa de que el precio no haya cambiado después).
+3. Por cada línea, crear el `Movimiento` tipo `"Venta"` correspondiente (ver punto siguiente sobre
+   reusar el mecanismo existente), y guardar su `id` en `OrdenEcommerceItem.movimiento_id` para
+   trazabilidad.
+
+**Sobre reusar la creación de la Venta**: `backend/app/routers/movimientos.py` ya tiene una función
+`_validar()` que hace exactamente la validación de arriba (incluido `stock_disponible()`) para
+`POST /movimientos` y su `PUT`. NO reimplementes esa validación en `routers/ecommerce.py`. Si `_validar()`
+hoy vive como función privada del router (no en `calculations.py`), movela ahí (o extraé su lógica a una
+función pública, ej. `calculations.validar_venta(...)`) junto con la creación real del `Movimiento`, en
+una función tipo `calculations.registrar_venta(db, producto_id, variante_id, cantidad, monto, ...)` que
+tanto `POST /movimientos` como este endpoint nuevo llamen — un solo camino de validación y creación de
+Venta, no dos que puedan desincronizarse con el tiempo. Fijate también el detalle de `_validar()` sobre
+sumar de vuelta la cantidad original al editar (`PUT`) — no aplica acá (las órdenes de e-commerce solo se
+crean, no se editan en esta fase), pero no rompas ese camino al refactorizar.
+
+## 4. Pantalla de administración: Órdenes E-commerce
+
+Página nueva en el frontend, `OrdenesEcommerce.jsx`, que lista lo que devuelve `GET /ecommerce/ordenes`
+(este SÍ es un endpoint interno normal, sin `X-API-Key`, como el resto del panel) — fecha, cliente, forma
+de entrega, items, total. Sin filtros complejos por ahora, una tabla alcanza. Nav link nuevo.
+
+## Qué NO hacer en esta ronda
+
+No toques nada de infraestructura nueva (nginx, Next.js, un servicio de e-commerce separado) — eso es
+Fase 1 en adelante, todavía no existe. No implementes ningún medio de pago ni cálculo de envío real —
+`forma_entrega` es solo un texto elegido entre dos opciones fijas, sin lógica detrás.
 
 ## Antes de terminar
 
-Probá con un producto con Talle S sin stock en ningún color, Talle M con stock solo en un color, Talle L
-con stock en todos — confirmá que el combo de Talle muestra S deshabilitado y que, al elegir M, el combo
-de Color deja seleccionable solo el color con stock. Actualizá el CLAUDE.md (sección "Variantes de
-producto", junto al punto de Compras ya documentado) con este comportamiento de Ventas.
+Probá contra la API real: marcar un producto como visible, subirle una foto, pegarle a
+`GET /ecommerce/catalogo` sin `X-API-Key` (debe dar 401) y con la key correcta (debe traer el producto
+con su foto y su stock). Crear una orden completa con `POST /ecommerce/ordenes` y confirmar que se creó
+el `Movimiento` Venta correspondiente y que el stock bajó en `stock_por_producto`. Probar una orden con
+una cantidad mayor al stock disponible y confirmar que se rechaza sin crear nada (ni la orden, ni el
+movimiento, ni tocar el stock). Actualizá el CLAUDE.md con una sección nueva "E-commerce" documentando
+todo esto — es la base sobre la que van a construirse las fases siguientes.

@@ -365,6 +365,74 @@ más adelante.
   total por encima de 100%. Las categorías se acotan a las 8 con más mix% acumulado (paleta categórica
   fija de 8 colores) y el resto se agrupa en "Otras" en vez de generar más colores.
 
+## E-commerce (Fase 0 — base para un servicio consumidor, todavía no existe)
+
+FashBalance no tiene tienda online propia. Esta ronda deja el backend listo para que un servicio de
+e-commerce separado (Next.js, nginx, etc. — infraestructura que se agrega recién en fases posteriores, no
+acá) lo consuma vía dos endpoints públicos. Todo lo demás del panel (`/productos`, `/movimientos`, etc.)
+sigue sin autenticación, exactamente como hoy.
+
+- **Terminología importante**: una venta por e-commerce genera un `Movimiento` tipo `"Venta"`, el mismo
+  mecanismo que cargar una venta a mano en Caja. **No** es una `Compra` (eso es reposición de stock, suma
+  unidades — lo opuesto).
+- **Catálogo publicado**: `productos.visible_ecommerce` (default `False`, opt-in explícito) y
+  `productos.descripcion_ecommerce` controlan qué se muestra y con qué texto — son independientes de
+  `activo` (un producto puede estar activo en el negocio pero todavía no publicado). Las fotos viven en
+  `producto_fotos` (una fila por foto, `orden` define el orden de visualización, `orden=1` es la portada,
+  `ondelete="CASCADE"` a diferencia de Compra/Movimiento porque una foto sin producto no tiene valor
+  histórico) y se sirven como archivos estáticos en `/fotos/...` (`StaticFiles` de FastAPI, montado en
+  `main.py`) desde un volumen Docker separado (`fashbalance_fotos_data`, montado en
+  `/app/fotos_productos`, hermano de `/app/app` para que el bind-mount de código no lo pise). Al subir una
+  foto (`POST /productos/{id}/fotos`, multipart) se valida extensión (jpg/png/webp, por el nombre de
+  archivo — el `content_type` del navegador no es confiable como único chequeo) y tamaño (5MB); no se
+  decodifica la imagen (no hay Pillow en el proyecto, se consideró innecesario para esta fase).
+  `DELETE /productos/{id}/fotos/{foto_id}` borra la fila y recién después el archivo en disco (si el
+  borrado del archivo falla, la base ya quedó consistente). `PUT /productos/{id}/fotos/orden` recibe la
+  lista completa de IDs en el nuevo orden y reasigna `orden` 1..N.
+- **Autenticación de los 2 endpoints públicos**: header `X-API-Key` contra la env var
+  `ECOMMERCE_API_KEY` (en `.env`, nunca en la base — no hay tabla de API keys ni multiusuario para esto).
+  Dependency reusable en `backend/app/auth.py` (`require_ecommerce_api_key`, usa `APIKeyHeader` en vez de
+  `Header()` a mano para que Swagger en `/docs` muestre el candado). `GET /ecommerce/ordenes` (para el
+  panel admin) queda sin este chequeo, como el resto del panel.
+- **Refactor de la creación de una Venta**: la validación que antes vivía en `_validar()` (privada de
+  `routers/movimientos.py`) se movió a `calculations.validar_movimiento()`, y se agregó
+  `calculations.registrar_venta()` como único camino de alta de un `Movimiento` tipo Venta — lo usan tanto
+  `POST /movimientos` como cada línea de `POST /ecommerce/ordenes`. Es la única función de
+  `calculations.py` que lanza `HTTPException`, excepción deliberada a la regla de "los routers validan,
+  calculations calcula": se aceptó porque dos routers necesitaban exactamente la misma regla de negocio, y
+  duplicarla en dos archivos era peor que la inconsistencia de estilo. El ajuste de "sumar la cantidad
+  vieja al editar" sigue siendo exclusivo del `PUT /movimientos` (vía el parámetro `actual`) — un alta
+  (e-commerce o `POST /movimientos`) nunca lo necesita.
+- **Reuso del árbol de variantes en el catálogo**: `routers/productos.py` separó el cuerpo de
+  `listar_variantes` en un helper `_formatear_variantes(db, producto_id, stock_por_id)` que recibe el mapa
+  de stock ya calculado. `GET /ecommerce/catalogo` calcula `stock_por_variante(db)` **una sola vez** para
+  todo el catálogo y llama ese helper por cada producto con variantes, en vez de recalcular el stock de
+  todas las variantes del sistema una vez por producto listado. Mismo criterio que en Ventas: una variante
+  se informa igual aunque tenga stock 0 (no se filtra en el backend, decisión de quien consuma el
+  catálogo).
+- **`GET /ecommerce/catalogo`**: solo productos `activo=True` y `visible_ecommerce=True`. Usa un schema
+  dedicado (`schemas.ProductoCatalogoOut`, no reusa `schemas.Producto`) para garantizar por diseño que
+  `costo`, `mix_pct`, `lead_time_dias` y cualquier otro dato interno nunca se expongan, sin depender de que
+  nadie los agregue por error a `Producto` más adelante — es un endpoint público, cualquiera puede ver la
+  respuesta JSON en el navegador.
+- **`POST /ecommerce/ordenes`**: valida CADA línea (producto activo+visible, variante corresponde si
+  aplica, stock suficiente vía `calculations.stock_disponible`) ANTES de escribir nada; si cualquiera
+  falla, devuelve `400` con el detalle de esa línea y no crea nada — ni la orden, ni el movimiento, ni
+  toca el stock (mismo criterio atómico que ya usan la Importación de Excel y el alta de producto con
+  variantes). Con todo validado, crea en una única transacción la `OrdenEcommerce`, un
+  `OrdenEcommerceItem` por línea (con `precio_unitario` guardado como valor propio, no como referencia al
+  producto — mismo criterio de denormalización deliberada que `MixSnapshot`, para que el histórico no
+  dependa de que el precio no haya cambiado después) y el `Movimiento` Venta correspondiente vía
+  `registrar_venta()`, guardando su id en `OrdenEcommerceItem.movimiento_id` para trazabilidad.
+- **Pantalla de administración**: `OrdenesEcommerce.jsx` lista lo que devuelve `GET /ecommerce/ordenes`
+  (interno, sin `X-API-Key`) en una tabla simple, sin filtros.
+- **Qué NO hace esta fase**: no hay medios de pago, no hay cálculo de envío real (`forma_entrega` es texto
+  fijo entre "Retiro en persona"/"Envío", sin lógica detrás), no hay servicio de e-commerce corriendo
+  todavía, no hay nginx ni Next.js — todo eso es fase 1 en adelante.
+- **Migraciones**: se agregaron 2 columnas a `productos` (tabla existente, requirió `ALTER TABLE` manual —
+  ver sección de arriba sobre `create_all()`) y 3 tablas nuevas (`producto_fotos`, `ordenes_ecommerce`,
+  `orden_ecommerce_items`), que se crearon solas.
+
 ## Convenciones de código
 
 - **Backend**: nombres de tablas, campos, funciones y mensajes de error en español. Sin Alembic (ver nota

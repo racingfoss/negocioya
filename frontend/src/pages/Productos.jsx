@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
 import api, { getErrorMessage } from '../api'
 import { aplanarArbol, etiquetaIndentada } from '../utils/categorias'
+import FotosProducto from '../components/FotosProducto'
 
 const empty = {
   nombre: '', codigo: '', categoria_id: '', precio_venta: '', costo: '', mix_pct: '', lead_time_dias: '',
-  tiene_variantes: false,
+  tiene_variantes: false, visible_ecommerce: false, descripcion_ecommerce: '',
 }
 
 const estadoColor = {
@@ -59,6 +60,8 @@ export default function Productos() {
       mix_pct: Number(form.mix_pct || 0),
       lead_time_dias: form.lead_time_dias ? Number(form.lead_time_dias) : null,
       tiene_variantes: form.tiene_variantes,
+      visible_ecommerce: form.visible_ecommerce,
+      descripcion_ecommerce: form.descripcion_ecommerce || null,
     }
     try {
       if (editId) {
@@ -127,6 +130,8 @@ export default function Productos() {
       mix_pct: p.mix_pct,
       lead_time_dias: p.lead_time_dias || '',
       tiene_variantes: p.tiene_variantes || false,
+      visible_ecommerce: p.visible_ecommerce || false,
+      descripcion_ecommerce: p.descripcion_ecommerce || '',
     })
     if (p.tiene_variantes) {
       cargarConfigVariantes(p.id).catch((e) => setError(getErrorMessage(e)))
@@ -326,6 +331,23 @@ export default function Productos() {
           />
           ¿Tiene variantes? (talle, color, etc.)
         </label>
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={form.visible_ecommerce}
+            onChange={(e) => setForm({ ...form, visible_ecommerce: e.target.checked })}
+          />
+          Visible en e-commerce
+        </label>
+        {form.visible_ecommerce && (
+          <textarea
+            className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2 w-full"
+            rows={3}
+            placeholder="Descripción para e-commerce"
+            value={form.descripcion_ecommerce}
+            onChange={(e) => setForm({ ...form, descripcion_ecommerce: e.target.value })}
+          />
+        )}
         <p className="text-xs text-gray-500">
           El costo se puede dejar en 0 al principio — en cuanto cargues la primera Compra de este producto, se va a
           recalcular solo como promedio ponderado. El lead time se usa para la alerta de "próximo a agotarse" en
@@ -352,6 +374,16 @@ export default function Productos() {
           )}
         </div>
       </div>
+
+      {editId && (
+        <div className="bg-[#151b2b] rounded-xl p-5">
+          <FotosProducto
+            productoId={editId}
+            fotos={productos.find((p) => p.id === editId)?.fotos || []}
+            onChange={cargar}
+          />
+        </div>
+      )}
 
       {editId && form.tiene_variantes && (
         <div className="bg-[#151b2b] rounded-xl p-5 space-y-4">

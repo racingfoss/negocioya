@@ -23,6 +23,7 @@ services:
     restart: unless-stopped
     environment:
       DATABASE_URL: ${DATABASE_URL}
+      ECOMMERCE_API_KEY: ${ECOMMERCE_API_KEY}
     depends_on:
       db:
         condition: service_healthy
@@ -30,6 +31,7 @@ services:
       - "8000:8000"
     volumes:
       - ./backend/app:/app/app
+      - fashbalance_fotos_data:/app/fotos_productos
 
   frontend:
     build: ./frontend
@@ -46,3 +48,4 @@ services:
 
 volumes:
   fashbalance_db_data:
+  fashbalance_fotos_data:

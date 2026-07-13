@@ -1,9 +1,12 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from .database import Base, engine
 from .routers import (
-    atributos, categorias, compras, configuracion, costos_fijos, dashboard, importacion,
+    atributos, categorias, compras, configuracion, costos_fijos, dashboard, ecommerce, importacion,
     mix_snapshots, movimientos, productos, stock,
 )
 
@@ -19,6 +22,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Fotos de producto, servidas como archivos estáticos para el catálogo de e-commerce.
+# os.makedirs es necesario porque StaticFiles valida existencia del directorio al construirse,
+# y el volumen nombrado (fashbalance_fotos_data) arranca vacío en el primer `docker compose up`.
+FOTOS_DIR = os.getenv("FOTOS_PRODUCTOS_DIR", "/app/fotos_productos")
+os.makedirs(FOTOS_DIR, exist_ok=True)
+app.mount("/fotos", StaticFiles(directory=FOTOS_DIR), name="fotos")
+
 app.include_router(categorias.router)
 app.include_router(productos.router)
 app.include_router(atributos.router)
@@ -30,6 +40,7 @@ app.include_router(dashboard.router)
 app.include_router(importacion.router)
 app.include_router(configuracion.router)
 app.include_router(mix_snapshots.router)
+app.include_router(ecommerce.router)
 
 
 @app.get("/")
