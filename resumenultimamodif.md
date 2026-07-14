@@ -1,55 +1,74 @@
-# Resumen de la última modificación — Fase 0 e-commerce
+# Resumen de la última modificación — Fase 1 e-commerce: storefront Next.js
 
-Implementación de `prompt1.md`: dejar FashBalance listo para que un futuro servicio de e-commerce
-(todavía no existe) consuma el catálogo y registre órdenes. Ronda 100% dentro del repo actual, sin
-infraestructura nueva.
+Implementación de `prompt1.md`: storefront público de solo lectura (Next.js, App Router, TypeScript)
+que consume la Storefront API de FashBalance ya construida en la Fase 0. Arquitectura Headless
+Commerce — FashBalance es el Commerce Core, el storefront es un BFF nuevo. Sin carrito, checkout,
+pagos ni nginx en esta ronda.
 
-## Backend
+## Backend (cambio puntual)
 
-- `models.py`: `visible_ecommerce` / `descripcion_ecommerce` en `Producto`, y tablas nuevas
-  `ProductoFoto`, `OrdenEcommerce`, `OrdenEcommerceItem`.
-- `calculations.py`: `validar_movimiento()` + `registrar_venta()` extraídas como único camino de alta
-  de una Venta (única función del módulo que lanza `HTTPException`, deliberado).
-- `movimientos.py` refactorizado para delegar en esas funciones — verificado con curl que POST/PUT
-  siguen funcionando idéntico a antes.
-- `productos.py`: endpoints de fotos (`POST/DELETE/PUT /productos/{id}/fotos...`) + helper
-  `_formatear_variantes` extraído de `listar_variantes` y reusado por el catálogo público.
-- `auth.py` (nuevo): dependency de `X-API-Key` contra la env var `ECOMMERCE_API_KEY`.
-- `routers/ecommerce.py` (nuevo): `GET /ecommerce/catalogo`, `POST /ecommerce/ordenes` (ambos con
-  API key), `GET /ecommerce/ordenes` (admin, sin key).
-- `main.py`: mount de `StaticFiles` en `/fotos`.
-- `docker-compose.yml`: volumen `fashbalance_fotos_data` + env var `ECOMMERCE_API_KEY`.
-- Migración manual: `ALTER TABLE productos ADD COLUMN visible_ecommerce ...` /
-  `descripcion_ecommerce` corrida contra la base de dev (las 3 tablas nuevas las creó solas
-  `create_all()`).
+- `backend/app/routers/ecommerce.py`: extraído el helper `_producto_a_catalogo_dict` del cuerpo de
+  `catalogo()` (reusado por ambos endpoints, no se duplicó el armado del dict) y agregado
+  `GET /ecommerce/catalogo/{producto_id}` — mismo `X-API-Key`, mismo schema `ProductoCatalogoOut`,
+  404 si no existe / no está `activo` / no está `visible_ecommerce` (sin distinguir el motivo).
+  Reusa `_formatear_variantes` igual que el listado. No se tocó nada más del backend.
 
-## Frontend
+## Storefront nuevo — `ecommerce/`
 
-- `Productos.jsx`: checkbox "Visible en e-commerce", textarea de descripción, sección de fotos.
-- `components/FotosProducto.jsx` (nuevo): subir/borrar/reordenar fotos con botones.
-- `pages/OrdenesEcommerce.jsx` (nuevo) + nav link nuevo en `App.jsx`.
+Carpeta hermana de `backend/`/`frontend/`, mismo repo, Next.js 14 + TypeScript + Tailwind.
 
-## Terminología clave respetada
+- `src/lib/api.ts`: fetch server-side con header `X-API-Key`, base `FASHBALANCE_API_URL` (interna de
+  Docker, nunca llega al navegador).
+- `src/lib/attributes.ts`: `derivarAtributosProducto()` (deriva el orden de los selectores por
+  primera aparición, ya que no hay endpoint público con el orden real de `ProductoAtributo`),
+  `opcionesParaAtributo()` y `elegirValorAtributo()` — port directo (mismo comportamiento, con tipos)
+  de las funciones homónimas de `frontend/src/pages/Movimientos.jsx`.
+- `src/lib/urls.ts`: arma URLs de fotos con `FASHBALANCE_PUBLIC_URL` (la IP/puerto que sí resuelve el
+  navegador del cliente, distinta de la URL interna de Docker).
+- `/` (`app/page.tsx`): grilla server-side de productos publicados.
+- `/productos/[id]`: galería de fotos, descripción, precio, selector de atributos en cascada
+  (`VariantSelector.tsx`, client component) con el mismo criterio que Movimientos.jsx — opciones sin
+  stock deshabilitadas con " (sin stock)" (nunca ocultas), mensaje único si no hay stock en ninguna
+  variante, aviso si el producto tiene variantes activadas pero ninguna cargada. `generateMetadata`
+  con Open Graph (`og:title`, `og:description`, `og:image` absoluta) para preview en WhatsApp/redes.
+  404 nativo de Next.js si el producto no existe o no está publicado.
+- Botón de WhatsApp flotante (mensaje genérico en home, con nombre de producto en el detalle) y links
+  de Instagram/Facebook en header/footer — todos con placeholders desde variables de entorno.
+- `Dockerfile` multi-stage de **producción** (`next build` con `output: standalone` + `node server.js`),
+  a diferencia del `frontend/Dockerfile` (dev puro con hot-reload) — hay que rebuildear la imagen ante
+  cada cambio de código acá.
 
-Una venta por e-commerce crea un `Movimiento` tipo `"Venta"` (mismo mecanismo que Caja) — **nunca**
-una `Compra`.
+## Variables de entorno nuevas (en `.env` de la raíz)
 
-## Verificado contra la API real
+- `FASHBALANCE_PUBLIC_URL`: URL/IP real accesible desde el navegador (mismo criterio que ya usa
+  `VITE_API_URL`), para fotos y `og:image` absoluta.
+- `WHATSAPP_NUMERO`, `INSTAGRAM_URL`, `FACEBOOK_URL`: placeholders obvios, a completar por vos.
+- `ECOMMERCE_API_KEY` (ya existía de la Fase 0): se reusa, ahora también pasada al servicio
+  `ecommerce`.
 
-- Producto marcado visible + foto subida/servida/reordenada/borrada.
-- `GET /ecommerce/catalogo`: 401 sin `X-API-Key`, 200 con la key correcta, sin exponer
-  `costo`/`mix_pct`/`lead_time_dias`.
-- Orden completa creada (con y sin variantes) → genera `Movimiento` tipo Venta, stock baja
-  correctamente en `stock_por_producto`.
-- Orden con cantidad mayor al stock disponible: rechazada con 400, sin crear nada (ni orden, ni
-  movimiento, ni tocar stock).
-- `PUT /movimientos` (edición) sigue funcionando igual tras el refactor.
+`docker-compose.yml`: servicio nuevo `ecommerce`, puerto `3000`, `depends_on: backend`.
 
-`CLAUDE.md` actualizado con la sección "E-commerce" documentando todas estas decisiones.
+`CLAUDE.md` actualizado con la sección "Storefront público (Fase 1 — Next.js, solo lectura)".
+
+## Verificado contra la API real y con curl (sin browser, según las reglas del proyecto)
+
+- `GET /ecommerce/catalogo/{id}`: 200 con datos completos, 404 para inexistente y para un producto
+  activo pero no publicado (`visible_ecommerce=false`), 401 sin `X-API-Key`.
+- Storefront `/`: HTML servido con nombres, precios y URLs de fotos ya embebidos (confirma SSR).
+- Storefront `/productos/{id}`: cascada de atributos verificada con datos reales — opciones con stock
+  habilitadas, sin stock deshabilitadas ("XL (sin stock)"), y el mensaje "no tiene stock disponible en
+  ninguna variante" apareciendo correctamente cuando las 12 variantes de un producto dan stock 0.
+- 404 del storefront confirmado tanto para id inexistente como para producto no publicado.
+- Meta tags Open Graph (`og:title`, `og:description`, `og:image`) presentes con URL absoluta.
+- Build de producción (`docker compose build ecommerce`) sin errores de TypeScript ni lint.
+- Sin errores en los logs del contenedor tras levantarlo.
 
 ## Pendiente de tu parte
 
-- Probar a mano en el navegador: checkbox/textarea/fotos en Productos, y que las órdenes de prueba
-  (creadas por curl) aparezcan bien en la pantalla "🛒 Órdenes E-commerce".
-- Se generó una `ECOMMERCE_API_KEY` en tu `.env` local (gitignoreado) para poder probar — rotala si
-  querés generar la tuya propia más adelante.
+- Revisar a mano en el navegador (`http://<ip-vm>:3000`): layout y paleta clara (no debe heredar el
+  tema oscuro del panel), que las fotos carguen bien, que el botón de WhatsApp abra `wa.me`
+  correctamente.
+- Reemplazar los placeholders reales en `.env`: `WHATSAPP_NUMERO`, `INSTAGRAM_URL`, `FACEBOOK_URL`.
+- Probar el preview del link compartido en WhatsApp/Facebook para confirmar el `og:image` en la
+  práctica (curl no puede validar eso del todo, esas plataformas cachean el scrape).
+- Los cambios no se commitearon — quedan en el working tree para que los revises antes.

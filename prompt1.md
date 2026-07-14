@@ -1,112 +1,91 @@
-Fase 0 del sub-proyecto de e-commerce: dejar FashBalance listo para que un servicio de e-commerce
-separado (que se construye en fases posteriores, todavía no) lo consuma. Esta ronda es 100% dentro de
-FashBalance — no se toca infraestructura nueva, no hay servicio de e-commerce todavía.
+Fase 1 del sub-proyecto de e-commerce, arquitectura ya confirmada: Headless Commerce — FashBalance como
+Commerce Core (Admin API + Storefront API ya construida en Fase 0), un storefront Next.js nuevo que
+consume esa Storefront API actuando como BFF (la API key vive server-side, nunca llega al navegador).
+nginx todavía NO entra en esta fase — se agrega más adelante, cuando el storefront esté listo para salir a
+internet de verdad. Por ahora se prueba en red local, mismo criterio que ya se usa con el frontend de
+FashBalance (puerto expuesto, se abre desde el navegador apuntando a la IP de la VM).
 
-## Corrección de terminología importante, para que no se cuele un error
+**Alcance de esta fase: catálogo navegable de solo lectura.** Sin carrito, sin checkout, sin medios de
+pago, sin cálculo de envío — eso es Fase 2. Acá el objetivo es: que se puedan ver los productos
+publicados, con sus fotos y variantes con stock, y que desde ahí se pueda contactar por WhatsApp.
 
-Cuando se vende algo por el e-commerce, hay que crear un `Movimiento` tipo `"Venta"` — el mismo mecanismo
-que ya existe para cargar una venta a mano en Caja. **NO es una `Compra`** (`Compra` es reposición de
-stock, suma unidades — es lo opuesto de lo que necesitamos acá). Prestale atención especial a esto en
-todo el código de esta ronda.
+## 0. Dónde vive el código
 
-## 1. Catálogo: qué se publica y con qué contenido
+Carpeta nueva `ecommerce/` en la raíz del repo, hermana de `backend/` y `frontend/` — mismo repo, no uno
+separado. El CLAUDE.md sigue siendo uno solo en la raíz, con una sección nueva para esta parte (no crear
+un CLAUDE.md aparte adentro de `ecommerce/`).
 
-- `productos`: agregar `visible_ecommerce` (bool, default `False` — opt-in explícito, nada se publica
-  solo) y `descripcion_ecommerce` (texto largo, nullable — descripción para el público, distinta de
-  cualquier dato interno).
-- Tabla nueva `producto_fotos`: `id`, `producto_id` (FK), `ruta_archivo`, `orden` (entero, define cuál es
-  la foto de portada — la de `orden=1`), `created_at`.
-- Backend: endpoint para subir fotos de un producto (`POST /productos/{id}/fotos`, multipart), que
-  guarde el archivo en un volumen nuevo (agregalo al `docker-compose.yml`, montado en el backend, algo
-  como `fashbalance_fotos_data:/app/fotos_productos`) y sirva esos archivos vía un mount de
-  `StaticFiles` de FastAPI en `/fotos/...`. Validá tipo de archivo (jpg/png/webp) y un tamaño máximo
-  razonable (5MB) antes de guardar. Endpoint para borrar una foto y para reordenarlas
-  (`PUT /productos/{id}/fotos/orden`, recibe el nuevo orden de IDs).
-- Frontend (`Productos.jsx`): checkbox "Visible en e-commerce", textarea "Descripción para e-commerce", y
-  una sección de fotos (subir, ver miniaturas, borrar, subir/bajar orden — no hace falta drag and drop,
-  con botones alcanza).
+## 1. Backend: un endpoint chico nuevo en FashBalance
 
-## 2. Autenticación entre servicios
+`GET /ecommerce/catalogo/{producto_id}`: mismo `X-API-Key`, mismo schema `ProductoCatalogoOut` que ya
+existe para el listado, pero devuelve un solo producto (404 si no existe, no está `activo`, o no está
+`visible_ecommerce`). Necesario para que cada página de producto en Next.js no tenga que traer el
+catálogo completo solo para mostrar uno — reusá toda la lógica que ya arma la respuesta del listado
+(`_formatear_variantes`, etc.), no la reescribas para este caso puntual.
 
-Los dos endpoints públicos de la sección 3 (no el resto del backend, que sigue sin autenticación como
-hoy) tienen que validar un header `X-API-Key` contra un valor guardado en una variable de entorno nueva
-(`ECOMMERCE_API_KEY` en `docker-compose.yml`/`.env`, NO en la base de datos — es un secreto de
-infraestructura). Si no viene o no matchea, `401`. Armá un dependency de FastAPI reusable para esto, no
-lo repitas a mano en cada endpoint.
+## 2. Storefront Next.js (App Router)
 
-## 3. Endpoints públicos para el e-commerce (`routers/ecommerce.py`, nuevo)
+- Páginas:
+  - `/` — grilla de productos publicados (foto de portada, nombre, precio), cada uno linkeando a su
+    página de detalle. Trae los datos con `GET /ecommerce/catalogo` en el servidor (Server Component,
+    sin JS de fetching del lado del cliente).
+  - `/productos/[id]` — galería de fotos, nombre, `descripcion_ecommerce`, precio, y si el producto tiene
+    variantes, selector de atributos en cascada (Talle → Color, etc.) con el MISMO criterio ya establecido
+    en `frontend/src/pages/Movimientos.jsx` de FashBalance: opciones sin stock se muestran igual pero
+    deshabilitadas (" (sin stock)"), nunca ocultas; si no hay stock en ninguna variante, mensaje claro en
+    vez de combos vacíos. Es una reimplementación (proyecto distinto, no se puede importar el componente
+    tal cual), pero el comportamiento tiene que ser idéntico — leé ese archivo como referencia antes de
+    escribir la lógica de acá.
+- **Metadata para compartir en redes/WhatsApp** (la razón concreta por la que se eligió Next.js en vez de
+  React+Vite para esto): cada página de producto tiene que usar `generateMetadata` de Next.js para las
+  etiquetas Open Graph — `og:title` (nombre + precio), `og:description` (`descripcion_ecommerce`),
+  `og:image` (la foto de portada). Sin esto, no tiene sentido haber elegido Next.js — no te lo saltees.
+- **Botón de WhatsApp**: flotante, visible en todas las páginas, arma el link `https://wa.me/<numero>` con
+  un mensaje pre-cargado (genérico en el home, mencionando el producto puntual en la página de detalle).
+  El número sale de una variable de entorno (`WHATSAPP_NUMERO`), con un valor placeholder obvio (ej.
+  `5490000000000`) — no tengo el número real a mano todavía, lo cargo yo después en el `.env`.
+- **Links a redes sociales**: Instagram/Facebook/lo que corresponda, en el header o footer, también desde
+  variables de entorno con placeholders (`INSTAGRAM_URL`, etc.) — mismo criterio, los completo yo después.
+- **Diseño propio, no el tema oscuro de FashBalance**: FashBalance usa Tailwind con una paleta oscura de
+  panel de administración (`bg-[#0b0f19]`, etc.) — el storefront es una tienda de ropa de cara al
+  público, necesita su propia identidad visual (más clara, con las fotos de producto como protagonistas),
+  no heredar el tema del panel interno. Usá Tailwind igual (consistencia de herramienta), pero con
+  paleta/tipografía propias.
 
-### `GET /ecommerce/catalogo`
+## 3. Dos variables de entorno para "cómo llegar a FashBalance", no una — son cosas distintas
 
-Devuelve solo productos `activo=True` y `visible_ecommerce=True`, con: nombre, `descripcion_ecommerce`,
-`precio_venta`, nombre de categoría, fotos (ordenadas), y:
-- Si el producto NO tiene variantes: `stock_actual` (reusá `stock_por_producto`, no la reescribas).
-- Si tiene variantes: la lista de variantes con sus valores de atributo y `stock_actual` cada una —
-  mismo dato que ya devuelve `GET /productos/{id}/variantes` (`listar_variantes` en
-  `routers/productos.py`, que ya usa `calculations.stock_por_variante()` para esto desde la ronda de
-  Ventas). Reusá esa misma función/lógica, no la reescribas. Mismo criterio que ya se aplicó en Ventas:
-  la variante se informa igual aunque tenga stock 0 (para que el frontend del e-commerce pueda decidir
-  mostrarla como "sin stock" en vez de ocultarla), no la filtres acá — dejale esa decisión a quien
-  consuma el endpoint.
-- **NO exponer** `costo`, `mix_pct`, `lead_time_dias`, ni ningún otro dato interno de negocio — es un
-  endpoint público, cualquiera puede ver la respuesta JSON en el navegador.
+- `FASHBALANCE_API_URL`: URL interna de Docker (`http://backend:8000`) — se usa SOLO server-side, en los
+  Server Components/`fetch` que llevan el `X-API-Key`. Nunca debe tener el prefijo `NEXT_PUBLIC_` (eso lo
+  metería en el bundle que baja al navegador, exponiendo la key).
+- `FASHBALANCE_PUBLIC_URL`: la URL con la que el NAVEGADOR DEL CLIENTE puede llegar a FashBalance para
+  bajar las fotos (`/fotos/...`) — no puede ser la URL interna de Docker, el navegador de un comprador no
+  tiene forma de resolver `backend:8000`. Por ahora, mientras no exista nginx, esto va a ser la IP/puerto
+  real de la VM donde corre FashBalance (`http://<ip-vm>:8000`), igual que ya usás `VITE_API_URL` para el
+  frontend actual. Cuando se agregue nginx en una fase posterior, esto se simplifica (va a quedar bajo el
+  mismo origen que el storefront), pero no te adelantes a resolver eso ahora.
 
-### `POST /ecommerce/ordenes`
+## 4. Docker
 
-Recibe: datos de contacto del cliente (nombre, email opcional, teléfono opcional), forma de entrega
-("Retiro en persona" o "Envío", si es Envío requiere dirección), notas opcionales, y una lista de líneas
-(producto_id, variante_id si corresponde, cantidad).
-
-Antes de escribir nada en la base, validar CADA línea:
-- El producto existe, está `activo=True` y `visible_ecommerce=True`.
-- Si tiene variantes, viene `variante_id` y pertenece a ese producto.
-- Stock suficiente: usá `calculations.stock_disponible(db, producto_id, variante_id)` (ya existe, de la
-  ronda de Ventas — mismo cálculo `total_comprado - total_vendido` acotado a un solo id, no lo
-  reimplementes) y compará contra la `cantidad` pedida.
-
-Si CUALQUIER línea falla, rechazar la orden completa con `400` y el detalle de qué línea falló — no crear
-nada parcial (mismo criterio atómico que ya se usa en Importación y en el alta de producto con
-variantes). Con todo válido, en una única transacción:
-1. Crear `OrdenEcommerce` (tabla nueva: `id`, `fecha`, `estado` — usá `"Confirmada"` acá, no hace falta
-   más estados por ahora —, `cliente_nombre`, `cliente_email`, `cliente_telefono`, `forma_entrega`,
-   `direccion_envio`, `notas`, `total`).
-2. Por cada línea, crear un `OrdenEcommerceItem` (`orden_id`, `producto_id`, `variante_id`, `cantidad`,
-   `precio_unitario` — el `precio_venta` del producto en ESE momento, guardado como valor propio, no
-   como referencia — mismo criterio de denormalización que ya se usa en `mix_snapshots` para que el
-   histórico no dependa de que el precio no haya cambiado después).
-3. Por cada línea, crear el `Movimiento` tipo `"Venta"` correspondiente (ver punto siguiente sobre
-   reusar el mecanismo existente), y guardar su `id` en `OrdenEcommerceItem.movimiento_id` para
-   trazabilidad.
-
-**Sobre reusar la creación de la Venta**: `backend/app/routers/movimientos.py` ya tiene una función
-`_validar()` que hace exactamente la validación de arriba (incluido `stock_disponible()`) para
-`POST /movimientos` y su `PUT`. NO reimplementes esa validación en `routers/ecommerce.py`. Si `_validar()`
-hoy vive como función privada del router (no en `calculations.py`), movela ahí (o extraé su lógica a una
-función pública, ej. `calculations.validar_venta(...)`) junto con la creación real del `Movimiento`, en
-una función tipo `calculations.registrar_venta(db, producto_id, variante_id, cantidad, monto, ...)` que
-tanto `POST /movimientos` como este endpoint nuevo llamen — un solo camino de validación y creación de
-Venta, no dos que puedan desincronizarse con el tiempo. Fijate también el detalle de `_validar()` sobre
-sumar de vuelta la cantidad original al editar (`PUT`) — no aplica acá (las órdenes de e-commerce solo se
-crean, no se editan en esta fase), pero no rompas ese camino al refactorizar.
-
-## 4. Pantalla de administración: Órdenes E-commerce
-
-Página nueva en el frontend, `OrdenesEcommerce.jsx`, que lista lo que devuelve `GET /ecommerce/ordenes`
-(este SÍ es un endpoint interno normal, sin `X-API-Key`, como el resto del panel) — fecha, cliente, forma
-de entrega, items, total. Sin filtros complejos por ahora, una tabla alcanza. Nav link nuevo.
+- `ecommerce/Dockerfile`: build de producción de Next.js (`next build` + `next start`, no modo dev — a
+  diferencia del frontend de FashBalance, que sí corre en modo dev porque es un panel interno tuyo nomás;
+  esto en algún momento va a estar expuesto a cualquiera, arranca con el hábito correcto desde ahora).
+- Servicio nuevo en `docker-compose.yml` (`ecommerce`), puerto `3000` expuesto para probarlo desde tu
+  navegador apuntando a la IP de la VM, con las 4 variables de entorno de arriba.
 
 ## Qué NO hacer en esta ronda
 
-No toques nada de infraestructura nueva (nginx, Next.js, un servicio de e-commerce separado) — eso es
-Fase 1 en adelante, todavía no existe. No implementes ningún medio de pago ni cálculo de envío real —
-`forma_entrega` es solo un texto elegido entre dos opciones fijas, sin lógica detrás.
+Nada de carrito, checkout, medios de pago ni cálculo de envío (Fase 2). Nada de nginx ni TLS (fase
+posterior, cuando el storefront esté listo para salir a internet). No toques nada de FashBalance más allá
+del endpoint puntual de la sección 1.
 
 ## Antes de terminar
 
-Probá contra la API real: marcar un producto como visible, subirle una foto, pegarle a
-`GET /ecommerce/catalogo` sin `X-API-Key` (debe dar 401) y con la key correcta (debe traer el producto
-con su foto y su stock). Crear una orden completa con `POST /ecommerce/ordenes` y confirmar que se creó
-el `Movimiento` Venta correspondiente y que el stock bajó en `stock_por_producto`. Probar una orden con
-una cantidad mayor al stock disponible y confirmar que se rechaza sin crear nada (ni la orden, ni el
-movimiento, ni tocar el stock). Actualizá el CLAUDE.md con una sección nueva "E-commerce" documentando
-todo esto — es la base sobre la que van a construirse las fases siguientes.
+Como esto es un storefront con renderizado del lado del servidor, se puede verificar sin navegador: un
+`curl http://localhost:3000/` (o al puerto que corresponda) tiene que devolver HTML ya con los nombres y
+precios de los productos incrustados (confirma que el fetch server-side a la Storefront API funcionó), y
+lo mismo contra `/productos/{id}` de un producto con variantes, revisando que el HTML incluya las
+opciones de talle/color. Probá también pedir un producto que no existe o no está publicado y confirmar
+que la página maneja el 404 sin romperse. Avisame explícitamente qué tengo que revisar yo a mano en el
+navegador (layout, fotos, que el botón de WhatsApp abra bien) antes de dar esto por terminado. Actualizá
+el CLAUDE.md con una sección nueva sobre el storefront — arquitectura (Headless Commerce, BFF), las dos
+variables de entorno y por qué son distintas, y que WhatsApp/redes quedaron con placeholders a completar.

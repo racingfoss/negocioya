@@ -8,6 +8,28 @@ from . import productos
 router = APIRouter(prefix="/ecommerce", tags=["E-commerce"])
 
 
+def _producto_a_catalogo_dict(
+    db: Session, p: models.Producto, stock_producto_map: dict, stock_variante_map: dict
+) -> dict:
+    item = {
+        "id": p.id,
+        "nombre": p.nombre,
+        "descripcion_ecommerce": p.descripcion_ecommerce,
+        "precio_venta": p.precio_venta,
+        "categoria": p.categoria.nombre if p.categoria else None,
+        "fotos": sorted(p.fotos, key=lambda f: f.orden),
+        "tiene_variantes": p.tiene_variantes,
+        "stock_actual": None,
+        "variantes": None,
+    }
+    if p.tiene_variantes:
+        # variante se informa igual con stock 0 (no se filtra acá) — decisión del consumidor
+        item["variantes"] = productos._formatear_variantes(db, p.id, stock_variante_map)
+    else:
+        item["stock_actual"] = stock_producto_map.get(p.id, 0)
+    return item
+
+
 @router.get(
     "/catalogo",
     response_model=list[schemas.ProductoCatalogoOut],
@@ -29,26 +51,35 @@ def catalogo(db: Session = Depends(get_db)):
     stock_producto_map = {s["producto_id"]: s["stock_actual"] for s in calculations.stock_por_producto(db)}
     stock_variante_map = {s["variante_id"]: s["stock_actual"] for s in calculations.stock_por_variante(db)}
 
-    resultado = []
-    for p in productos_db:
-        item = {
-            "id": p.id,
-            "nombre": p.nombre,
-            "descripcion_ecommerce": p.descripcion_ecommerce,
-            "precio_venta": p.precio_venta,
-            "categoria": p.categoria.nombre if p.categoria else None,
-            "fotos": sorted(p.fotos, key=lambda f: f.orden),
-            "tiene_variantes": p.tiene_variantes,
-            "stock_actual": None,
-            "variantes": None,
-        }
-        if p.tiene_variantes:
-            # variante se informa igual con stock 0 (no se filtra acá) — decisión del consumidor
-            item["variantes"] = productos._formatear_variantes(db, p.id, stock_variante_map)
-        else:
-            item["stock_actual"] = stock_producto_map.get(p.id, 0)
-        resultado.append(item)
-    return resultado
+    return [_producto_a_catalogo_dict(db, p, stock_producto_map, stock_variante_map) for p in productos_db]
+
+
+@router.get(
+    "/catalogo/{producto_id}",
+    response_model=schemas.ProductoCatalogoOut,
+    dependencies=[Depends(auth.require_ecommerce_api_key)],
+)
+def catalogo_detalle(producto_id: int, db: Session = Depends(get_db)):
+    """Mismo criterio de visibilidad que GET /ecommerce/catalogo: 404 si no existe, no está activo,
+    o no está publicado — no se distingue el motivo en la respuesta para no filtrar por inferencia
+    que un producto existe pero está oculto. Pensado para la página de detalle de un storefront, así
+    no hace falta traer el catálogo completo para mostrar un solo producto."""
+    p = (
+        db.query(models.Producto)
+        .options(joinedload(models.Producto.categoria), joinedload(models.Producto.fotos))
+        .filter(
+            models.Producto.id == producto_id,
+            models.Producto.activo.is_(True),
+            models.Producto.visible_ecommerce.is_(True),
+        )
+        .first()
+    )
+    if not p:
+        raise HTTPException(404, "Producto no encontrado o no disponible en el e-commerce.")
+
+    stock_producto_map = {s["producto_id"]: s["stock_actual"] for s in calculations.stock_por_producto(db)}
+    stock_variante_map = {s["variante_id"]: s["stock_actual"] for s in calculations.stock_por_variante(db)}
+    return _producto_a_catalogo_dict(db, p, stock_producto_map, stock_variante_map)
 
 
 @router.post(

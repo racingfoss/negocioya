@@ -433,6 +433,75 @@ sigue sin autenticación, exactamente como hoy.
   ver sección de arriba sobre `create_all()`) y 3 tablas nuevas (`producto_fotos`, `ordenes_ecommerce`,
   `orden_ecommerce_items`), que se crearon solas.
 
+## Storefront público (Fase 1 — Next.js, solo lectura)
+
+Carpeta nueva `ecommerce/`, hermana de `backend/`/`frontend/`, mismo repo. Es un storefront de **solo
+lectura** — sin carrito, checkout ni pagos (eso sería una fase posterior, no decidida todavía). No hay
+CLAUDE.md aparte adentro de `ecommerce/`, todo documentado acá.
+
+- **Arquitectura**: Headless Commerce / BFF (Backend-for-Frontend). FashBalance es el Commerce Core; el
+  storefront es un Next.js (App Router, TypeScript) que consume los mismos 2 endpoints públicos protegidos
+  con `X-API-Key` que ya existían de la Fase 0 (`GET /ecommerce/catalogo`) más uno nuevo de esta ronda
+  (`GET /ecommerce/catalogo/{producto_id}`, para que la página de detalle no traiga el catálogo completo).
+  TypeScript porque el contrato JSON del catálogo (variantes opcionales, fotos, valores anidados) es
+  justo donde tipar evita bugs de acceso — es un proyecto aislado, no comparte build con `frontend/`, así
+  que no hay tensión real con que el resto del repo sea JS/Python sin tipos.
+- **Endpoint nuevo `GET /ecommerce/catalogo/{producto_id}`** (`backend/app/routers/ecommerce.py`): mismo
+  criterio de visibilidad que el listado (404 si no existe, no está `activo`, o no está
+  `visible_ecommerce` — sin distinguir el motivo, para no filtrar por inferencia que un producto existe
+  pero está oculto). El armado del dict de respuesta se extrajo a un helper `_producto_a_catalogo_dict`
+  (reusado por ambos endpoints) para no duplicar la lógica que ya arma `catalogo()`, mismo criterio que
+  `_formatear_variantes` en `productos.py`. Sigue usando `stock_por_variante(db)` (todas las variantes del
+  sistema) en vez de escribir una función nueva acotada a un producto — no hay volumen que lo justifique.
+- **Dos variables de entorno para llegar a FashBalance, no una — son cosas distintas**:
+  `FASHBALANCE_API_URL` (`http://backend:8000`, red interna de Docker) es la única que usa el servidor de
+  Next.js para hacer `fetch` en Server Components, con el header `X-API-Key` — nunca llega al navegador.
+  `FASHBALANCE_PUBLIC_URL` (misma IP/puerto que ya usa `VITE_API_URL` para el panel, ej.
+  `http://192.168.100.50:8000`) es la URL que sí tiene que poder resolver el navegador del cliente final,
+  para bajar las fotos (`/fotos/...`) y para armar la URL **absoluta** de `og:image` (WhatsApp/Facebook
+  necesitan URL pública para generar el preview de un link, no relativa). Ninguna de las dos lleva el
+  prefijo `NEXT_PUBLIC_` porque ambas se resuelven 100% server-side (fetch, `generateMetadata`, o props ya
+  armadas que se pasan a Client Components) — la diferencia es red interna de Docker vs. red externa/LAN,
+  no "server vs. cliente" en el sentido de Next.js. Cuando se agregue nginx en una fase posterior esto se
+  simplifica (mismo origen que el storefront), no se adelantó esa solución acá.
+- **Bug real ya corregido — nunca leer `process.env.FASHBALANCE_PUBLIC_URL` (ni ninguna env var sin
+  `NEXT_PUBLIC_`) dentro de un Client Component**: `ProductGallery.tsx` originalmente llamaba a
+  `fotoUrl()` directo para armar el `src` de la imagen en foco y las miniaturas. Como el componente
+  tiene `"use client"`, Next.js reemplaza en build-time cualquier `process.env.X` sin prefijo
+  `NEXT_PUBLIC_` por `undefined` en el código que termina en el bundle de cliente — rompía **ambas**
+  imágenes (foco y miniaturas) en `/productos/[id]`, mientras que `ProductCard.tsx` (la grilla de `/`,
+  Server Component) mostraba las fotos bien porque ahí `fotoUrl()` corre en el servidor con la env var
+  disponible en runtime. Fix aplicado: `ProductGallery` ya no recibe `Foto[]` ni llama a `fotoUrl()`
+  él mismo — recibe `FotoResuelta[]` (`{id, url}`) con las URLs ya armadas por `page.tsx` (Server
+  Component) y pasadas como prop. Regla general para cualquier componente nuevo: si necesita una URL
+  construida con `FASHBALANCE_PUBLIC_URL` (u otra env var server-only) y es o puede terminar siendo un
+  Client Component, resolvé la URL en el Server Component padre y pasala ya armada — nunca llames
+  `fotoUrl()` ni leas esas env vars desde un archivo con `"use client"`.
+- **Selector de atributos en cascada sin endpoint dedicado** (`ecommerce/src/lib/attributes.ts`): el
+  storefront no tiene acceso a `GET /productos/{id}/atributos` (interno del panel, sin `X-API-Key`) ni al
+  `orden` real de `ProductoAtributo`. `derivarAtributosProducto()` deriva la lista de atributos por orden
+  de **primera aparición** recorriendo `producto.variantes[].valores[]` — determinístico (no depende de
+  que cada variante liste sus valores en el mismo orden interno, que de hecho no está garantizado por la
+  query de `_formatear_variantes`), pero no es necesariamente el orden de negocio real de
+  `ProductoAtributo.orden`. Es una limitación aceptada, no un bug: alcanza para 1-2 atributos tipo
+  talle/color. `opcionesParaAtributo()` y `elegirValorAtributo()` son un port directo (mismo
+  comportamiento, con tipos) de las funciones homónimas en `frontend/src/pages/Movimientos.jsx` — mismo
+  criterio de opciones sin stock deshabilitadas con " (sin stock)" (nunca ocultas), mismo mensaje único
+  si todas las opciones del primer atributo quedan sin stock, mismo aviso si el producto tiene
+  `tiene_variantes=true` pero cero `Variante` cargadas.
+- **Placeholders pendientes de completar a mano**: `WHATSAPP_NUMERO`, `INSTAGRAM_URL`, `FACEBOOK_URL` (en
+  `.env` de la raíz) tienen valores de ejemplo obvios — hay que reemplazarlos por los reales del negocio
+  antes de compartir el storefront con clientes de verdad.
+- **Docker**: `ecommerce/Dockerfile` es multi-stage de **producción** (`next build` con
+  `output: "standalone"` + `node server.js` en el runner), a diferencia de `frontend/Dockerfile` (dev
+  puro, `npm run dev`, bind-mount) — no hay hot-reload acá, hay que rebuildear la imagen
+  (`docker compose build ecommerce`) ante cada cambio de código. Servicio `ecommerce` en
+  `docker-compose.yml`, puerto `3000`, `depends_on: backend` (sin `condition: service_healthy` porque
+  `backend` no tiene healthcheck definido, mismo nivel que ya usa `frontend`).
+- **Qué NO hace esta fase**: nada de carrito, checkout, medios de pago ni cálculo de envío. Nada de nginx
+  ni TLS — el storefront se prueba en red local igual que el panel, apuntando al puerto expuesto desde la
+  IP de la VM.
+
 ## Convenciones de código
 
 - **Backend**: nombres de tablas, campos, funciones y mensajes de error en español. Sin Alembic (ver nota
