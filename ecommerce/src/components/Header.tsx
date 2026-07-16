@@ -1,5 +1,6 @@
 import Link from "next/link";
 import SocialLinks from "./SocialLinks";
+import CartBadge from "./CartBadge";
 
 export default function Header({
   nombreTienda,
@@ -16,7 +17,10 @@ export default function Header({
         <Link href="/" className="font-serif text-2xl tracking-tight text-[#2a231f]">
           {nombreTienda}
         </Link>
-        <SocialLinks className="text-[#2a231f]" instagram={instagram} facebook={facebook} />
+        <div className="flex items-center gap-4">
+          <CartBadge />
+          <SocialLinks className="text-[#2a231f]" instagram={instagram} facebook={facebook} />
+        </div>
       </div>
     </header>
   );

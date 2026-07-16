@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "test:checkout": "tsx scripts/test-checkout.ts"
   },
   "dependencies": {
     "next": "^14.2.15",
@@ -19,6 +20,7 @@
     "autoprefixer": "^10.4.20",
     "postcss": "^8.4.47",
     "tailwindcss": "^3.4.13",
+    "tsx": "^4.19.0",
     "typescript": "^5.5.4"
   }
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Variante } from "@/lib/types";
 import {
   derivarAtributosProducto,
@@ -9,9 +9,49 @@ import {
   type ValoresElegidos,
 } from "@/lib/attributes";
 
-export default function VariantSelector({ variantes }: { variantes: Variante[] }) {
+export interface SeleccionVariante {
+  varianteId: number | null;
+  stock: number;
+  disponible: boolean;
+  descripcion: string | null; // ej. "M / Verde"
+}
+
+export default function VariantSelector({
+  variantes,
+  onSeleccionChange,
+}: {
+  variantes: Variante[];
+  onSeleccionChange?: (info: SeleccionVariante) => void;
+}) {
   const atributosProducto = useMemo(() => derivarAtributosProducto(variantes), [variantes]);
   const [valoresElegidos, setValoresElegidos] = useState<ValoresElegidos>({});
+
+  const seleccionCompleta = variantes.length > 0 && atributosProducto.every((a) => valoresElegidos[a.atributo_id]);
+  const varianteResuelta = seleccionCompleta
+    ? variantes.find((v) =>
+        atributosProducto.every((a) =>
+          v.valores.some((x) => x.atributo_id === a.atributo_id && x.valor_atributo_id === valoresElegidos[a.atributo_id])
+        )
+      )
+    : undefined;
+
+  useEffect(() => {
+    if (!seleccionCompleta || !varianteResuelta) {
+      onSeleccionChange?.({ varianteId: null, stock: 0, disponible: false, descripcion: null });
+      return;
+    }
+    const descripcion = atributosProducto
+      .map((a) => varianteResuelta.valores.find((v) => v.atributo_id === a.atributo_id)?.valor)
+      .filter(Boolean)
+      .join(" / ");
+    onSeleccionChange?.({
+      varianteId: varianteResuelta.id,
+      stock: varianteResuelta.stock_actual,
+      disponible: varianteResuelta.stock_actual > 0,
+      descripcion,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [varianteResuelta, seleccionCompleta]);
 
   if (variantes.length === 0) {
     return (
@@ -31,15 +71,6 @@ export default function VariantSelector({ variantes }: { variantes: Variante[] }
       </p>
     );
   }
-
-  const seleccionCompleta = atributosProducto.every((a) => valoresElegidos[a.atributo_id]);
-  const varianteResuelta = seleccionCompleta
-    ? variantes.find((v) =>
-        atributosProducto.every((a) =>
-          v.valores.some((x) => x.atributo_id === a.atributo_id && x.valor_atributo_id === valoresElegidos[a.atributo_id])
-        )
-      )
-    : undefined;
 
   return (
     <div className="space-y-4">

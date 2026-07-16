@@ -211,6 +211,10 @@ class Configuracion(Base):
     whatsapp_numero = Column(String(30), nullable=True)
     instagram_url = Column(String(255), nullable=True)
     facebook_url = Column(String(255), nullable=True)
+    # Destino del mailto: armado por el formulario de Contacto del storefront (Fase 2). Sin
+    # default, igual que whatsapp_numero/instagram_url/facebook_url — si queda vacío, el storefront
+    # oculta el formulario y muestra solo el botón de WhatsApp.
+    email_contacto = Column(String(150), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
@@ -269,6 +273,9 @@ class OrdenEcommerce(Base):
     forma_entrega = Column(String(20), nullable=False)  # "Retiro en persona" | "Envío"
     direccion_envio = Column(Text, nullable=True)
     notas = Column(Text, nullable=True)
+    # Qué opción visual tildó el cliente en el checkout (ej. "Efectivo al retirar",
+    # "Transferencia bancaria") — puramente informativo, no dispara ninguna lógica de pago real.
+    metodo_pago_preferido = Column(String(50), nullable=True)
     total = Column(Numeric(12, 2), nullable=False)
 
     items = relationship("OrdenEcommerceItem", back_populates="orden", cascade="all, delete-orphan")

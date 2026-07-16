@@ -221,6 +221,7 @@ class OrdenEcommerceCreate(BaseModel):
     forma_entrega: str  # "Retiro en persona" | "Envío"
     direccion_envio: Optional[str] = None
     notas: Optional[str] = None
+    metodo_pago_preferido: Optional[str] = None
     lineas: list[LineaOrdenIn]
 
 
@@ -246,6 +247,7 @@ class OrdenEcommerceOut(BaseModel):
     forma_entrega: str
     direccion_envio: Optional[str]
     notas: Optional[str]
+    metodo_pago_preferido: Optional[str]
     total: Decimal
     items: list[OrdenEcommerceItemOut] = []
 
@@ -296,6 +298,7 @@ class ConfiguracionBase(BaseModel):
     whatsapp_numero: Optional[str] = None
     instagram_url: Optional[str] = None
     facebook_url: Optional[str] = None
+    email_contacto: Optional[str] = None
 
 
 class Configuracion(ConfiguracionBase):
@@ -320,6 +323,7 @@ class ConfiguracionUpdate(BaseModel):
     whatsapp_numero: Optional[str] = None
     instagram_url: Optional[str] = None
     facebook_url: Optional[str] = None
+    email_contacto: Optional[str] = None
 
 
 # --- Configuración de la tienda (subset público, para el storefront) ---
@@ -333,6 +337,7 @@ class ConfiguracionTiendaOut(BaseModel):
     whatsapp_numero: Optional[str] = None
     instagram_url: Optional[str] = None
     facebook_url: Optional[str] = None
+    email_contacto: Optional[str] = None
 
 
 # --- Snapshots del mix real (para graficar evolución en el tiempo) ---

@@ -142,6 +142,7 @@ def crear_orden(payload: schemas.OrdenEcommerceCreate, db: Session = Depends(get
         forma_entrega=payload.forma_entrega,
         direccion_envio=payload.direccion_envio,
         notas=payload.notas,
+        metodo_pago_preferido=payload.metodo_pago_preferido,
         total=total,
     )
     db.add(orden)

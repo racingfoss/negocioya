@@ -3,7 +3,7 @@ import { notFound } from "next/navigation";
 import { getConfiguracionTienda, getProducto } from "@/lib/api";
 import { fotoUrl, formatearPrecio } from "@/lib/urls";
 import ProductGallery from "@/components/ProductGallery";
-import VariantSelector from "./VariantSelector";
+import AddToCartButton from "./AddToCartButton";
 
 export const dynamic = "force-dynamic";
 
@@ -53,13 +53,15 @@ export default async function ProductoPage({ params }: Params) {
         )}
 
         <div className="mt-6">
-          {producto.tiene_variantes ? (
-            <VariantSelector variantes={producto.variantes ?? []} />
-          ) : (
-            <p className={`text-sm font-medium ${(producto.stock_actual ?? 0) > 0 ? "text-green-700" : "text-red-700"}`}>
-              {(producto.stock_actual ?? 0) > 0 ? "Disponible" : "Sin stock"}
-            </p>
-          )}
+          <AddToCartButton
+            productoId={producto.id}
+            nombre={producto.nombre}
+            precioVenta={producto.precio_venta}
+            foto={fotos[0]?.url ?? null}
+            tieneVariantes={producto.tiene_variantes}
+            stockProducto={producto.stock_actual}
+            variantes={producto.variantes ?? []}
+          />
         </div>
 
         <div className="mt-8">

@@ -24,6 +24,7 @@ export default function OrdenesEcommerce() {
               <th className="py-2">Fecha</th>
               <th>Cliente</th>
               <th>Entrega</th>
+              <th>Pago</th>
               <th>Items</th>
               <th>Total</th>
             </tr>
@@ -41,6 +42,7 @@ export default function OrdenesEcommerce() {
                   {o.forma_entrega}
                   {o.direccion_envio && <div className="text-gray-500 text-xs">{o.direccion_envio}</div>}
                 </td>
+                <td>{o.metodo_pago_preferido || '—'}</td>
                 <td>
                   {o.items.map((it) => (
                     <div key={it.id}>
@@ -53,7 +55,7 @@ export default function OrdenesEcommerce() {
             ))}
             {ordenes.length === 0 && (
               <tr>
-                <td colSpan={5} className="text-gray-500 py-4 text-center">
+                <td colSpan={6} className="text-gray-500 py-4 text-center">
                   Todavía no hay órdenes.
                 </td>
               </tr>

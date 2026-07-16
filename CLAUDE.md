@@ -528,9 +528,114 @@ CLAUDE.md aparte adentro de `ecommerce/`, todo documentado acá.
   (`docker compose build ecommerce`) ante cada cambio de código. Servicio `ecommerce` en
   `docker-compose.yml`, puerto `3000`, `depends_on: backend` (sin `condition: service_healthy` porque
   `backend` no tiene healthcheck definido, mismo nivel que ya usa `frontend`).
-- **Qué NO hace esta fase**: nada de carrito, checkout, medios de pago ni cálculo de envío. Nada de nginx
-  ni TLS — el storefront se prueba en red local igual que el panel, apuntando al puerto expuesto desde la
-  IP de la VM.
+- **Qué NO hace esta fase**: nada de carrito, checkout, medios de pago ni cálculo de envío (ver
+  "Carrito y checkout (Fase 2)" más abajo — carrito y checkout ya existen, medios de pago y envío
+  siguen sin funcionalidad real). Nada de nginx ni TLS — el storefront se prueba en red local igual
+  que el panel, apuntando al puerto expuesto desde la IP de la VM.
+
+## Carrito y checkout (Fase 2 — Next.js, con estado de cliente)
+
+Agrega al storefront de solo lectura de la Fase 1 un carrito de compras y un checkout que genera
+órdenes reales contra `POST /ecommerce/ordenes` (el mismo endpoint construido y probado en la Fase
+0 — no hizo falta tocarlo para persistir órdenes, solo agregarle un campo informativo, ver más
+abajo). Sigue sin haber pasarela de pago real, cálculo de envío real, ni nginx/TLS — eso queda para
+una fase futura no planificada todavía.
+
+- **Excepción deliberada a "sin `localStorage`"**: la convención de no usar `localStorage`/
+  `sessionStorage` (ver "Convenciones de código" más abajo) es específica del panel interno
+  (`frontend/`), donde toda la data de negocio tiene que vivir en Postgres. El carrito del
+  storefront es distinto a propósito: es estado de sesión de un comprador anónimo, no un dato de
+  negocio, y perder el carrito al recargar la página sería mala experiencia de compra real. Es una
+  decisión consciente, no que se pasó por alto la regla del panel.
+- **`CartContext`/`CartProvider`** (`ecommerce/src/context/CartContext.tsx`, Client Component):
+  estado `items: CartItem[]` (cada línea con `producto_id`, `variante_id` opcional, `nombre`,
+  `foto` ya resuelta, `variante_descripcion`, `precio_venta` snapshot numérico al agregar,
+  `cantidad`, y `stock_actual` conocido al agregar para acotar la cantidad client-side — no hace
+  falta que sea perfecto, el checkout revalida en el servidor igual). Acciones: `agregarItem`
+  (suma cantidades si ya existe la línea por `producto_id`+`variante_id`, en vez de duplicarla, con
+  tope contra `stock_actual`), `actualizarCantidad`, `quitarItem`, `vaciarCarrito`. Derivados
+  `cantidadTotal`/`total` expuestos por el hook `useCart()` para no recalcular la suma en cada
+  consumidor.
+  - **Gotcha de hidratación evitado**: sincronizar a `localStorage` en un único `useEffect([items])`
+    también correría en el primer render (con `items` todavía `[]`, antes de que la carga inicial
+    tuviera chance de aplicar lo guardado), pisando el localStorage real con `[]`. Se resuelve con
+    un flag `hydrated` interno: un primer efecto (solo al montar) lee `localStorage` y lo vuelca a
+    `items`; el efecto de sync a `localStorage` solo escribe si `hydrated` ya es `true`.
+  - **`CartProvider` envuelve Header + `{children}` + Footer + `WhatsAppButton` en `layout.tsx`,
+    no solo `children`**: el spec original pedía envolver `children`, pero `CartBadge` (el ícono
+    con contador en el header) vive dentro de `Header`, que en `layout.tsx` es hermano de
+    `{children}`, no descendiente — si el Provider solo envolviera `children`, `CartBadge` quedaría
+    fuera de su alcance. `layout.tsx` sigue siendo Server Component (async, `generateMetadata`,
+    `dynamic = "force-dynamic"` intactos): solo se envuelve su JSX de salida con `<CartProvider>`,
+    patrón soportado de Next.js (un Server Component puede pasar JSX ya renderizado como hijo de un
+    Client Component sin que ese JSX se vuelva cliente).
+- **Agregar al carrito** (`app/productos/[id]/AddToCartButton.tsx`, nuevo): reemplaza el bloque que
+  antes solo mostraba disponibilidad. `VariantSelector.tsx` ganó un prop opcional
+  `onSeleccionChange` (cambio aditivo, no se duplicó su lógica de cascada) que reporta hacia arriba
+  la variante resuelta, su stock y su descripción (ej. "M / Verde") cada vez que cambia la
+  selección — vía un `useEffect` ubicado **antes** de los `return` tempranos del componente (los de
+  "sin variantes cargadas" / "sin stock en ninguna combinación"), para no violar las reglas de
+  hooks llamándolo condicionalmente. `AddToCartButton` es quien realmente sabe agregar al carrito
+  (`useCart().agregarItem(...)`), con un input de cantidad topado contra el stock conocido, mismo
+  criterio de "tope contra stock" que ya usa `Movimientos.jsx` del panel.
+- **`/carrito`** (Client Component completo, necesita `useCart()`): lista de líneas con foto,
+  nombre, variante, cantidad editable (tope por línea), subtotal, botón "Sacar", total general y
+  link a `/checkout`. Vacío: mensaje + link a `/`.
+- **`/checkout` — Server Action con lógica real separada, a propósito**: `src/lib/checkout.ts`
+  expone `procesarCheckout(carrito, datosContacto)`, que arma el payload real y le pega a
+  `POST /ecommerce/ordenes` con la `X-API-Key` (nunca en código de cliente) usando `fetch` con
+  `cache: "no-store"` — no reutiliza el `apiFetch` de `lib/api.ts` porque ese helper está atado a
+  GET + `revalidate: 60` + semántica "404 → null", que no aplica a una mutación. La Server Action
+  (`app/checkout/actions.ts`, `"use server"`) es una envoltura fina: `FormData` → objeto → delega
+  100% en `procesarCheckout`. Esta separación es lo que permite probar `procesarCheckout` con un
+  script (`scripts/test-checkout.ts`, ver abajo) sin navegador ni el protocolo interno de invocación
+  de Server Actions, que no es practicable armar a mano con `curl`. `app/checkout/CheckoutForm.tsx`
+  (Client) usa `useFormState`/`useFormStatus` de `react-dom` (estable en React 18.3.1 + Next
+  14.2.x); el carrito (`items`) viaja **bindeado** a la Server Action
+  (`crearOrdenAction.bind(null, items)`, mecanismo nativo de Next.js para pasar datos no-formulario
+  a un `<form action>`), el resto de los campos son inputs nativos leídos de `FormData`. El vaciado
+  del carrito ocurre **client-side**, en un `useEffect` que reacciona al resultado devuelto —
+  nunca dentro de la Server Action, que corre en el servidor sin acceso a `localStorage`. Si el
+  backend rechaza una línea puntual por stock insuficiente, el `detail` del error se muestra tal
+  cual en el formulario y el carrito **no se vacía** (solo se vacía en el branch de éxito), para
+  que el comprador ajuste cantidad o saque el producto y reintente.
+- **`/pedido-confirmado`**: Server Component simple, lee `?id=` de la URL, sin fetch propio.
+- **`metodo_pago_preferido`** (nuevo campo en `OrdenEcommerce`, nullable): qué opción visual tildó
+  el cliente en el checkout (ej. "Efectivo al retirar", "Transferencia bancaria") — puramente
+  informativo, no dispara ninguna lógica de pago real. Mismo patrón de siempre para columnas
+  nuevas en una tabla existente: `ALTER TABLE ordenes_ecommerce ADD COLUMN metodo_pago_preferido
+  VARCHAR(50);` manual (`create_all()` no migra tablas existentes). Se agregó a
+  `OrdenEcommerceCreate`/`OrdenEcommerceOut` y se muestra en `OrdenesEcommerce.jsx` del panel
+  (columna "Pago", `—` para órdenes viejas con el campo en `NULL`).
+- **`email_contacto` en `configuracion`** (desvío puntual acordado, no parte del plan original):
+  el formulario de Contacto (punto siguiente) arma un `mailto:` pero no había ningún email de
+  destino disponible en ningún lado del sistema. En vez de una env var nueva en `ecommerce/` o un
+  valor hardcodeado, se agregó como un campo más de "Tienda Online" en ⚙️ Configuración del panel
+  (mismo patrón que `nombre_ecommerce`/`whatsapp_numero`/`instagram_url`/`facebook_url`: columna
+  nullable en `configuracion`, sin default, `ALTER TABLE configuracion ADD COLUMN email_contacto
+  VARCHAR(150);` manual, expuesto al storefront vía `GET /ecommerce/configuracion-tienda`). Se
+  edita sin rebuild, igual que el resto de esa sección.
+- **Formulario de contacto** (`app/contacto/`): página liviana (nombre, email, mensaje) que arma un
+  link `mailto:` al destino de `email_contacto` — sin backend propio, sin envío real de mail
+  server-side. Si `email_contacto` todavía no está configurado (`null`), `ContactForm.tsx` oculta
+  el formulario y muestra un mensaje apuntando al botón de WhatsApp, coherente con que ese ya es el
+  canal de contacto principal desde la Fase 1.
+- **`scripts/test-checkout.ts`**: prueba `procesarCheckout()` directo contra el backend real (sin
+  pasar por Next.js ni por HTTP al storefront). Busca automáticamente en el catálogo publicado un
+  producto (con o sin variantes) con stock suficiente, corre un caso válido (confirma que crea la
+  orden y muestra su id bien visible) y un caso de cantidad mayor al stock disponible (confirma que
+  se rechaza sin crear nada). **Nunca borra nada automáticamente** — los pedidos válidos que crea
+  quedan como órdenes reales (con su Movimiento de Venta real y stock descontado real) en la base.
+  Como el proyecto no tiene `node`/`npm` en el host (todo corre en contenedores) y el servicio
+  `ecommerce` corre la build de producción sin bind-mount de código, se ejecuta con un contenedor
+  descartable de Node en la red de Docker Compose del proyecto (`docker run --rm --network
+  negocioya_default -v "$(pwd)/ecommerce:/app" -w /app -e FASHBALANCE_API_URL=http://backend:8000
+  -e ECOMMERCE_API_KEY=... node:20-alpine sh -c "npm install && npm run test:checkout"`). `tsx` es
+  devDependency de `ecommerce/package.json` (no entra a la imagen de producción, que solo copia
+  `.next/standalone`).
+- **Qué NO se tocó**: Compras, Movimientos, Análisis e Importación del panel siguen exactamente
+  igual — el único cambio de ese lado además de lo de arriba es el campo `metodo_pago_preferido` en
+  la pantalla de Órdenes E-commerce.
 
 ## Convenciones de código
 

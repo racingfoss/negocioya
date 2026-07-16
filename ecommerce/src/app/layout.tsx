@@ -3,6 +3,7 @@ import Header from "@/components/Header";
 import Footer from "@/components/Footer";
 import WhatsAppButton from "@/components/WhatsAppButton";
 import { getConfiguracionTienda } from "@/lib/api";
+import { CartProvider } from "@/context/CartContext";
 import "./globals.css";
 
 // El layout ahora hace fetch a FashBalance (nombre/WhatsApp/redes de la tienda). Sin esto, "next
@@ -24,21 +25,23 @@ export default async function RootLayout({ children }: { children: React.ReactNo
   return (
     <html lang="es">
       <body className="flex min-h-screen flex-col font-sans">
-        <Header
-          nombreTienda={config.nombre_ecommerce}
-          instagram={config.instagram_url}
-          facebook={config.facebook_url}
-        />
-        <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-8 sm:px-6">{children}</main>
-        <Footer
-          nombreTienda={config.nombre_ecommerce}
-          instagram={config.instagram_url}
-          facebook={config.facebook_url}
-        />
-        <WhatsAppButton
-          numero={config.whatsapp_numero}
-          mensaje="Hola! Quería consultar por sus productos."
-        />
+        <CartProvider>
+          <Header
+            nombreTienda={config.nombre_ecommerce}
+            instagram={config.instagram_url}
+            facebook={config.facebook_url}
+          />
+          <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-8 sm:px-6">{children}</main>
+          <Footer
+            nombreTienda={config.nombre_ecommerce}
+            instagram={config.instagram_url}
+            facebook={config.facebook_url}
+          />
+          <WhatsAppButton
+            numero={config.whatsapp_numero}
+            mensaje="Hola! Quería consultar por sus productos."
+          />
+        </CartProvider>
       </body>
     </html>
   );

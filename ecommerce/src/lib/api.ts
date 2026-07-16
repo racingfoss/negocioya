@@ -29,6 +29,7 @@ const CONFIGURACION_TIENDA_DEFAULT: ConfiguracionTienda = {
   whatsapp_numero: null,
   instagram_url: null,
   facebook_url: null,
+  email_contacto: null,
 };
 
 export async function getConfiguracionTienda(): Promise<ConfiguracionTienda> {

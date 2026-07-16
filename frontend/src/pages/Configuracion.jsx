@@ -110,6 +110,12 @@ const GRUPOS = [
         ayuda: 'Ej: https://facebook.com/tu_negocio. Dejalo vacío para no mostrar el ícono en el storefront.',
         tipo: 'texto',
       },
+      {
+        key: 'email_contacto',
+        label: 'Email de contacto',
+        ayuda: 'Email que recibe los mensajes del formulario de Contacto del storefront. Dejalo vacío para ocultar ese formulario y mostrar solo el botón de WhatsApp.',
+        tipo: 'texto',
+      },
     ],
   },
 ]
