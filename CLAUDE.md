@@ -331,6 +331,31 @@ sale el número.
 `GET /configuracion` devuelve la fila (la crea si no existe); `PUT /configuracion` actualiza los campos
 que se manden (`exclude_unset`, así que se puede mandar solo el campo que cambia).
 
+**Identidad de la tienda (nombre, WhatsApp, redes) — vive acá también, no son "números mágicos" de
+negocio, pero son el mismo tipo de dato editable sin rebuild**: `nombre_ecommerce` (default `"Adorante"`
+— el nombre real de la tienda; "FashBalance" es el nombre de este software de gestión, no se muestran
+al público), `whatsapp_numero`, `instagram_url` (nullable), `facebook_url` (nullable). Reemplazan a las
+env vars fijas `WHATSAPP_NUMERO`/`INSTAGRAM_URL`/`FACEBOOK_URL` que existían en el `docker-compose.yml`
+del servicio `ecommerce` (Fase 1) — esas variables **ya no existen**, ni en `docker-compose.yml` ni en
+`.env`. Se editan desde la misma sección "Tienda Online" de la pantalla ⚙️ Configuración, con el mismo
+`GET`/`PUT /configuracion` y el mismo botón de guardar que el resto de los campos de esta tabla — por eso
+viven en `ConfiguracionBase`/`ConfiguracionUpdate` igual que los demás.
+**Pero el storefront (`ecommerce/`) NO los lee de `GET /configuracion`** — ese endpoint es la Admin API
+interna, sin autenticación, y devuelve además todos los umbrales de negocio (márgenes, percentiles, etc.)
+que no tienen por qué llegar a un servicio de cara al público. Para eso existe
+`GET /ecommerce/configuracion-tienda` (`backend/app/routers/ecommerce.py`), con el mismo `X-API-Key` que
+los otros 3 endpoints de ese router, y un schema dedicado `schemas.ConfiguracionTiendaOut` (mismo criterio
+que `ProductoCatalogoOut`: garantiza por diseño que nunca se cuele otro campo de `configuracion`, sin
+armar un `dict` a mano). `ecommerce/src/lib/api.ts` expone `getConfiguracionTienda()` con el mismo
+mecanismo de `X-API-Key` y `revalidate: 60` que `getCatalogo()`/`getProducto()`. Se consume una sola vez
+en `app/layout.tsx` (Server Component, junto con `generateMetadata` para el `<title>`) y se pasa como
+props ya resueltas a `Header`/`Footer`/`SocialLinks`/`WhatsAppButton` — ninguno de esos componentes lee
+la env var ni hace fetch propio. `app/productos/[id]/page.tsx` hace su propio fetch (mismo `Promise.all`
+que ya usaba para `getProducto`) porque el botón de WhatsApp de esa pantalla necesita el nombre del
+producto en el mensaje. **`layout.tsx` tiene `export const dynamic = "force-dynamic"`**: sin eso,
+`next build` intenta pre-renderizar estáticamente rutas como `/_not-found` y falla en build time (no hay
+backend ni env vars de runtime disponibles todavía en esa etapa).
+
 ## Snapshots del mix real (`mix_snapshots`)
 
 Guarda una foto periódica del mix% real de facturación de cada producto activo (misma función
@@ -489,9 +514,14 @@ CLAUDE.md aparte adentro de `ecommerce/`, todo documentado acá.
   criterio de opciones sin stock deshabilitadas con " (sin stock)" (nunca ocultas), mismo mensaje único
   si todas las opciones del primer atributo quedan sin stock, mismo aviso si el producto tiene
   `tiene_variantes=true` pero cero `Variante` cargadas.
-- **Placeholders pendientes de completar a mano**: `WHATSAPP_NUMERO`, `INSTAGRAM_URL`, `FACEBOOK_URL` (en
-  `.env` de la raíz) tienen valores de ejemplo obvios — hay que reemplazarlos por los reales del negocio
-  antes de compartir el storefront con clientes de verdad.
+- **Nombre de la tienda, WhatsApp y redes ya NO son env vars — se sacaron del todo**: en una ronda
+  posterior se dieron de baja `WHATSAPP_NUMERO`, `INSTAGRAM_URL`, `FACEBOOK_URL` del servicio `ecommerce`
+  en `docker-compose.yml` y de `.env` (eran placeholders de ejemplo obvios que había que completar a
+  mano y rebuildear para cambiar). Pasaron a vivir en `configuracion` (columnas `nombre_ecommerce`,
+  `whatsapp_numero`, `instagram_url`, `facebook_url`), editables desde ⚙️ Configuración del panel y
+  expuestas al storefront vía `GET /ecommerce/configuracion-tienda` — ver el detalle completo en la
+  sección "Configuración del negocio" más arriba. Un cambio ahí se refleja solo (respetando el
+  `revalidate: 60` del fetch), sin rebuildear `ecommerce/`.
 - **Docker**: `ecommerce/Dockerfile` es multi-stage de **producción** (`next build` con
   `output: "standalone"` + `node server.js` en el runner), a diferencia de `frontend/Dockerfile` (dev
   puro, `npm run dev`, bind-mount) — no hay hot-reload acá, hay que rebuildear la imagen

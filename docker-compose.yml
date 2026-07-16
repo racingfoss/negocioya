@@ -54,9 +54,6 @@ services:
       FASHBALANCE_API_URL: http://backend:8000
       FASHBALANCE_PUBLIC_URL: ${FASHBALANCE_PUBLIC_URL}
       ECOMMERCE_API_KEY: ${ECOMMERCE_API_KEY}
-      WHATSAPP_NUMERO: ${WHATSAPP_NUMERO}
-      INSTAGRAM_URL: ${INSTAGRAM_URL}
-      FACEBOOK_URL: ${FACEBOOK_URL}
     depends_on:
       - backend
     ports:

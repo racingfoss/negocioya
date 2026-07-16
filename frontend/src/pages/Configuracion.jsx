@@ -83,6 +83,35 @@ const GRUPOS = [
       },
     ],
   },
+  {
+    titulo: 'Tienda Online',
+    campos: [
+      {
+        key: 'nombre_ecommerce',
+        label: 'Nombre de la tienda',
+        ayuda: 'Nombre que se muestra en el storefront (logo, título de la página, pie de página). No es el nombre de este panel de gestión.',
+        tipo: 'texto',
+      },
+      {
+        key: 'whatsapp_numero',
+        label: 'WhatsApp (con código de país, sin espacios ni +)',
+        ayuda: 'Ej: 5491122334455. Se usa para el botón flotante de WhatsApp y el botón "Consultar" de cada producto en el storefront.',
+        tipo: 'texto',
+      },
+      {
+        key: 'instagram_url',
+        label: 'Instagram (URL completa)',
+        ayuda: 'Ej: https://instagram.com/tu_negocio. Dejalo vacío para no mostrar el ícono en el storefront.',
+        tipo: 'texto',
+      },
+      {
+        key: 'facebook_url',
+        label: 'Facebook (URL completa)',
+        ayuda: 'Ej: https://facebook.com/tu_negocio. Dejalo vacío para no mostrar el ícono en el storefront.',
+        tipo: 'texto',
+      },
+    ],
+  },
 ]
 
 export default function Configuracion() {
@@ -139,10 +168,10 @@ export default function Configuracion() {
               <label className="md:col-span-1 font-medium text-sm pt-2">{c.label}</label>
               <div className="md:col-span-2">
                 <input
-                  type="number"
-                  step="any"
-                  className="w-full md:w-48 bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
-                  value={config[c.key]}
+                  type={c.tipo === 'texto' ? 'text' : 'number'}
+                  step={c.tipo === 'texto' ? undefined : 'any'}
+                  className="w-full md:w-72 bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
+                  value={config[c.key] ?? ''}
                   onChange={(e) => cambiar(c.key, e.target.value)}
                 />
                 <p className="text-gray-500 text-xs mt-1">{c.ayuda}</p>

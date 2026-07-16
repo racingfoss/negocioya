@@ -292,6 +292,10 @@ class ConfiguracionBase(BaseModel):
     motor_decoracion_pareto_pct: Decimal
     mix_real_ventana_dias_default: int
     snapshot_periodo_dias: int
+    nombre_ecommerce: str = "Adorante"
+    whatsapp_numero: Optional[str] = None
+    instagram_url: Optional[str] = None
+    facebook_url: Optional[str] = None
 
 
 class Configuracion(ConfiguracionBase):
@@ -312,6 +316,23 @@ class ConfiguracionUpdate(BaseModel):
     motor_decoracion_pareto_pct: Optional[Decimal] = None
     mix_real_ventana_dias_default: Optional[int] = None
     snapshot_periodo_dias: Optional[int] = None
+    nombre_ecommerce: Optional[str] = None
+    whatsapp_numero: Optional[str] = None
+    instagram_url: Optional[str] = None
+    facebook_url: Optional[str] = None
+
+
+# --- Configuración de la tienda (subset público, para el storefront) ---
+# Schema dedicado (mismo criterio que ProductoCatalogoOut): garantiza por diseño que
+# GET /ecommerce/configuracion-tienda nunca devuelva ningún otro campo de `configuracion`
+# (umbrales internos de negocio), aunque el modelo ORM tenga muchos más.
+
+class ConfiguracionTiendaOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    nombre_ecommerce: str
+    whatsapp_numero: Optional[str] = None
+    instagram_url: Optional[str] = None
+    facebook_url: Optional[str] = None
 
 
 # --- Snapshots del mix real (para graficar evolución en el tiempo) ---

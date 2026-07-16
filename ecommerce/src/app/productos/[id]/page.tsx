@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
-import { getProducto } from "@/lib/api";
+import { getConfiguracionTienda, getProducto } from "@/lib/api";
 import { fotoUrl, formatearPrecio } from "@/lib/urls";
 import ProductGallery from "@/components/ProductGallery";
 import VariantSelector from "./VariantSelector";
@@ -30,7 +30,7 @@ export async function generateMetadata({ params }: Params): Promise<Metadata> {
 }
 
 export default async function ProductoPage({ params }: Params) {
-  const producto = await getProducto(params.id);
+  const [producto, config] = await Promise.all([getProducto(params.id), getConfiguracionTienda()]);
   if (!producto) notFound();
 
   const fotos = [...producto.fotos]
@@ -63,15 +63,14 @@ export default async function ProductoPage({ params }: Params) {
         </div>
 
         <div className="mt-8">
-          <WhatsAppButtonInline nombre={producto.nombre} />
+          <WhatsAppButtonInline nombre={producto.nombre} numero={config.whatsapp_numero} />
         </div>
       </div>
     </div>
   );
 }
 
-function WhatsAppButtonInline({ nombre }: { nombre: string }) {
-  const numero = process.env.WHATSAPP_NUMERO ?? "";
+function WhatsAppButtonInline({ nombre, numero }: { nombre: string; numero: string | null }) {
   if (!numero) return null;
   const mensaje = encodeURIComponent(`Hola! Quería consultar por "${nombre}".`);
   return (

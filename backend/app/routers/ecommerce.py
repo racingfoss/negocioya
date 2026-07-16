@@ -31,6 +31,18 @@ def _producto_a_catalogo_dict(
 
 
 @router.get(
+    "/configuracion-tienda",
+    response_model=schemas.ConfiguracionTiendaOut,
+    dependencies=[Depends(auth.require_ecommerce_api_key)],
+)
+def configuracion_tienda(db: Session = Depends(get_db)):
+    """Identidad de la tienda para el storefront (nombre, WhatsApp, redes). Deliberadamente NO es
+    GET /configuracion (Admin API interna, sin autenticación, que devuelve todos los umbrales de
+    negocio) — este endpoint usa un schema dedicado que solo puede devolver estos 4 campos."""
+    return calculations.get_configuracion(db)
+
+
+@router.get(
     "/catalogo",
     response_model=list[schemas.ProductoCatalogoOut],
     dependencies=[Depends(auth.require_ecommerce_api_key)],

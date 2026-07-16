@@ -203,6 +203,14 @@ class Configuracion(Base):
     motor_decoracion_pareto_pct = Column(Numeric(5, 2), nullable=False, default=80.0)
     mix_real_ventana_dias_default = Column(Integer, nullable=False, default=30)
     snapshot_periodo_dias = Column(Integer, nullable=False, default=30)
+    # Identidad de la tienda para el storefront (ecommerce/) — reemplaza a las env vars fijas
+    # WHATSAPP_NUMERO/INSTAGRAM_URL/FACEBOOK_URL de la Fase 1, editable sin rebuild.
+    # Expuesto al storefront vía GET /ecommerce/configuracion-tienda (schema dedicado, con
+    # X-API-Key), nunca por GET /configuracion (Admin API interna, sin auth).
+    nombre_ecommerce = Column(String(100), nullable=False, default="Adorante")
+    whatsapp_numero = Column(String(30), nullable=True)
+    instagram_url = Column(String(255), nullable=True)
+    facebook_url = Column(String(255), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 

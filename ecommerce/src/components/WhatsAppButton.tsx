@@ -2,8 +2,13 @@ function whatsappHref(numero: string, mensaje: string): string {
   return `https://wa.me/${numero}?text=${encodeURIComponent(mensaje)}`;
 }
 
-export default function WhatsAppButton({ mensaje }: { mensaje: string }) {
-  const numero = process.env.WHATSAPP_NUMERO ?? "";
+export default function WhatsAppButton({
+  numero,
+  mensaje,
+}: {
+  numero: string | null;
+  mensaje: string;
+}) {
   if (!numero) return null;
 
   return (

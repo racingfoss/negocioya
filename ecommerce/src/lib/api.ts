@@ -1,4 +1,4 @@
-import type { ProductoCatalogo } from "./types";
+import type { ConfiguracionTienda, ProductoCatalogo } from "./types";
 
 const API_URL = process.env.FASHBALANCE_API_URL;
 const API_KEY = process.env.ECOMMERCE_API_KEY;
@@ -22,4 +22,16 @@ export async function getCatalogo(): Promise<ProductoCatalogo[]> {
 
 export async function getProducto(id: string | number): Promise<ProductoCatalogo | null> {
   return apiFetch<ProductoCatalogo>(`/ecommerce/catalogo/${id}`);
+}
+
+const CONFIGURACION_TIENDA_DEFAULT: ConfiguracionTienda = {
+  nombre_ecommerce: "Adorante",
+  whatsapp_numero: null,
+  instagram_url: null,
+  facebook_url: null,
+};
+
+export async function getConfiguracionTienda(): Promise<ConfiguracionTienda> {
+  const data = await apiFetch<ConfiguracionTienda>("/ecommerce/configuracion-tienda");
+  return data ?? CONFIGURACION_TIENDA_DEFAULT;
 }

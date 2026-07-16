@@ -1,7 +1,12 @@
-export default function SocialLinks({ className = "" }: { className?: string }) {
-  const instagram = process.env.INSTAGRAM_URL;
-  const facebook = process.env.FACEBOOK_URL;
-
+export default function SocialLinks({
+  className = "",
+  instagram,
+  facebook,
+}: {
+  className?: string;
+  instagram: string | null;
+  facebook: string | null;
+}) {
   if (!instagram && !facebook) return null;
 
   return (

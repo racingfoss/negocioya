@@ -31,3 +31,10 @@ export interface ProductoCatalogo {
   stock_actual: number | null;
   variantes: Variante[] | null;
 }
+
+export interface ConfiguracionTienda {
+  nombre_ecommerce: string;
+  whatsapp_numero: string | null;
+  instagram_url: string | null;
+  facebook_url: string | null;
+}
