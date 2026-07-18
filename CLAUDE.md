@@ -327,6 +327,10 @@ sale el número.
 | `motor_decoracion_pareto_pct` | 80.0 | % de Pareto usado como fallback de "Motor vs Decoración" en `analisis_combinado` cuando no hay costos fijos cargados. |
 | `mix_real_ventana_dias_default` | 30 | Solo afecta al frontend: con cuántos días viene tildado por defecto el selector de ventana al abrir el Punto de Equilibrio (el selector 7/30/90 sigue existiendo igual, esto no lo reemplaza). |
 | `snapshot_periodo_dias` | 30 | Cada cuántos días corresponde tomar un snapshot del mix real (ver sección siguiente). |
+| `arca_cuit` | `null` | CUIT que se usa para pedir el CAE a ARCA (WSFEv1). Ver sección "Facturación electrónica (Fase A)" más abajo. |
+| `arca_punto_venta_defecto` | 1 | Punto de venta habilitado en ARCA usado para `FECompUltimoAutorizado`/`FECAESolicitar`. |
+| `arca_razon_social` | `null` | Nombre completo para el comprobante. Todavía sin uso en código (fase pendiente del PDF/impresión). |
+| `arca_domicilio_fiscal` | `null` | Domicilio para el comprobante. Todavía sin uso en código (fase pendiente del PDF/impresión). |
 
 `GET /configuracion` devuelve la fila (la crea si no existe); `PUT /configuracion` actualiza los campos
 que se manden (`exclude_unset`, así que se puede mandar solo el campo que cambia).
@@ -636,6 +640,93 @@ una fase futura no planificada todavía.
 - **Qué NO se tocó**: Compras, Movimientos, Análisis e Importación del panel siguen exactamente
   igual — el único cambio de ese lado además de lo de arriba es el campo `metodo_pago_preferido` en
   la pantalla de Órdenes E-commerce.
+
+## Facturación electrónica (Fase A — integración ARCA)
+
+Primer paso hacia facturación electrónica real: autenticarse contra ARCA (WSAA) y pedir un CAE real
+para Factura C (WSFEv1) contra homologación. **Esta fase es 100% integración técnica aislada** — no
+toca `Pedido`, `OrdenEcommerce`, Caja, ni ninguna pantalla de facturación (la única excepción es la
+sección nueva de ⚙️ Configuración descrita más abajo, pedido explícito posterior al alcance original).
+Todavía no hay ningún camino que convierta una Orden/Venta real en una Factura — eso es una fase
+futura no planificada todavía.
+
+- **Contexto de negocio**: Florencia es monotributista, emite Factura C. WSFEv1 es el servicio más
+  simple de ARCA para este caso porque **no lleva desglose de IVA** (prohibido informarlo para tipo
+  C — mandar el array `<Iva>` lo rechaza) y **no lleva detalle de ítem**: se factura el total de una
+  operación, no producto por producto. Esto simplifica mucho el diseño — no hace falta mapear líneas
+  de un pedido a líneas de un comprobante en esta fase, ni en ninguna futura mientras se siga
+  facturando por Factura C.
+- **Paquete aislado `backend/app/arca/`**: primer módulo del proyecto que no es ni router ni parte de
+  `calculations.py` — es integración externa pura (SOAP contra ARCA), no lógica de negocio del
+  catálogo. No se importa desde `main.py`, así que un problema de configuración acá (certificado
+  faltante, CUIT no cargado) nunca puede romper el arranque del resto de la API.
+  - `config.py`: constantes de entorno (`ARCA_ENTORNO`, `ARCA_CERT_PATH`, `ARCA_KEY_PATH`,
+    `ARCA_CACHE_DIR`), estilo `os.getenv(...)` a nivel de módulo igual que el resto del proyecto (no
+    hay capa de `Settings`/`BaseSettings` en FashBalance). Resuelve las URLs de WSAA/WSFEv1 según
+    `ARCA_ENTORNO` (`testing` | `produccion`) sin ningún branch de lógica en el resto del código — todo
+    lo que cambia entre entornos son estas constantes.
+  - `wsaa.py`: arma la TRA (Ticket de Requerimiento de Acceso, pidiendo el servicio `"wsfe"`), la
+    firma como CMS/PKCS#7 con `cryptography.hazmat.primitives.serialization.pkcs7`
+    (`PKCS7SignatureBuilder`, sin `DetachedSignature` porque WSAA exige el contenido embebido —
+    "nodetach"), y llama `loginCms` de WSAA vía `zeep`. El ticket (Token/Sign) dura 12hs reales y se
+    cachea en disco (`{ARCA_CACHE_DIR}/ticket_{entorno}_{servicio}.json`, un JSON simple, no hace
+    falta tabla en la base) para no pedir uno nuevo en cada llamada a WSFEv1.
+  - `wsfe.py`: cliente WSFEv1 acotado a lo que necesita Factura C — `FEDummy` (chequeo de
+    conectividad, sin auth), `FECompUltimoAutorizado` (se llama siempre antes de pedir un CAE; ARCA es
+    la fuente de verdad del número de comprobante, nunca se mantiene un contador propio en la base que
+    se pueda desincronizar) y `FECAESolicitar`. Para Factura C (`CbteTipo=11`): `Concepto=1`,
+    `CbteDesde=CbteHasta` (un solo comprobante por request, obligatorio para tipo C),
+    `ImpTotConc=ImpOpEx=ImpIVA=ImpTrib=0`, `ImpNeto` = subtotal de la operación (no "neto gravado"
+    como en Factura A/B), `ImpTotal = ImpNeto + ImpTrib`, sin la clave `Iva` en el dict en absoluto.
+    **`CondicionIVAReceptorId`** (default `5` = Consumidor Final) se agregó aunque no estaba en el
+    detalle original de esta fase — es un campo que ARCA exige hoy en `FECAEDetRequest` y sin él
+    rechaza el comprobante; se detectó al pedirlo explícitamente antes de programar. `cuit`/`pto_vta`
+    son parámetros explícitos de cada función, nunca constantes de módulo — el paquete `arca/` es
+    agnóstico de la base de datos, quien resuelve esos valores desde `configuracion` es el caller
+    (`probar_conexion.py` en esta fase).
+  - **Gotcha real de zeep, ya corregido**: para elementos opcionales ausentes en la respuesta SOAP
+    (ej. `Errors` cuando no hay errores, `Observaciones` cuando no hay observaciones), zeep no
+    devuelve `None` al acceder al atributo — lanza `AttributeError`. Por eso `_interpretar_respuesta`
+    usa `getattr(resultado, "Errors", None)` / `getattr(det, "Observaciones", None)` en vez de acceso
+    directo. También el nombre del campo en `FECAEDetResponse` es **`Observaciones`** (no `Obs` — ese
+    es el nombre del elemento *dentro* de `ArrayOfObs`), confundirlos rompe el parseo silenciosamente
+    con una excepción al primer comprobante sin observaciones.
+  - `probar_conexion.py`: script de prueba manual (no es parte de la API), vive dentro de `arca/`
+    para reusar el bind mount existente de `app/` sin tocar Dockerfile ni compose. Se corre con
+    `docker compose exec backend python -m app.arca.probar_conexion`. Corre los 5 pasos de esta fase
+    (FEDummy, ticket WSAA, último autorizado, CAE real, caso de rechazo a propósito mandando `<Iva>`
+    en una Factura C) contra el ambiente activo. Confirmado funcionando end-to-end contra homologación
+    real: CAE obtenido, y el caso de rechazo devuelve el error real de ARCA ("Para comprobantes tipo C
+    el objeto IVA no debe informarse", código 10071) en vez de una excepción sin manejar.
+- **Certificados — bind mount de solo lectura, no named volume**: a diferencia de
+  `fashbalance_fotos_data` (named volume que la app puebla en runtime), los certificados de ARCA los
+  genera/renueva Florencia a mano vía WSASS (testing) o el Administrador de Certificados Digitales
+  (producción) — viven en `arca_certs/` en la raíz del repo (gitignored) y se montan de solo lectura:
+  `./arca_certs:/app/arca_certs:ro` en `docker-compose.yml`. El cache de ticket WSAA sí necesita
+  escritura, así que va en un named volume separado (`fashbalance_arca_cache:/app/arca_cache`) — nunca
+  se mezcla estado runtime escribible con el mount de solo lectura de secretos.
+- **Qué va en `.env` (infra) vs. qué va en `configuracion`/DB (negocio) — desvío deliberado del plan
+  original**: la primera versión de esta fase preveía `ARCA_CUIT` como variable de entorno. Se cambió
+  a pedido explícito posterior: el CUIT, el punto de venta, la Razón Social y el Domicilio Fiscal viven
+  en la tabla `configuracion` (ver tabla de campos en la sección "Configuración del negocio" más
+  arriba), editables desde ⚙️ Configuración sin acceso a la infraestructura del servidor. Solo lo que
+  depende del filesystem/red del contenedor (`ARCA_ENTORNO`, rutas de certificado) sigue en `.env` —
+  cambiarlas si requiere reiniciar el contenedor de todos modos porque son archivos/URLs, no datos que
+  Florencia deba poder tocar sin ayuda técnica. `arca_razon_social`/`arca_domicilio_fiscal` se crearon
+  en esta fase pero **todavía no los usa ningún código** (`FECAESolicitar` no los necesita, van en el
+  comprobante impreso, no en el request a WSFEv1) — quedan cargados para no rehacer esta pantalla
+  cuando llegue esa fase futura.
+- **Dependencias nuevas**: `zeep` (cliente SOAP, resuelve el WSDL de WSAA/WSFEv1 solo) y
+  `cryptography` (firma CMS/PKCS#7). `lxml` no se agregó como dependencia directa — la TRA y la
+  respuesta de `loginCms` se arman/parsean con `xml.etree.ElementTree` de la stdlib, `zeep` ya trae
+  `lxml` transitivamente para el SOAP de WSFEv1. `python:3.11-slim` resolvió wheels prearmadas para
+  ambas sin necesitar `build-essential`/headers de compilación — si algún día eso deja de ser cierto
+  (otra arquitectura, otra versión), ahí sí hay que agregar el `apt-get install` correspondiente al
+  Dockerfile, no antes.
+- **Qué NO hace esta fase** (explícito, no reinventar): nada de CAEA (solo CAE). Ningún otro tipo de
+  comprobante que Factura C (11), ni Nota de Débito/Crédito C. CUIT nunca hardcodeado en código — sale
+  de `configuracion`, cargado por Florencia desde la pantalla. No hay ningún camino desde una Orden o
+  Venta real hacia una Factura — eso es la fase que sigue, no planificada todavía.
 
 ## Convenciones de código
 

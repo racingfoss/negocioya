@@ -215,6 +215,16 @@ class Configuracion(Base):
     # default, igual que whatsapp_numero/instagram_url/facebook_url — si queda vacío, el storefront
     # oculta el formulario y muestra solo el botón de WhatsApp.
     email_contacto = Column(String(150), nullable=True)
+    # Facturación electrónica (Fase A — integración ARCA). Datos de negocio editables desde
+    # ⚙️ Configuración, no variables de entorno (esas son solo para lo que depende del filesystem/
+    # red del contenedor: rutas de certificado, URLs de ARCA — ver backend/app/arca/config.py).
+    # arca_razon_social/arca_domicilio_fiscal no los usa todavía ningún código de esta fase (WSFEv1
+    # no lleva esos datos en el request de CAE) — se cargan ya para no rehacer esta pantalla cuando
+    # llegue la fase que arme el comprobante imprimible.
+    arca_cuit = Column(String(20), nullable=True)
+    arca_punto_venta_defecto = Column(Integer, nullable=False, default=1)
+    arca_razon_social = Column(String(150), nullable=True)
+    arca_domicilio_fiscal = Column(String(255), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 

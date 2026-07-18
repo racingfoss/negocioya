@@ -299,6 +299,10 @@ class ConfiguracionBase(BaseModel):
     instagram_url: Optional[str] = None
     facebook_url: Optional[str] = None
     email_contacto: Optional[str] = None
+    arca_cuit: Optional[str] = None
+    arca_punto_venta_defecto: int = 1
+    arca_razon_social: Optional[str] = None
+    arca_domicilio_fiscal: Optional[str] = None
 
 
 class Configuracion(ConfiguracionBase):
@@ -324,6 +328,10 @@ class ConfiguracionUpdate(BaseModel):
     instagram_url: Optional[str] = None
     facebook_url: Optional[str] = None
     email_contacto: Optional[str] = None
+    arca_cuit: Optional[str] = None
+    arca_punto_venta_defecto: Optional[int] = None
+    arca_razon_social: Optional[str] = None
+    arca_domicilio_fiscal: Optional[str] = None
 
 
 # --- Configuración de la tienda (subset público, para el storefront) ---

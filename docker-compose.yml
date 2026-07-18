@@ -24,6 +24,9 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       ECOMMERCE_API_KEY: ${ECOMMERCE_API_KEY}
+      ARCA_ENTORNO: ${ARCA_ENTORNO:-testing}
+      ARCA_CERT_PATH: /app/arca_certs/arca_test_certificado.crt
+      ARCA_KEY_PATH: /app/arca_certs/arca_test_privada.key
     depends_on:
       db:
         condition: service_healthy
@@ -32,6 +35,8 @@ services:
     volumes:
       - ./backend/app:/app/app
       - fashbalance_fotos_data:/app/fotos_productos
+      - ./arca_certs:/app/arca_certs:ro
+      - fashbalance_arca_cache:/app/arca_cache
 
   frontend:
     build: ./frontend
@@ -62,3 +67,4 @@ services:
 volumes:
   fashbalance_db_data:
   fashbalance_fotos_data:
+  fashbalance_arca_cache:

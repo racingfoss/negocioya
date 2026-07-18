@@ -118,6 +118,34 @@ const GRUPOS = [
       },
     ],
   },
+  {
+    titulo: 'ARCA / Facturación electrónica',
+    campos: [
+      {
+        key: 'arca_cuit',
+        label: 'CUIT',
+        ayuda: 'CUIT que se usa para pedir el CAE a ARCA. Sin espacios ni guiones, ej: 27360741104.',
+        tipo: 'texto',
+      },
+      {
+        key: 'arca_punto_venta_defecto',
+        label: 'Punto de venta',
+        ayuda: 'Punto de venta habilitado en ARCA que se usa para pedir el próximo número de comprobante y el CAE.',
+      },
+      {
+        key: 'arca_razon_social',
+        label: 'Razón Social',
+        ayuda: 'Nombre completo que va a figurar en el comprobante. Todavía no se usa para pedir el CAE, se deja cargado para cuando se arme el comprobante imprimible.',
+        tipo: 'texto',
+      },
+      {
+        key: 'arca_domicilio_fiscal',
+        label: 'Domicilio Fiscal',
+        ayuda: 'Dirección que va a figurar en el comprobante. Todavía no se usa para pedir el CAE, se deja cargado para cuando se arme el comprobante imprimible.',
+        tipo: 'texto',
+      },
+    ],
+  },
 ]
 
 export default function Configuracion() {

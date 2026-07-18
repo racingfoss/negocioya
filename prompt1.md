@@ -1,102 +1,91 @@
-Fase 2 del storefront: carrito de compras + checkout que genera órdenes reales contra
-`POST /ecommerce/ordenes` (ya construido y probado en Fase 0). Medios de pago y forma de envío quedan
-**visuales, sin funcionalidad real** — nada de integración con pasarelas de pago ni cálculo de costo de
-envío, eso es una fase futura todavía no planificada. Nada de nginx tampoco — se sigue probando en red
-local, salir a producción es una decisión aparte que tomamos cuando esto ya funcione bien probado acá.
+Fase A de facturación electrónica: integración técnica con ARCA (WSAA + WSFEv1) para Factura C
+(monotributista), aislada — todavía no se conecta con ningún Pedido ni pantalla nueva. El objetivo de
+esta fase es validar que FashBalance puede autenticarse y pedir un CAE real contra el ambiente de
+homologación, antes de construir nada más encima.
 
-## 0. Dos decisiones de arquitectura, léelas antes de escribir código
+## Contexto de negocio, para que no se pierda al codificar
 
-- **El carrito usa `localStorage`, a propósito.** El CLAUDE.md tiene documentada la convención de "sin
-  localStorage" para el panel de FashBalance (`frontend/`) — esa regla es específica del panel interno,
-  donde toda la data de negocio tiene que vivir en Postgres. Acá es distinto: es estado de sesión de un
-  comprador anónimo, no un dato de negocio, y perder el carrito al recargar la página es una mala
-  experiencia de compra real. Documentá esto como excepción deliberada en el CLAUDE.md al terminar, no
-  como que se te pasó la regla.
-- **El checkout va con Server Action (`"use server"`), patrón moderno de Next.js — PERO con la lógica
-  real separada en una función propia, testeable sin navegador.** Armá `src/lib/checkout.ts` con una
-  función simple (ej. `procesarCheckout(carrito, datosContacto)`) que arma el payload real y le pega a
-  `POST /ecommerce/ordenes` de FashBalance con la `X-API-Key` (nunca en código de cliente), devolviendo
-  éxito con el id de la orden, o el detalle de qué línea falló. La Server Action que invoca el formulario
-  es solo una envoltura fina alrededor de esa función — no le metas lógica propia ahí. Esto te permite
-  probar `procesarCheckout` directo con un script (`npx tsx` o equivalente, mismo espíritu que los
-  scripts de Python que ya se usan para probar el backend) sin pasar por el navegador ni por el protocolo
-  interno de invocación de Server Actions (que no es practicable armar a mano con `curl`).
+Florencia es monotributista, emite Factura C. WSFEv1 (el servicio real a usar) es el más simple de los
+que ofrece ARCA para este caso: no lleva desglose de IVA (prohibido informarlo para tipo C), la fórmula
+es `ImpTotal = ImpNeto + ImpTrib` (`ImpNeto` es el subtotal de la operación, no "neto gravado" como en
+Factura A/B), y **no lleva detalle de ítem** — se factura el total de una operación, no producto por
+producto. Concepto = 1 (Productos), porque Adorante vende indumentaria física.
 
-## 1. Backend: un campo chico nuevo
+## 1. Certificados y configuración
 
-Agregar `metodo_pago_preferido` (texto, nullable) a `OrdenEcommerce` — es solo informativo (qué opción
-tildó el cliente entre las visuales del punto 4), no dispara ninguna lógica de pago real. Incluilo en el
-payload de `POST /ecommerce/ordenes` y en lo que devuelve/muestra `GET /ecommerce/ordenes` /
-`OrdenesEcommerce.jsx`, para que la dueña vea qué esperaba el cliente al revisar el pedido.
+Los certificados están en arca_certs/ en la raíz del repo.
 
-## 2. Carrito: estado global del storefront
+Dos certificados X.509 (uno de testing, gestionado vía WSASS con Clave Fiscal; uno de producción, vía
+"Administrador de Certificados Digitales"). El código tiene que
+esperarlos como archivos en un volumen/carpeta montada (mismo criterio que ya se usa para las fotos de
+producto: secreto de infraestructura, nunca en el repo, `.gitignore`).
 
-- Context + Provider en un Client Component cerca de la raíz (envolviendo `children` en `layout.tsx`,
-  sin convertir `layout.tsx` en sí a Client Component — ese sigue siendo Server Component como ya está,
-  solo agregale el Provider como wrapper).
-- Cada línea: `producto_id`, `variante_id` (si aplica), `nombre`, `foto` (portada), `precio_venta`
-  (snapshot al agregar), `cantidad`, y el `stock_actual` conocido de esa variante/producto en el momento
-  de agregar (para acotar la cantidad en el carrito, mismo criterio de "tope contra stock" que ya existe
-  en `Movimientos.jsx` del panel — no hace falta que sea perfecto acá, el checkout revalida en el
-  servidor igual, es solo para no dejar que el comprador cargue un número disparatado).
-  Sincronizado con `localStorage` en cada cambio, hidratado al montar.
-- Badge de cantidad en el header: como el dato es 100% estado de cliente (no depende de ninguna env var
-  server-only), un `CartBadge.tsx` chico como Client Component anidado dentro de `Header` está bien —
-  `Header` sigue recibiendo por props lo que ya recibe de `layout.tsx` (nombre de tienda, redes), no hace
-  falta convertir todo `Header` a cliente por esto.
+Variables de entorno nuevas: `ARCA_ENTORNO` (`testing` | `produccion`), `ARCA_CUIT` (el CUIT de
+Florencia), y las rutas a certificado/clave privada correspondientes al entorno activo. Según
+`ARCA_ENTORNO`, el código elige las URLs correctas:
+- Testing: WSAA `https://wsaahomo.afip.gov.ar/ws/services/LoginCms`, WSFEv1
+  `https://wswhomo.afip.gov.ar/wsfev1/service.asmx`
+- Producción: WSAA `https://wsaa.afip.gov.ar/ws/services/LoginCms`, WSFEv1
+  `https://servicios1.afip.gov.ar/wsfev1/service.asmx`
 
-## 3. Agregar al carrito (página de producto)
+Nada de branches para esto — es 100% configuración, mismo código para los dos entornos.
 
-En `app/productos/[id]/page.tsx` / `VariantSelector.tsx`: botón "Agregar al carrito" con selector de
-cantidad. Si el producto tiene variantes, deshabilitado hasta que se haya elegido una combinación válida
-con stock (reusa el estado que `VariantSelector` ya maneja). Al agregar, si ya había una línea igual
-(mismo producto+variante) en el carrito, sumar cantidades en vez de duplicar la línea.
+## 2. Cliente WSAA (autenticación)
 
-## 4. `/carrito`
+Módulo nuevo (`backend/app/arca/wsaa.py` o similar, aislado del resto de `calculations.py`/routers —
+esto es integración externa, no lógica de negocio del catálogo). Responsabilidades:
+- Armar el `TRA` (Ticket de Requerimiento de Acceso) pidiendo el servicio `"wsfe"` (así, no "wsfev1" —
+  es el nombre de servicio que espera WSAA).
+- Firmarlo con el certificado/clave privada del entorno activo (CMS/PKCS#7).
+- Pedirle el Ticket de Acceso a WSAA, obteniendo `Token` y `Sign`.
+- **Cachear el resultado 12 horas** (duración real del ticket) y reusarlo — no pedir uno nuevo en cada
+  llamada a WSFEv1. Un archivo o tabla chica alcanza para el caché, no hace falta nada elaborado.
 
-Lista de líneas con foto, nombre, variante (si aplica), cantidad editable (tope contra el
-`stock_actual` guardado en la línea), subtotal por línea, botón de sacar, total general, y link a
-`/checkout`. Si está vacío, mensaje + link a `/`.
+## 3. Cliente WSFEv1 (facturación)
 
-## 5. `/checkout`
+Módulo nuevo (`backend/app/arca/wsfe.py` o similar), usando el Token/Sign del punto 2. Solo estos
+métodos, no implementes el resto del catálogo enorme de WSFEv1 que no aplica a Factura C:
+- `FEDummy`: chequeo de que el servicio está arriba, útil para un test rápido de conectividad.
+- `FECompUltimoAutorizado`: consulta el último número de comprobante autorizado para un
+  tipo/puntoVenta — hay que llamarlo SIEMPRE antes de `FECAESolicitar` para saber el próximo número
+  (`CbteDesde = CbteHasta = último + 1`). No mantengas un contador propio en la base que pueda
+  desincronizarse de ARCA — ARCA es la fuente de verdad del número de comprobante.
+- `FECAESolicitar`: pide el CAE. Para Factura C (`CbteTipo = 11`), armá el request con:
+  - `Concepto = 1`
+  - `CbteDesde = CbteHasta` (obligatorio para tipo C, un solo comprobante por request)
+  - `ImpTotConc = 0`, `ImpOpEx = 0`, `ImpIVA = 0` (todos en cero, es lo que exige tipo C)
+  - `ImpNeto` = el subtotal de la operación
+  - `ImpTrib` = 0 (no hay tributos/percepciones en este negocio por ahora)
+  - `ImpTotal = ImpNeto + ImpTrib`
+  - **NO mandar el array `<Iva>`** — está prohibido para tipo C, lo rechaza si lo mandás.
+  - `MonId = "PES"`, `MonCotiz = 1`
+  - `DocTipo`/`DocNro`: parametrizables por la función (en esta fase, probalo con Consumidor Final —
+    `DocTipo = 99`, `DocNro = 0` — que va a ser el caso más común en la práctica).
+- Función que interprete la respuesta: si `Resultado = "A"` (aprobado), devolver CAE + fecha de
+  vencimiento; si viene con `Observaciones`, devolverlas igual (se aprobó pero con avisos, no es un
+  error); si `Resultado = "R"` (rechazado) o viene `<Errors>`, devolver el detalle del error de forma
+  clara — no una excepción genérica sin contexto.
 
-Formulario: nombre, email (opcional), teléfono (opcional), `forma_entrega` ("Retiro en persona" /
-"Envío", ya soportado por el backend), `direccion_envio` (solo si eligió Envío), notas (opcional), y una
-sección "Método de pago" con opciones visuales fijas (ej. "Efectivo al retirar", "Transferencia
-bancaria") que solo alimentan `metodo_pago_preferido` — no dispara nada más. Resumen del pedido (líneas
-del carrito + total) antes de confirmar.
+## Qué NO hacer en esta fase
 
-Al confirmar: el formulario invoca la Server Action directo (sin `fetch` a mano, es el mecanismo nativo
-de Next.js para esto), que a su vez llama a `procesarCheckout()` de `src/lib/checkout.ts`.
-
-- **Éxito**: vaciar el carrito (localStorage + estado), mostrar confirmación con el número de pedido
-  (una página `/pedido-confirmado` con el id por query param está bien).
-- **Error de stock en alguna línea** (el backend ya valida esto de forma atómica — podés agregar una
-  revalidación de stock al cargar `/carrito` como mejora, pero no es obligatorio para esta fase): mostrar
-  el error apuntando a la línea puntual que falló (el backend devuelve el detalle por línea), sin
-  vaciar el carrito, para que el comprador pueda ajustar cantidad o sacar ese producto y reintentar.
-
-## 6. Formulario de contacto
-
-Página o sección simple (nombre, email, mensaje) que arma un link `mailto:` pre-cargado al confirmar —
-sin backend propio, sin envío real de mail server-side. Es deliberadamente liviano, coherente con que el
-canal de contacto principal ya es el botón de WhatsApp que existe desde la Fase 1.
-
-## Qué NO hacer
-
-Nada de pasarela de pago real, nada de cálculo de costo de envío, nada de nginx/TLS. No toques Compras,
-Movimientos, Análisis ni Importación del panel de FashBalance — el único cambio de ese lado es el campo
-chico del punto 1.
+No toques `Pedido`, `OrdenEcommerce`, Caja, ni ninguna pantalla del frontend. No implementes CAEA (solo
+CAE, que es lo que corresponde acá). No implementes ningún otro tipo de comprobante que no sea Factura C
+(11), ni Nota de Débito/Crédito C todavía. No hardcodees el CUIT ni ningún dato de Florencia en el código
+— todo sale de las variables de entorno del punto 1.
 
 ## Antes de terminar
 
-Probá `procesarCheckout()` con un script directo (no por HTTP): un pedido válido (confirmá que crea la
-orden, el `Movimiento` Venta, y que el stock baja) y uno con cantidad mayor al stock disponible (confirmá
-que rechaza sin crear nada, igual que ya probamos en Fase 0). Como esto genera movimientos reales de
-venta y descuenta stock real, al terminar avisame explícitamente qué pedidos de prueba quedaron creados
-—si conviene los revertís vos, no los borres por tu cuenta sin avisar. Decime también qué tengo que
-probar a mano en el navegador — acá en particular importa confirmar que el formulario de checkout invoca
-bien la Server Action de punta a punta (es lo único que el script no puede confirmar), además de la
-persistencia del carrito al recargar y que el badge del header se actualice. Actualizá el CLAUDE.md con
-esta sección nueva, incluyendo la excepción del `localStorage` y por qué `procesarCheckout()` está
-separada de la Server Action que la invoca.
+Escribí un script de prueba que, contra el ambiente de testing/homologación:
+1. Llame a `FEDummy` y confirme que el servicio responde.
+2. Obtenga un Token/Sign válido de WSAA.
+3. Consulte `FECompUltimoAutorizado` para Factura C, punto de venta de prueba.
+4. Pida un CAE real con `FECAESolicitar` para una Factura C de prueba (ej. `ImpNeto = 1000`,
+   Consumidor Final) y muestre el CAE y la fecha de vencimiento obtenidos.
+5. Pruebe un caso que debería rechazar (ej. mandar el array de IVA en un comprobante tipo C) y confirme
+   que se recibe el error esperado, no una excepción sin manejar.
+
+Esto va a requerir que yo tenga generado el certificado de testing y la variable `ARCA_CUIT` cargada
+antes de que puedas correr el script — avisame si llegás a ese punto y todavía no está listo de mi lado.
+Actualizá el CLAUDE.md con una sección nueva "Facturación electrónica (Fase A — integración ARCA)"
+documentando la arquitectura, por qué WSFEv1 sin detalle de ítem simplifica el diseño, y las decisiones
+específicas de Factura C (sin IVA, ImpNeto=subtotal, etc.).
