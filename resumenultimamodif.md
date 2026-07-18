@@ -1,76 +1,93 @@
-# Resumen de la última modificación — Fase A: integración técnica con ARCA (WSAA + WSFEv1)
+# Resumen de la última modificación — Fase B: Pedido unificado, Caja como carrito, estados de logística
 
-Implementación de `prompt1.md`: autenticación contra ARCA (WSAA) y pedido de CAE real para Factura C
-(WSFEv1) contra homologación. Fase 100% de integración técnica, aislada — no toca `Pedido`,
-`OrdenEcommerce`, Caja ni ninguna pantalla de facturación (la única excepción es el agregado puntual a
-⚙️ Configuración descrito abajo, pedido explícito del usuario posterior al alcance original del prompt).
-Ningún camino conecta todavía una Venta/Orden real con una Factura — eso queda para una fase futura no
-planificada.
+Implementación de `prompt1.md`: unifica `OrdenEcommerce`/`OrdenEcommerceItem` (canal e-commerce) y las
+Ventas sueltas de Caja (canal mostrador) en un solo concepto `Pedido`/`PedidoItem` que sirve a los dos
+canales, agrega `canal`/`facturar_arca` y una cadena real de estados de logística, y convierte Caja en un
+flujo de carrito (agregar N ítems, después confirmar todo junto). Esta fase NO conecta con ARCA
+(`backend/app/arca/` queda intacto) ni implementa reversión/cancelación real de stock — `Cancelado` es
+solo un estado disponible en el selector. El storefront Next.js (`ecommerce/`) no se tocó, y su contrato
+HTTP (`GET /ecommerce/catalogo`, `GET /ecommerce/catalogo/{id}`, `POST /ecommerce/ordenes`) sigue
+funcionando exactamente igual (verificado corriendo el smoke test real del storefront).
 
-**Backend — paquete nuevo `backend/app/arca/`**
-- `config.py`: constantes de entorno (`ARCA_ENTORNO`, `ARCA_CERT_PATH`, `ARCA_KEY_PATH`,
-  `ARCA_CACHE_DIR`), resuelve las URLs de WSAA/WSFEv1 de testing/producción sin ningún branch de
-  lógica en el resto del código.
-- `wsaa.py`: arma la TRA, la firma como CMS/PKCS#7 con `cryptography` (sin `DetachedSignature`,
-  contenido embebido tal como exige WSAA), pide el ticket vía `zeep` y lo cachea 12hs en disco
-  (`/app/arca_cache/ticket_{entorno}_{servicio}.json`).
-- `wsfe.py`: `FEDummy`, `FECompUltimoAutorizado` (siempre se llama antes de pedir un CAE, ARCA es la
-  fuente de verdad del número), `FECAESolicitar` armado para Factura C (`Concepto=1`,
-  `CbteDesde=CbteHasta`, `ImpTotConc=ImpOpEx=ImpIVA=ImpTrib=0`, `ImpNeto`=subtotal,
-  `ImpTotal=ImpNeto+ImpTrib`, sin la clave `Iva`). Incluye `CondicionIVAReceptorId` (default 5 =
-  Consumidor Final) — campo que ARCA exige hoy y no estaba en el detalle original del prompt, se
-  agregó a pedido explícito del usuario antes de programar.
-- `probar_conexion.py`: script de prueba manual (`docker compose exec backend python -m
-  app.arca.probar_conexion`), corre los 5 pasos pedidos (FEDummy, ticket WSAA, último autorizado, CAE
-  real, caso de rechazo mandando `<Iva>` en una Factura C a propósito).
-- Dos bugs reales de integración con `zeep`, encontrados corriendo el script contra ARCA real y ya
-  corregidos: (1) zeep lanza `AttributeError` en vez de devolver `None` para elementos opcionales
-  ausentes en la respuesta SOAP; (2) el campo de observaciones en `FECAEDetResponse` se llama
-  `Observaciones`, no `Obs` (ese es el nombre del elemento *dentro* del array).
+**Decisión de diseño — renombrar/extender la tabla existente, no crear una tabla nueva** (explicada y
+justificada en el chat antes de aplicarla): se transformó `ordenes_ecommerce`/`orden_ecommerce_items` en
+lugar en vez de crear un `Pedido` paralelo, porque el propio pedido era "generalizar" el concepto
+existente (no duplicarlo), porque renombrar + agregar columnas nullable/con default no mueve ni una fila
+(las órdenes de e-commerce ya reales conservaron su `id` y su `movimiento_id` de trazabilidad sin ningún
+script de copia), y porque la superficie de código que tocaba el modelo viejo era chica y estaba mapeada
+de antemano.
 
-**Backend — `configuracion` (4 campos nuevos, pedido explícito del usuario que amplía el alcance
-original del prompt)**
-- `arca_cuit`, `arca_punto_venta_defecto` (default 1), `arca_razon_social`, `arca_domicilio_fiscal` en
-  `models.py`/`schemas.py`. `ALTER TABLE` ya aplicado a la DB corriendo.
-- Desvío deliberado respecto del prompt original (que pedía el CUIT solo por variable de entorno): el
-  usuario pidió que CUIT y punto de venta sean editables desde ⚙️ Configuración, y de paso pidió sumar
-  Razón Social y Domicilio Fiscal (sin uso todavía en el código de esta fase — quedan cargados para la
-  fase que arme el comprobante imprimible).
-- `Configuracion.jsx` (panel): sección nueva "ARCA / Facturación electrónica" con los 4 campos.
+**Backend**
+- Migración SQL aplicada a mano contra la base viva (antes de tocar el código Python, para no romper el
+  hot-reload): `ALTER TABLE ordenes_ecommerce RENAME TO pedidos`, `orden_ecommerce_items RENAME TO
+  pedido_items` (+ columna `orden_id`→`pedido_id`), secuencias/índices/constraints renombrados por
+  prolijidad, columnas nuevas `canal VARCHAR(20) NOT NULL DEFAULT 'ecommerce'` y `facturar_arca BOOLEAN
+  NOT NULL DEFAULT TRUE`, `cliente_nombre`/`forma_entrega` pasados a nullable, y un `UPDATE` que
+  reescribió el valor legado `estado='Confirmada'` (6 filas, todas datos de prueba, ninguna real) a
+  `'Entregado'`.
+- `models.py`: `OrdenEcommerce`→`Pedido`, `OrdenEcommerceItem`→`PedidoItem`, con los campos nuevos.
+- `calculations.py`: nueva tupla `ESTADOS_PEDIDO_VALIDOS` (`Pendiente`, `Preparando`, `Listo para
+  retirar`, `Enviado`, `Entregado`, `Cancelado`) — sin función nueva que lance `HTTPException`,
+  `validar_movimiento` sigue siendo la única con esa excepción documentada.
+- `schemas.py`: `OrdenEcommerceItemOut`→`PedidoItemOut`, `OrdenEcommerceOut`→`PedidoOut` (con `canal` y
+  `facturar_arca` agregados, cambio aditivo). `OrdenEcommerceCreate` NO se tocó (contrato de entrada del
+  storefront). Nuevos `PedidoLocalCreate` y `PedidoEstadoUpdate`.
+- `routers/ecommerce.py`: `crear_orden` ahora fija `canal="ecommerce"`, `facturar_arca=True`,
+  `estado="Pendiente"` explícito (antes el default de columna decidía). Se retiró `GET
+  /ecommerce/ordenes` (solo lo consumía la pantalla vieja del panel, nunca el storefront).
+- Nuevo `backend/app/routers/pedidos.py`: `GET /pedidos/` (ambos canales), `POST /pedidos/` (alta de
+  pedido `canal="local"` desde Caja, mismo criterio de validación atómica por línea que
+  `POST /ecommerce/ordenes`, reusando `stock_disponible`/`registrar_venta` tal cual, sin el chequeo de
+  `visible_ecommerce` ni de `forma_entrega`), `PUT /pedidos/{id}/estado`.
+- `main.py`: registrado el router nuevo.
 
-**Infraestructura**
-- `docker-compose.yml`: `ARCA_ENTORNO` como env var del backend; bind mount de solo lectura
-  `./arca_certs:/app/arca_certs:ro` (certificados que administra Florencia a mano vía WSASS, distinto
-  del patrón de named volume que usa `fotos_productos`); named volume nuevo
-  `fashbalance_arca_cache:/app/arca_cache` para el cache del ticket (separado de los certs porque
-  necesita escritura).
-- `.env`: agregado solo `ARCA_ENTORNO=testing`. El CUIT real que pasó el usuario en el chat
-  (27360741104) se cargó directo en la base vía `PUT /configuracion`, nunca quedó en ningún archivo.
-- `requirements.txt`: `zeep` + `cryptography`. Buildearon sin problema en `python:3.11-slim`, no hizo
-  falta tocar el Dockerfile.
+**Frontend**
+- `frontend/src/pages/OrdenesEcommerce.jsx` borrado, reemplazado por `Pedidos.jsx` (ruta `/pedidos`):
+  lista pedidos de ambos canales con badge de canal, cliente, items, total, badge de `facturar_arca`, y
+  estado editable con un `<select>` inline (`PUT /pedidos/{id}/estado`, revierte si falla). Sin botón de
+  Facturar (Fase C).
+- `frontend/src/pages/Movimientos.jsx`: tipo Venta pasa de guardar directo a un carrito de 2 fases.
+  **Armar**: el selector de categoría→producto→atributos→variante (`opcionesParaAtributo`,
+  `elegirValorAtributo`, `varianteResuelta`) se reusó tal cual sin reescribirlo; un botón "+ Agregar al
+  pedido" empuja el ítem al carrito en memoria contra un tope de stock que descuenta lo ya agregado.
+  **Confirmar**: checkbox "Facturar (ARCA)" (arranca destildado por default) + cliente opcional +
+  `POST /pedidos/`. Ingreso/Egreso y la edición/borrado de un `Movimiento` ya existente no cambiaron.
+  - **Bug encontrado y corregido tras el primer pase**: agregar dos veces el mismo producto+variante
+    (ej. "Calza Dua M/Verde" x2 y después x1 más) dejaba dos líneas separadas en el carrito en vez de
+    sumar la cantidad en una sola. Fix: `agregarAlCarrito` ahora busca si ya existe una línea con el
+    mismo `producto_id`+`variante_id` antes de agregar, y si existe le suma la cantidad en vez de
+    duplicar la línea. Confirmado por la usuaria en el navegador que ya funciona bien.
+- `frontend/src/App.jsx`: ruta `/ordenes-ecommerce` reemplazada por `/pedidos`.
 
 **Verificado**
-- `docker compose build backend` — build limpio.
-- `docker compose up -d backend` — arranca normal, certs montados, cache escribible.
-- `curl PUT/GET /configuracion/` — los 4 campos nuevos persisten.
-- `docker compose exec backend python -m app.arca.probar_conexion` corrido **contra homologación real
-  de ARCA**, los 5 pasos pasaron:
-  1. `FEDummy` → OK.
-  2. Ticket WSAA obtenido (Token/Sign reales), reusado de cache en corridas posteriores (mismo
-     vencimiento confirmado en dos corridas distintas).
-  3. `FECompUltimoAutorizado` → número real devuelto por ARCA.
-  4. `FECAESolicitar` → **CAE real emitido** (`86290596791490`, vencimiento `20260728`).
-  5. Caso de rechazo a propósito (array `Iva` en Factura C) → rechazado con el error real de ARCA
-     ("Para comprobantes tipo C el objeto IVA no debe informarse", código 10071), no una excepción sin
-     manejar.
-- `git status` confirmado: `.env` y `arca_certs/` siguen fuera del control de versiones.
+- Migración SQL corrida en la base viva sin pérdida de datos (`\d pedidos`/`\d pedido_items` confirmados,
+  6 filas legado migradas).
+- `POST /pedidos/` con 3 líneas (2 con variante distinta, 1 sin variante): pedido creado con
+  `canal="local"`, `estado="Entregado"`, `facturar_arca=false`, y confirmado que se generaron 3
+  `Movimiento` tipo Venta con `movimiento_id` correcto y que el stock bajó bien en cada producto/variante.
+- Rechazo atómico: una línea con cantidad muy superior al stock disponible devolvió 400 y no creó nada
+  (ni Pedido, ni PedidoItem, ni Movimiento) — conteos de `movimientos`/`pedidos` iguales antes y después.
+- `POST /ecommerce/ordenes` de prueba directa: `canal="ecommerce"`, `estado="Pendiente"`,
+  `facturar_arca=true`.
+- Smoke test real del storefront (`ecommerce/scripts/test-checkout.ts`, corrido con un contenedor
+  descartable de Node en la red de Docker Compose del proyecto): creó una orden real de punta a punta y
+  rechazó correctamente un pedido con cantidad mayor al stock — confirma que el contrato de
+  `POST /ecommerce/ordenes` sigue intacto pese al cambio de tabla por debajo.
+- `PUT /pedidos/{id}/estado` con valor válido (200) e inválido (400 con el detalle de los estados
+  válidos).
+- Confirmado que `GET /ecommerce/ordenes` ya no responde (405, solo queda el `POST` en esa ruta) y que
+  `GET /pedidos/` devuelve unificados tanto los pedidos e-commerce viejos (ahora `Entregado`) como los
+  nuevos de ambos canales.
+- Frontend: confirmado que Vite transforma `App.jsx`/`Pedidos.jsx`/`Movimientos.jsx` sin errores de
+  import ni de build.
 
-**Falta probar a mano en el navegador** (no se puede confirmar desde acá):
-1. Abrir ⚙️ Configuración, confirmar que aparece la sección "ARCA / Facturación electrónica" con los 4
-   campos, guardarlos y refrescar para confirmar que persisten.
+**Probado a mano en el navegador por la usuaria**: armar un pedido en Caja con varios ítems, incluyendo
+agregar dos veces el mismo producto+variante — confirmado que ahora suma bien la cantidad en una sola
+línea tras el fix.
 
-**No se tocó**: Compras, Movimientos, Caja, `Pedido`, `OrdenEcommerce`, ni ninguna otra pantalla del
-panel o del storefront. Nada de CAEA. Ningún otro tipo de comprobante que Factura C (11).
+**No se tocó**: `backend/app/arca/`, `ecommerce/` (storefront Next.js), la interfaz pública de
+`calculations.registrar_venta`/`validar_movimiento`/`stock_disponible`, `Compras.jsx`.
 
-CLAUDE.md actualizado con la sección nueva "Facturación electrónica (Fase A — integración ARCA)" y los
-4 campos sumados a la tabla de "Configuración del negocio".
+CLAUDE.md actualizado con la sección nueva "Fase B — Pedido unificado (canal e-commerce + local, Caja
+como carrito)", incluyendo la decisión de renombrar vs. tabla nueva, los defaults de estado por canal, el
+default destildado de `facturar_arca`, y el bug del merge de líneas repetidas en el carrito ya corregido.

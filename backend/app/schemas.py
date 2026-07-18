@@ -225,7 +225,7 @@ class OrdenEcommerceCreate(BaseModel):
     lineas: list[LineaOrdenIn]
 
 
-class OrdenEcommerceItemOut(BaseModel):
+class PedidoItemOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
     producto_id: Optional[int]
@@ -236,20 +236,37 @@ class OrdenEcommerceItemOut(BaseModel):
     producto: Optional[Producto] = None
 
 
-class OrdenEcommerceOut(BaseModel):
+class PedidoOut(BaseModel):
+    """Pedido unificado (Fase B), cualquier canal. `canal`/`facturar_arca` son campos
+    aditivos sobre lo que antes era OrdenEcommerceOut — el storefront (POST /ecommerce/ordenes)
+    solo lee `id` de la respuesta, así que agregarlos no rompe su contrato."""
     model_config = ConfigDict(from_attributes=True)
     id: int
     fecha: datetime
+    canal: str
+    facturar_arca: bool
     estado: str
-    cliente_nombre: str
+    cliente_nombre: Optional[str]
     cliente_email: Optional[str]
     cliente_telefono: Optional[str]
-    forma_entrega: str
+    forma_entrega: Optional[str]
     direccion_envio: Optional[str]
     notas: Optional[str]
     metodo_pago_preferido: Optional[str]
     total: Decimal
-    items: list[OrdenEcommerceItemOut] = []
+    items: list[PedidoItemOut] = []
+
+
+class PedidoLocalCreate(BaseModel):
+    """Alta de un Pedido canal="local" desde Caja (Fase B) — el carrito armado en Movimientos.jsx."""
+    cliente_nombre: Optional[str] = None
+    facturar_arca: bool = False
+    notas: Optional[str] = None
+    lineas: list[LineaOrdenIn]
+
+
+class PedidoEstadoUpdate(BaseModel):
+    estado: str
 
 
 # --- Stock (calculado, no se carga a mano) ---

@@ -96,7 +96,7 @@ def catalogo_detalle(producto_id: int, db: Session = Depends(get_db)):
 
 @router.post(
     "/ordenes",
-    response_model=schemas.OrdenEcommerceOut,
+    response_model=schemas.PedidoOut,
     dependencies=[Depends(auth.require_ecommerce_api_key)],
 )
 def crear_orden(payload: schemas.OrdenEcommerceCreate, db: Session = Depends(get_db)):
@@ -134,8 +134,12 @@ def crear_orden(payload: schemas.OrdenEcommerceCreate, db: Session = Depends(get
             )
 
     total = sum(productos_cache[l.producto_id].precio_venta * l.cantidad for l in payload.lineas)
-    orden = models.OrdenEcommerce(
-        estado="Confirmada",
+    # canal/facturar_arca/estado explícitos (Fase B): toda venta online se factura siempre y
+    # arranca en Pendiente (falta prepararla/enviarla) — sin que el comprador vea ni elija nada de esto.
+    orden = models.Pedido(
+        canal="ecommerce",
+        facturar_arca=True,
+        estado="Pendiente",
         cliente_nombre=payload.cliente_nombre,
         cliente_email=payload.cliente_email,
         cliente_telefono=payload.cliente_telefono,
@@ -159,8 +163,8 @@ def crear_orden(payload: schemas.OrdenEcommerceCreate, db: Session = Depends(get
             concepto=f"Venta e-commerce — orden #{orden.id}",
         )
         db.add(
-            models.OrdenEcommerceItem(
-                orden_id=orden.id,
+            models.PedidoItem(
+                pedido_id=orden.id,
                 producto_id=linea.producto_id,
                 variante_id=linea.variante_id,
                 cantidad=linea.cantidad,
@@ -172,15 +176,3 @@ def crear_orden(payload: schemas.OrdenEcommerceCreate, db: Session = Depends(get
     db.commit()
     db.refresh(orden)
     return orden
-
-
-@router.get("/ordenes", response_model=list[schemas.OrdenEcommerceOut])
-def listar_ordenes(db: Session = Depends(get_db), limit: int = 300):
-    """Endpoint interno normal (SIN X-API-Key) para el panel de administración."""
-    return (
-        db.query(models.OrdenEcommerce)
-        .options(joinedload(models.OrdenEcommerce.items).joinedload(models.OrdenEcommerceItem.producto))
-        .order_by(models.OrdenEcommerce.fecha.desc())
-        .limit(limit)
-        .all()
-    )

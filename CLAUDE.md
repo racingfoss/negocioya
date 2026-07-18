@@ -728,6 +728,121 @@ futura no planificada todavía.
   de `configuracion`, cargado por Florencia desde la pantalla. No hay ningún camino desde una Orden o
   Venta real hacia una Factura — eso es la fase que sigue, no planificada todavía.
 
+## Fase B — Pedido unificado (canal e-commerce + local, Caja como carrito)
+
+Unifica lo que hasta acá eran dos caminos de venta desconectados (`OrdenEcommerce`/`OrdenEcommerceItem`
+del canal online, y un `Movimiento` tipo Venta suelto por cada carga en Caja para el canal mostrador) en
+un solo concepto `Pedido`/`PedidoItem` que sirve a los dos canales. Esta fase NO conecta con ARCA
+(`backend/app/arca/` queda intacto y sin ninguna llamada nueva) ni implementa reversión/cancelación real
+de stock — `Cancelado` es un estado disponible en el selector, sin ningún efecto de devolución de stock
+todavía (eso es una fase futura). El storefront Next.js (`ecommerce/`) no se tocó.
+
+- **Decisión: renombrar/extender la tabla existente, no crear una tabla nueva.** Se evaluaron ambas
+  opciones y se optó por transformar `OrdenEcommerce`/`OrdenEcommerceItem` en lugar (`ALTER TABLE ...
+  RENAME`) en vez de crear un `Pedido` paralelo, por: (1) el propio criterio de la fase era generalizar
+  el concepto existente, no duplicarlo — mantener dos tablas casi idénticas habría contradicho
+  "unificar"; (2) cero movimiento de datos: renombrar tabla + agregar columnas nullable/con default no
+  mueve ni una fila, así que las órdenes de e-commerce ya probadas contra la API real (incluidas las
+  generadas por `ecommerce/scripts/test-checkout.ts`) conservan su `id` y su `movimiento_id` de
+  trazabilidad sin ningún script de copia; (3) la superficie de código que tocaba el modelo viejo era
+  chica y estaba mapeada de antemano (`models.py`, `schemas.py`, `routers/ecommerce.py`,
+  `OrdenesEcommerce.jsx`, este último reemplazado en la misma fase de todos modos). El `ALTER TABLE`
+  aplicado (además de renombrar tabla/columna, se renombraron también secuencia/índices/constraints por
+  prolijidad, ya que un `RENAME TABLE` de Postgres no los renombra solo):
+  ```sql
+  ALTER TABLE ordenes_ecommerce RENAME TO pedidos;
+  ALTER TABLE orden_ecommerce_items RENAME TO pedido_items;
+  ALTER TABLE pedido_items RENAME COLUMN orden_id TO pedido_id;
+  ALTER SEQUENCE ordenes_ecommerce_id_seq RENAME TO pedidos_id_seq;
+  ALTER SEQUENCE orden_ecommerce_items_id_seq RENAME TO pedido_items_id_seq;
+  ALTER INDEX ordenes_ecommerce_pkey RENAME TO pedidos_pkey;
+  ALTER INDEX ix_ordenes_ecommerce_id RENAME TO ix_pedidos_id;
+  ALTER INDEX orden_ecommerce_items_pkey RENAME TO pedido_items_pkey;
+  ALTER INDEX ix_orden_ecommerce_items_id RENAME TO ix_pedido_items_id;
+  ALTER TABLE pedido_items RENAME CONSTRAINT orden_ecommerce_items_orden_id_fkey TO pedido_items_pedido_id_fkey;
+  ALTER TABLE pedido_items RENAME CONSTRAINT orden_ecommerce_items_producto_id_fkey TO pedido_items_producto_id_fkey;
+  ALTER TABLE pedido_items RENAME CONSTRAINT orden_ecommerce_items_variante_id_fkey TO pedido_items_variante_id_fkey;
+  ALTER TABLE pedido_items RENAME CONSTRAINT orden_ecommerce_items_movimiento_id_fkey TO pedido_items_movimiento_id_fkey;
+  ALTER TABLE pedidos ADD COLUMN canal VARCHAR(20) NOT NULL DEFAULT 'ecommerce';
+  ALTER TABLE pedidos ADD COLUMN facturar_arca BOOLEAN NOT NULL DEFAULT TRUE;
+  ALTER TABLE pedidos ALTER COLUMN cliente_nombre DROP NOT NULL;
+  ALTER TABLE pedidos ALTER COLUMN forma_entrega DROP NOT NULL;
+  UPDATE pedidos SET estado = 'Entregado' WHERE estado = 'Confirmada';
+  ```
+  El `UPDATE` final reescribe el valor legado `"Confirmada"` (todas las filas que existían antes de esta
+  fase eran datos de prueba, sin ningún cliente real todavía) a `"Entregado"`, porque `"Confirmada"` no
+  es parte de la cadena de estados nueva y no había ningún dato real en riesgo.
+- **Campos nuevos en `Pedido`** (`backend/app/models.py`): `canal` (`"ecommerce"` | `"local"`, sin
+  default de columna — se setea explícito en cada router que crea un pedido). `facturar_arca` (bool):
+  siempre `True` para `canal="ecommerce"` (`POST /ecommerce/ordenes` lo fija explícito, sin opción en el
+  storefront — toda venta online se factura), lo decide un checkbox visible en Caja para `canal="local"`.
+  `cliente_nombre` y `forma_entrega` pasaron a nullable (no aplican igual a un pedido de mostrador).
+- **Estados de logística** (`calculations.ESTADOS_PEDIDO_VALIDOS`): `Pendiente → Preparando → Listo para
+  retirar / Enviado → Entregado`, más `Cancelado` como alternativa en cualquier punto antes de Entregado.
+  "Listo para retirar" y "Enviado" son ambos valores válidos para cualquier pedido — no se acopla la
+  validación de backend a `forma_entrega` (eso queda del lado del frontend, que solo ofrece la opción que
+  corresponde en el selector de `Pedidos.jsx`), para no sumar una quinta categoría rara. **Default de
+  estado según canal, no el mismo para los dos**: `canal="ecommerce"` arranca en `Pendiente` (falta
+  prepararlo/enviarlo). `canal="local"` arranca directo en `Entregado` (la clienta se lo lleva puesto en
+  el momento) — sin bloquear que se pueda cambiar a mano después si hiciera falta un caso raro. No hay
+  una función nueva en `calculations.py` que valide el estado y lance `HTTPException` —
+  `validar_movimiento` sigue siendo la única función del módulo con esa excepción documentada; el chequeo
+  de `estado in ESTADOS_PEDIDO_VALIDOS` vive inline en el router `PUT /pedidos/{id}/estado`, mismo nivel
+  de trivialidad que la validación de `forma_entrega` que ya vivía inline en `routers/ecommerce.py`.
+- **`backend/app/routers/ecommerce.py`**: `crear_orden` (`POST /ecommerce/ordenes`) sigue aceptando y
+  devolviendo el mismo contrato JSON que antes — el storefront (`ecommerce/src/lib/checkout.ts`) solo lee
+  `data.id` de la respuesta y no renderiza `estado` en ningún lado, así que los campos nuevos (`canal`,
+  `facturar_arca`) son aditivos y el cambio de valor de `estado` (de siempre `"Confirmada"` a
+  `"Pendiente"`) no rompe nada de ese lado. Internamente ahora crea un `models.Pedido(canal="ecommerce",
+  facturar_arca=True, estado="Pendiente", ...)` explícito. **`GET /ecommerce/ordenes` se retiró** de este
+  router (solo lo consumía `OrdenesEcommerce.jsx`, que se reemplazó por `Pedidos.jsx` en la misma fase; el
+  storefront nunca lo llamaba).
+- **Nuevo `backend/app/routers/pedidos.py`**: `GET /pedidos` (todos los pedidos de ambos canales,
+  reemplaza al viejo `GET /ecommerce/ordenes`). `POST /pedidos` (alta de un pedido `canal="local"` desde
+  Caja — el carrito armado en `Movimientos.jsx` se confirma acá de una sola vez; mismo criterio de
+  validación atómica por línea que `POST /ecommerce/ordenes`, reusando `calculations.stock_disponible` y
+  `calculations.registrar_venta` tal cual, sin reimplementar nada, pero **sin** el chequeo de
+  `visible_ecommerce` — una venta de mostrador puede vender un producto no publicado en la tienda online
+  — ni de `forma_entrega`/`direccion_envio`, que no aplican a este canal). `PUT /pedidos/{id}/estado`
+  (valida contra `ESTADOS_PEDIDO_VALIDOS`, 400 si no corresponde).
+- **Caja (`Movimientos.jsx`) pasa de "un producto = un movimiento" a "un pedido = varios ítems"**, solo
+  para tipo Venta (Ingreso/Egreso no cambiaron, siguen siendo una carga rápida de una sola línea vía
+  `POST /movimientos` directo, y la edición/borrado de un `Movimiento` ya existente tampoco cambió). El
+  selector de categoría→producto→atributos→variante con el filtro por stock (`opcionesParaAtributo`,
+  `elegirValorAtributo`, `varianteResuelta`) se reusó tal cual, sin reescribirlo. Flujo de dos fases: (1)
+  **Armar** — un botón "+ Agregar al pedido" empuja el ítem resuelto a un carrito en memoria
+  (`itemsPedido`), contra un tope de cantidad que además de `stock_disponible` real descuenta lo que ya
+  está en el carrito para esa misma variante/producto (si no, se podrían agregar dos líneas de la misma
+  variante sumando más que el stock real sin que el frontend avise antes de confirmar — el backend de
+  todos modos lo rechazaría igual gracias a que `registrar_venta` valida secuencialmente contra el estado
+  ya flusheado dentro de la misma transacción, mismo mecanismo que ya usa `POST /ecommerce/ordenes` con
+  líneas múltiples). (2) **Confirmar** — checkbox "Facturar (ARCA)" (arranca **destildado** por default:
+  a diferencia del canal ecommerce, que siempre factura por regla de negocio separada, una venta de
+  mostrador no siempre la pide la clienta, y tildarlo debería ser un acto explícito cuando corresponde) +
+  input de cliente opcional + botón que llama `POST /pedidos` con las líneas del carrito. En error (ej.
+  una venta concurrente consumió el stock entre armar y confirmar), el carrito **no se vacía** — la
+  usuaria puede sacar el ítem problemático y reintentar, mismo criterio que ya usa el checkout del
+  storefront.
+  - **Bug real ya corregido — agregar dos veces el mismo producto+variante duplicaba la línea en vez de
+    sumar la cantidad**: la primera versión de `agregarAlCarrito` armaba siempre un ítem nuevo con una
+    `key` única, sin buscar si ya había una línea con el mismo `producto_id`+`variante_id` en
+    `itemsPedido`. Caso real detectado por la usuaria: agregar "Calza Dua M/Verde" x2 y después, en el
+    mismo pedido, agregar otra vez "Calza Dua M/Verde" x1 dejaba dos líneas separadas en vez de una sola
+    de x3. Fix: antes de agregar, busca en `itemsPedido` una línea con el mismo `producto_id` y
+    `variante_id` (`null` si no tiene variantes) y, si existe, le suma la cantidad nueva en vez de
+    empujar una línea más; si no existe, recién ahí crea la línea nueva. El tope de stock
+    (`stockDisponibleEfectivo`, que ya descontaba lo acumulado en el carrito para esa
+    variante/producto) no necesitó cambios — seguía siendo correcto, el bug era solo de presentación
+    (dos filas en vez de una), no de validación de stock.
+- **`OrdenesEcommerce.jsx` se reemplazó por `Pedidos.jsx`** (ruta `/pedidos`): lista TODOS los pedidos sin
+  importar el canal, con columna de canal (badge), fecha, cliente (o "Mostrador" si no se cargó nombre en
+  uno local), items, total, `facturar_arca` (badge sí/no), y estado editable ahí mismo con un `<select>`
+  que dispara `PUT /pedidos/{id}/estado` al cambiar (revierte el valor si la API rechaza el cambio). Sin
+  botón de "Facturar" — explícitamente fuera de alcance, es de la Fase C.
+- **Qué NO se tocó**: `backend/app/arca/`, `ecommerce/` (storefront Next.js), la interfaz pública de
+  `calculations.registrar_venta`/`validar_movimiento`/`stock_disponible` (se reusan sin cambiar firma),
+  `Compras.jsx` (tiene su propia copia de la lógica de selectores, independiente de `Movimientos.jsx`).
+
 ## Convenciones de código
 
 - **Backend**: nombres de tablas, campos, funciones y mensajes de error en español. Sin Alembic (ver nota

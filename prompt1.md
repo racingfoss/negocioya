@@ -1,91 +1,81 @@
-Fase A de facturación electrónica: integración técnica con ARCA (WSAA + WSFEv1) para Factura C
-(monotributista), aislada — todavía no se conecta con ningún Pedido ni pantalla nueva. El objetivo de
-esta fase es validar que FashBalance puede autenticarse y pedir un CAE real contra el ambiente de
-homologación, antes de construir nada más encima.
+Fase B: unificar el concepto de Pedido entre e-commerce y ventas locales, rediseñar Caja para armar un
+pedido de varios ítems antes de confirmar, y agregar estados de logística. Esta fase NO conecta con ARCA
+todavía — eso es la Fase C. Al terminar, un pedido queda confirmado (stock descontado, caja actualizada)
+pero sin ninguna facturación disparada.
 
-## Contexto de negocio, para que no se pierda al codificar
+## 0. Restricción dura, no negociable
 
-Florencia es monotributista, emite Factura C. WSFEv1 (el servicio real a usar) es el más simple de los
-que ofrece ARCA para este caso: no lleva desglose de IVA (prohibido informarlo para tipo C), la fórmula
-es `ImpTotal = ImpNeto + ImpTrib` (`ImpNeto` es el subtotal de la operación, no "neto gravado" como en
-Factura A/B), y **no lleva detalle de ítem** — se factura el total de una operación, no producto por
-producto. Concepto = 1 (Productos), porque Adorante vende indumentaria física.
+**El contrato de la Storefront API no cambia.** `GET /ecommerce/catalogo`, `GET /ecommerce/catalogo/{id}`
+y `POST /ecommerce/ordenes` tienen que seguir aceptando y devolviendo exactamente el mismo JSON que hoy,
+sin importar qué le hagas por dentro al modelo de datos. El storefront de Next.js (`ecommerce/`) no se
+toca en esta fase — si algo de lo que planeás requeriría cambiarlo, replanteá el enfoque del lado de
+FashBalance en vez de tocar el storefront.
 
-## 1. Certificados y configuración
+## 1. Pedido unificado
 
-Los certificados están en arca_certs/ en la raíz del repo.
+Generalizar `OrdenEcommerce`/`OrdenEcommerceItem` a un concepto de `Pedido`/`PedidoItem` que sirva para
+los dos canales. **Antes de decidir cómo**, mirá el código real de esos modelos y de todo lo que ya los
+usa (`routers/ecommerce.py`, `OrdenesEcommerce.jsx`, la validación de `POST /ecommerce/ordenes`) y elegí
+entre renombrar/extender la tabla existente o crear una nueva — con el criterio de "menos riesgo de
+romper lo que ya funciona y está probado contra ARCA/e-commerce real", no por preferencia estética.
+Mostrame qué elegiste y por qué antes de aplicarlo.
 
-Dos certificados X.509 (uno de testing, gestionado vía WSASS con Clave Fiscal; uno de producción, vía
-"Administrador de Certificados Digitales"). El código tiene que
-esperarlos como archivos en un volumen/carpeta montada (mismo criterio que ya se usa para las fotos de
-producto: secreto de infraestructura, nunca en el repo, `.gitignore`).
+Campos nuevos sobre lo que ya existe:
+- `canal`: `"ecommerce"` | `"local"`.
+- `facturar_arca` (bool): para pedidos de canal `ecommerce`, siempre `True`, sin opción en la UI (una
+  venta online se factura siempre). Para canal `local`, lo decide un checkbox al confirmar el pedido en
+  Caja (ver punto 2) — default a tu criterio, pero que sea explícito y visible, no un valor oculto.
+- `estado`: ampliar de la única opción `"Confirmada"` que hay hoy a una cadena real:
+  `Pendiente → Preparando → Listo para retirar / Enviado (según forma_entrega) → Entregado`, más
+  `Cancelado` como estado alternativo en cualquier punto antes de Entregado. **Default según canal, no
+  el mismo para los dos**: un pedido `canal="ecommerce"` arranca en `Pendiente` (falta prepararlo/
+  enviarlo). Un pedido `canal="local"` arranca directo en `Entregado` (la clienta se lo lleva puesto en
+  el momento) — sin bloquear que se pueda cambiar a mano si hiciera falta un caso raro.
+- `cliente_nombre` en pedidos locales queda opcional (no todo mostrador necesita registrar quién compró).
 
-Variables de entorno nuevas: `ARCA_ENTORNO` (`testing` | `produccion`), `ARCA_CUIT` (el CUIT de
-Florencia), y las rutas a certificado/clave privada correspondientes al entorno activo. Según
-`ARCA_ENTORNO`, el código elige las URLs correctas:
-- Testing: WSAA `https://wsaahomo.afip.gov.ar/ws/services/LoginCms`, WSFEv1
-  `https://wswhomo.afip.gov.ar/wsfev1/service.asmx`
-- Producción: WSAA `https://wsaa.afip.gov.ar/ws/services/LoginCms`, WSFEv1
-  `https://servicios1.afip.gov.ar/wsfev1/service.asmx`
+`POST /ecommerce/ordenes` sigue creando pedidos con `canal="ecommerce"`, `facturar_arca=True`,
+`estado="Pendiente"` — automático, sin que el comprador vea ni elija nada de esto.
 
-Nada de branches para esto — es 100% configuración, mismo código para los dos entornos.
+## 2. Caja: de "una venta = un producto" a "un pedido = varios ítems"
 
-## 2. Cliente WSAA (autenticación)
+Hoy `Movimientos.jsx`, con tipo Venta, crea un `Movimiento` por cada carga (un producto, confirma,
+listo). Pasa a funcionar como un carrito: se van agregando ítems a un pedido en curso (reusando tal cual
+el selector de categoría → producto → variante con el filtro por stock que ya existe —
+`opcionesParaAtributo`, tope de cantidad contra `stock_disponible`, todo eso se mantiene igual, no lo
+reescribas) y recién al final se confirma todo junto.
 
-Módulo nuevo (`backend/app/arca/wsaa.py` o similar, aislado del resto de `calculations.py`/routers —
-esto es integración externa, no lógica de negocio del catálogo). Responsabilidades:
-- Armar el `TRA` (Ticket de Requerimiento de Acceso) pidiendo el servicio `"wsfe"` (así, no "wsfev1" —
-  es el nombre de servicio que espera WSAA).
-- Firmarlo con el certificado/clave privada del entorno activo (CMS/PKCS#7).
-- Pedirle el Ticket de Acceso a WSAA, obteniendo `Token` y `Sign`.
-- **Cachear el resultado 12 horas** (duración real del ticket) y reusarlo — no pedir uno nuevo en cada
-  llamada a WSFEv1. Un archivo o tabla chica alcanza para el caché, no hace falta nada elaborado.
+- Mientras se arma: lista de ítems agregados (producto, variante si aplica, cantidad, subtotal), poder
+  sacar un ítem antes de confirmar, total corriendo.
+- Al confirmar: checkbox "Facturar" (ver `facturar_arca` del punto 1), nombre de cliente opcional,
+  crea el `Pedido` (`canal="local"`) + un `PedidoItem` por línea + el `Movimiento` Venta correspondiente
+  por cada línea, vía `registrar_venta()` — la misma función que ya existe y ya valida stock, no la
+  reimplementes.
+- `Ingreso`/`Egreso` en Caja **no cambian** — siguen siendo carga rápida de una sola línea, como hoy. El
+  concepto de "armar varios ítems antes de confirmar" aplica solo a Venta.
 
-## 3. Cliente WSFEv1 (facturación)
+## 3. Pantalla de Pedidos unificada
 
-Módulo nuevo (`backend/app/arca/wsfe.py` o similar), usando el Token/Sign del punto 2. Solo estos
-métodos, no implementes el resto del catálogo enorme de WSFEv1 que no aplica a Factura C:
-- `FEDummy`: chequeo de que el servicio está arriba, útil para un test rápido de conectividad.
-- `FECompUltimoAutorizado`: consulta el último número de comprobante autorizado para un
-  tipo/puntoVenta — hay que llamarlo SIEMPRE antes de `FECAESolicitar` para saber el próximo número
-  (`CbteDesde = CbteHasta = último + 1`). No mantengas un contador propio en la base que pueda
-  desincronizarse de ARCA — ARCA es la fuente de verdad del número de comprobante.
-- `FECAESolicitar`: pide el CAE. Para Factura C (`CbteTipo = 11`), armá el request con:
-  - `Concepto = 1`
-  - `CbteDesde = CbteHasta` (obligatorio para tipo C, un solo comprobante por request)
-  - `ImpTotConc = 0`, `ImpOpEx = 0`, `ImpIVA = 0` (todos en cero, es lo que exige tipo C)
-  - `ImpNeto` = el subtotal de la operación
-  - `ImpTrib` = 0 (no hay tributos/percepciones en este negocio por ahora)
-  - `ImpTotal = ImpNeto + ImpTrib`
-  - **NO mandar el array `<Iva>`** — está prohibido para tipo C, lo rechaza si lo mandás.
-  - `MonId = "PES"`, `MonCotiz = 1`
-  - `DocTipo`/`DocNro`: parametrizables por la función (en esta fase, probalo con Consumidor Final —
-    `DocTipo = 99`, `DocNro = 0` — que va a ser el caso más común en la práctica).
-- Función que interprete la respuesta: si `Resultado = "A"` (aprobado), devolver CAE + fecha de
-  vencimiento; si viene con `Observaciones`, devolverlas igual (se aprobó pero con avisos, no es un
-  error); si `Resultado = "R"` (rechazado) o viene `<Errors>`, devolver el detalle del error de forma
-  clara — no una excepción genérica sin contexto.
+`OrdenesEcommerce.jsx` pasa a ser (o se reemplaza por) `Pedidos.jsx`: lista TODOS los pedidos sin
+importar el canal, con columna de canal, fecha, cliente (o "Mostrador" si no se cargó nombre en uno
+local), items, total, `facturar_arca` (badge sí/no), y `estado` — editable ahí mismo con un selector,
+para que puedas ir moviendo un pedido por la cadena a medida que lo procesás. **Sin botón de "Facturar"
+todavía** — no lo agregues, es explícitamente de la Fase C.
 
-## Qué NO hacer en esta fase
+## Qué NO hacer
 
-No toques `Pedido`, `OrdenEcommerce`, Caja, ni ninguna pantalla del frontend. No implementes CAEA (solo
-CAE, que es lo que corresponde acá). No implementes ningún otro tipo de comprobante que no sea Factura C
-(11), ni Nota de Débito/Crédito C todavía. No hardcodees el CUIT ni ningún dato de Florencia en el código
-— todo sale de las variables de entorno del punto 1.
+No llames a nada de `backend/app/arca/` desde ningún lado en esta fase — el módulo de la Fase A queda
+intacto y sin conectar. No toques `ecommerce/` (ver punto 0). No implementes lógica de reversión/
+cancelación real todavía (eso es la Fase D) — `Cancelado` es un estado disponible en el selector, nada
+más, no dispara ninguna devolución de stock por ahora.
 
 ## Antes de terminar
 
-Escribí un script de prueba que, contra el ambiente de testing/homologación:
-1. Llame a `FEDummy` y confirme que el servicio responde.
-2. Obtenga un Token/Sign válido de WSAA.
-3. Consulte `FECompUltimoAutorizado` para Factura C, punto de venta de prueba.
-4. Pida un CAE real con `FECAESolicitar` para una Factura C de prueba (ej. `ImpNeto = 1000`,
-   Consumidor Final) y muestre el CAE y la fecha de vencimiento obtenidos.
-5. Pruebe un caso que debería rechazar (ej. mandar el array de IVA en un comprobante tipo C) y confirme
-   que se recibe el error esperado, no una excepción sin manejar.
-
-Esto va a requerir que yo tenga generado el certificado de testing y la variable `ARCA_CUIT` cargada
-antes de que puedas correr el script — avisame si llegás a ese punto y todavía no está listo de mi lado.
-Actualizá el CLAUDE.md con una sección nueva "Facturación electrónica (Fase A — integración ARCA)"
-documentando la arquitectura, por qué WSFEv1 sin detalle de ítem simplifica el diseño, y las decisiones
-específicas de Factura C (sin IVA, ImpNeto=subtotal, etc.).
+Probá contra la API real: un pedido local con 3 ítems distintos (2 con variante, 1 sin) armado como
+carrito y confirmado, verificando que se crearon los 3 `Movimiento` correctos y el stock bajó bien en
+cada uno. Un pedido de e-commerce de prueba (reusando `POST /ecommerce/ordenes` tal cual) y confirmá que
+sigue funcionando idéntico a como lo dejó la Fase 2, con `canal="ecommerce"` y `estado="Pendiente"`
+puestos solos. Cambiar el estado de un pedido desde la pantalla nueva y confirmar que persiste. Avisame
+qué tengo que probar a mano en el navegador (el flujo completo de armar un pedido en Caja con varios
+ítems es lo más nuevo, ahí es donde más vale la pena que lo mires vos). Actualizá el CLAUDE.md con esta
+sección nueva, documentando la decisión de renombrar vs. tabla nueva y por qué, y los defaults de estado
+por canal.

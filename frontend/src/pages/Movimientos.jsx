@@ -37,6 +37,12 @@ export default function Movimientos() {
   // venta original en edición: para no contar su propia cantidad como "ya vendida" al topear stock
   const [ventaOriginal, setVentaOriginal] = useState(null) // { productoId, varianteId, cantidad }
 
+  // Carrito de un pedido de mostrador en armado (tipo Venta, sin estar editando un Movimiento
+  // existente): se van agregando ítems acá y recién al confirmar se manda todo junto a POST /pedidos.
+  const [itemsPedido, setItemsPedido] = useState([])
+  const [facturarArca, setFacturarArca] = useState(false)
+  const [clienteNombreCarrito, setClienteNombreCarrito] = useState('')
+
   const cargar = () => {
     api.get('/movimientos').then((r) => setMovimientos(r.data))
     api.get('/productos', { params: { solo_activos: true } }).then((r) => setProductos(r.data))
@@ -52,6 +58,11 @@ export default function Movimientos() {
   const productosFiltrados = form.categoria_id
     ? productos.filter((p) => String(p.categoria_id) === String(form.categoria_id))
     : productos
+
+  // true mientras se está armando un pedido nuevo de mostrador (no se está editando un Movimiento
+  // ya existente) — es cuando el formulario de Venta pasa a agregar ítems al carrito en vez de
+  // guardar directo.
+  const enModoCarrito = form.tipo === 'Venta' && !editId
 
   useEffect(() => {
     setValoresElegidos({})
@@ -133,6 +144,16 @@ export default function Movimientos() {
   const stockDisponible =
     stockActualBase == null ? null : stockActualBase + (esLaVentaOriginal ? ventaOriginal.cantidad : 0)
 
+  // En modo carrito, el tope real también descuenta lo que ya se agregó al pedido en armado para
+  // esta misma variante/producto (si no, se podría agregar 2 líneas de 3 unidades contra un stock
+  // de 4 sin que el frontend avise antes de confirmar).
+  const yaEnCarrito = itemsPedido
+    .filter((i) => i.producto_id === productoSeleccionado?.id && (i.variante_id || null) === (varianteResuelta?.id || null))
+    .reduce((acc, i) => acc + i.cantidad, 0)
+  const stockDisponibleEfectivo = enModoCarrito
+    ? (stockDisponible == null ? null : stockDisponible - yaEnCarrito)
+    : stockDisponible
+
   // al editar un movimiento ya cargado, prellenar los selectores con la variante que tenía
   useEffect(() => {
     if (edicionVarianteId && variantesProducto.length > 0) {
@@ -199,6 +220,88 @@ export default function Movimientos() {
     }
   }
 
+  // Agrega el ítem resuelto (producto + variante si aplica + cantidad) al pedido en armado, en vez
+  // de guardarlo directo — mismas validaciones que guardar() tenía para una Venta nueva, pero contra
+  // el tope ajustado por lo que ya está en el carrito.
+  const agregarAlCarrito = () => {
+    setError('')
+    if (!productoSeleccionado) {
+      setError('Elegí un producto.')
+      return
+    }
+    if (productoSeleccionado.tiene_variantes && variantesProducto.length === 0) {
+      setError('Este producto no tiene variantes cargadas todavía, configuralas en Catálogo antes de registrar la venta.')
+      return
+    }
+    if (atributosProducto.length > 0 && !varianteResuelta) {
+      setError('Elegí un valor para cada atributo, así se puede resolver la variante de la venta.')
+      return
+    }
+    const cantidad = Number(form.cantidad || 0)
+    if (cantidad <= 0) {
+      setError('La cantidad tiene que ser mayor a 0.')
+      return
+    }
+    if (stockDisponibleEfectivo != null && cantidad > stockDisponibleEfectivo) {
+      setError(
+        `No hay stock suficiente: disponible ${stockDisponibleEfectivo} (descontando lo ya agregado a este pedido), pediste ${cantidad}.`
+      )
+      return
+    }
+    const descripcionVariante = varianteResuelta
+      ? atributosProducto
+          .map((a) => varianteResuelta.valores.find((x) => x.atributo_id === a.atributo_id)?.valor)
+          .filter(Boolean)
+          .join(' / ')
+      : null
+    const varianteId = varianteResuelta?.id || null
+    setItemsPedido((prev) => {
+      // si ya hay una línea del mismo producto+variante, se suma la cantidad en vez de duplicar la línea
+      const existente = prev.find((i) => i.producto_id === productoSeleccionado.id && (i.variante_id || null) === varianteId)
+      if (existente) {
+        return prev.map((i) => (i.key === existente.key ? { ...i, cantidad: i.cantidad + cantidad } : i))
+      }
+      return [
+        ...prev,
+        {
+          key: `${productoSeleccionado.id}-${varianteId ?? 'sv'}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          producto_id: productoSeleccionado.id,
+          variante_id: varianteId,
+          nombre_producto: productoSeleccionado.nombre,
+          descripcion_variante: descripcionVariante,
+          cantidad,
+          precio_unitario: Number(productoSeleccionado.precio_venta),
+        },
+      ]
+    })
+    setForm((f) => ({ ...f, producto_id: '', cantidad: 1 }))
+    setValoresElegidos({})
+  }
+
+  const sacarDelCarrito = (key) => setItemsPedido((prev) => prev.filter((i) => i.key !== key))
+
+  const totalCarrito = itemsPedido.reduce((acc, i) => acc + i.cantidad * i.precio_unitario, 0)
+
+  const confirmarPedido = async () => {
+    setError('')
+    try {
+      await api.post('/pedidos', {
+        cliente_nombre: clienteNombreCarrito || null,
+        facturar_arca: facturarArca,
+        lineas: itemsPedido.map((i) => ({ producto_id: i.producto_id, variante_id: i.variante_id, cantidad: i.cantidad })),
+      })
+      setItemsPedido([])
+      setFacturarArca(false)
+      setClienteNombreCarrito('')
+      setForm({ ...empty, fecha: nowLocal() })
+      setMontoEditadoManualmente(false)
+      cargar()
+    } catch (e) {
+      // no se vacía el carrito: el usuario puede sacar el ítem problemático y reintentar
+      setError(getErrorMessage(e))
+    }
+  }
+
   const editar = (m) => {
     setEditId(m.id)
     setMontoEditadoManualmente(true) // no pisar el monto ya guardado al editar
@@ -239,7 +342,9 @@ export default function Movimientos() {
       <h1 className="text-3xl font-bold flex items-center gap-2">💰 Gestión de Caja Reales</h1>
 
       <div className="bg-[#151b2b] rounded-xl p-5 space-y-3">
-        <h2 className="font-bold">{editId ? 'Editar Movimiento' : 'Registrar Movimiento'}</h2>
+        <h2 className="font-bold">
+          {editId ? 'Editar Movimiento' : enModoCarrito ? 'Agregar ítem al pedido' : 'Registrar Movimiento'}
+        </h2>
         {error && <p className="text-red-400 text-sm">{error}</p>}
 
         <div className="flex gap-2">
@@ -306,7 +411,7 @@ export default function Movimientos() {
               <input
                 type="number"
                 min="1"
-                max={stockDisponible ?? undefined}
+                max={stockDisponibleEfectivo ?? undefined}
                 className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
                 placeholder="Cantidad vendida"
                 value={form.cantidad}
@@ -318,34 +423,38 @@ export default function Movimientos() {
             </>
           )}
 
-          <input
-            type="number"
-            className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
-            placeholder="Monto ($)"
-            value={form.monto}
-            onChange={(e) => {
-              setMontoEditadoManualmente(true)
-              setForm({ ...form, monto: e.target.value })
-            }}
-          />
-          <input
-            type="datetime-local"
-            className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
-            value={form.fecha}
-            onChange={(e) => setForm({ ...form, fecha: e.target.value })}
-          />
-          <input
-            className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2 md:col-span-2"
-            placeholder="Detalle / concepto (opcional)"
-            value={form.concepto}
-            onChange={(e) => setForm({ ...form, concepto: e.target.value })}
-          />
+          {!enModoCarrito && (
+            <>
+              <input
+                type="number"
+                className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
+                placeholder="Monto ($)"
+                value={form.monto}
+                onChange={(e) => {
+                  setMontoEditadoManualmente(true)
+                  setForm({ ...form, monto: e.target.value })
+                }}
+              />
+              <input
+                type="datetime-local"
+                className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
+                value={form.fecha}
+                onChange={(e) => setForm({ ...form, fecha: e.target.value })}
+              />
+              <input
+                className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2 md:col-span-2"
+                placeholder="Detalle / concepto (opcional)"
+                value={form.concepto}
+                onChange={(e) => setForm({ ...form, concepto: e.target.value })}
+              />
+            </>
+          )}
         </div>
 
         {form.tipo === 'Venta' && productoSeleccionado && (
           <p className="text-xs text-gray-500">
-            Precio de venta del producto: ${productoSeleccionado.precio_venta} · el monto se calcula solo
-            (cantidad × precio), pero lo podés pisar a mano si vendiste con descuento.
+            Precio de venta del producto: ${productoSeleccionado.precio_venta}
+            {!enModoCarrito && ' · el monto se calcula solo (cantidad × precio), pero lo podés pisar a mano si vendiste con descuento.'}
           </p>
         )}
         {form.tipo === 'Venta' && productoSeleccionado?.tiene_variantes && variantesProducto.length === 0 && (
@@ -363,16 +472,23 @@ export default function Movimientos() {
             Elegí un valor para cada atributo para resolver la variante puntual de esta venta.
           </p>
         )}
-        {form.tipo === 'Venta' && stockDisponible != null && Number(form.cantidad || 0) > stockDisponible && (
+        {form.tipo === 'Venta' && stockDisponibleEfectivo != null && Number(form.cantidad || 0) > stockDisponibleEfectivo && (
           <p className="text-xs text-red-400">
-            Stock disponible: {stockDisponible}. La cantidad cargada lo supera.
+            Stock disponible{enModoCarrito && yaEnCarrito > 0 ? ' (descontando lo ya agregado a este pedido)' : ''}:{' '}
+            {stockDisponibleEfectivo}. La cantidad cargada lo supera.
           </p>
         )}
 
         <div className="flex gap-2">
-          <button onClick={guardar} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg font-medium">
-            {editId ? 'Guardar cambios' : '+ Registrar Movimiento'}
-          </button>
+          {enModoCarrito ? (
+            <button onClick={agregarAlCarrito} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg font-medium">
+              + Agregar al pedido
+            </button>
+          ) : (
+            <button onClick={guardar} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg font-medium">
+              {editId ? 'Guardar cambios' : '+ Registrar Movimiento'}
+            </button>
+          )}
           {editId && (
             <button
               onClick={() => {
@@ -388,6 +504,68 @@ export default function Movimientos() {
           )}
         </div>
       </div>
+
+      {enModoCarrito && (
+        <div className="bg-[#151b2b] rounded-xl p-5 space-y-3">
+          <h2 className="font-bold">Pedido en armado</h2>
+          {itemsPedido.length === 0 ? (
+            <p className="text-gray-500 text-sm">Todavía no agregaste ningún ítem a este pedido.</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-gray-400 border-b border-gray-700">
+                    <th className="py-2">Producto</th>
+                    <th>Cantidad</th>
+                    <th>Precio unit.</th>
+                    <th>Subtotal</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {itemsPedido.map((it) => (
+                    <tr key={it.key} className="border-b border-gray-800">
+                      <td className="py-2">
+                        {it.nombre_producto}
+                        {it.descripcion_variante && <span className="text-gray-400"> — {it.descripcion_variante}</span>}
+                      </td>
+                      <td>{it.cantidad}</td>
+                      <td>${it.precio_unitario.toLocaleString('es-AR')}</td>
+                      <td>${(it.cantidad * it.precio_unitario).toLocaleString('es-AR')}</td>
+                      <td className="text-right">
+                        <button onClick={() => sacarDelCarrito(it.key)} className="text-red-400 hover:underline">
+                          Sacar
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <p className="text-right font-bold mt-2">Total: ${totalCarrito.toLocaleString('es-AR')}</p>
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center gap-3 pt-2 border-t border-gray-800">
+            <label className="flex items-center gap-2 text-sm">
+              <input type="checkbox" checked={facturarArca} onChange={(e) => setFacturarArca(e.target.checked)} />
+              Facturar (ARCA)
+            </label>
+            <input
+              className="bg-[#0b0f19] border border-gray-700 rounded-lg p-2 text-sm"
+              placeholder="Cliente (opcional)"
+              value={clienteNombreCarrito}
+              onChange={(e) => setClienteNombreCarrito(e.target.value)}
+            />
+            <button
+              onClick={confirmarPedido}
+              disabled={itemsPedido.length === 0}
+              className="bg-green-600 hover:bg-green-700 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 rounded-lg font-medium ml-auto"
+            >
+              Confirmar venta
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="bg-[#151b2b] rounded-xl p-5 overflow-x-auto">
         <table className="w-full text-sm">

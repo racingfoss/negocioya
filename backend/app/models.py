@@ -249,9 +249,11 @@ class MixSnapshot(Base):
 
 
 # ---------------------------------------------------------------------------
-# E-commerce (Fase 0): base para que un servicio de e-commerce separado (fases
-# posteriores, todavía no existe) consuma el catálogo y registre órdenes. Ver
-# sección "E-commerce" en CLAUDE.md para el detalle completo.
+# E-commerce (Fase 0): base para que un servicio de e-commerce separado consuma
+# el catálogo y registre órdenes. Pedido/PedidoItem (Fase B) generalizan lo que
+# empezó acá como OrdenEcommerce/OrdenEcommerceItem a un concepto que sirve para
+# los dos canales de venta (ecommerce y local/mostrador). Ver sección
+# "E-commerce" y "Fase B — Pedido unificado" en CLAUDE.md para el detalle completo.
 # ---------------------------------------------------------------------------
 class ProductoFoto(Base):
     """Fotos de un producto para el catálogo público. `orden` define el orden de
@@ -269,18 +271,27 @@ class ProductoFoto(Base):
     producto = relationship("Producto", back_populates="fotos")
 
 
-class OrdenEcommerce(Base):
-    """Orden creada desde el e-commerce. `estado` siempre "Confirmada" en esta fase
-    (no hay más estados todavía — no hay pagos ni logística real que trackear)."""
-    __tablename__ = "ordenes_ecommerce"
+class Pedido(Base):
+    """Pedido unificado de los dos canales de venta (Fase B). `canal`: "ecommerce" | "local".
+    `facturar_arca`: siempre True para "ecommerce" (toda venta online se factura), lo decide
+    un checkbox en Caja para "local". `estado`: cadena de logística
+    Pendiente -> Preparando -> Listo para retirar/Enviado (según forma_entrega) -> Entregado,
+    con Cancelado disponible como alternativa en cualquier punto antes de Entregado (sin
+    ningún efecto de reversión de stock todavía, eso es una fase futura). Default de estado
+    por canal: "ecommerce" arranca en Pendiente (falta prepararlo/enviarlo), "local" arranca
+    directo en Entregado (la clienta se lo lleva en el momento). `cliente_nombre` y
+    `forma_entrega` son nullable porque no aplican igual a un pedido de mostrador."""
+    __tablename__ = "pedidos"
 
     id = Column(Integer, primary_key=True, index=True)
     fecha = Column(DateTime(timezone=True), nullable=False, default=_now_utc)
-    estado = Column(String(20), nullable=False, default="Confirmada")
-    cliente_nombre = Column(String(150), nullable=False)
+    canal = Column(String(20), nullable=False)  # "ecommerce" | "local"
+    facturar_arca = Column(Boolean, nullable=False, default=True)
+    estado = Column(String(20), nullable=False)
+    cliente_nombre = Column(String(150), nullable=True)
     cliente_email = Column(String(150), nullable=True)
     cliente_telefono = Column(String(50), nullable=True)
-    forma_entrega = Column(String(20), nullable=False)  # "Retiro en persona" | "Envío"
+    forma_entrega = Column(String(20), nullable=True)  # "Retiro en persona" | "Envío", solo canal ecommerce
     direccion_envio = Column(Text, nullable=True)
     notas = Column(Text, nullable=True)
     # Qué opción visual tildó el cliente en el checkout (ej. "Efectivo al retirar",
@@ -288,26 +299,26 @@ class OrdenEcommerce(Base):
     metodo_pago_preferido = Column(String(50), nullable=True)
     total = Column(Numeric(12, 2), nullable=False)
 
-    items = relationship("OrdenEcommerceItem", back_populates="orden", cascade="all, delete-orphan")
+    items = relationship("PedidoItem", back_populates="pedido", cascade="all, delete-orphan")
 
 
-class OrdenEcommerceItem(Base):
-    """Línea de una orden de e-commerce. `precio_unitario` se guarda como valor propio
+class PedidoItem(Base):
+    """Línea de un Pedido (cualquier canal). `precio_unitario` se guarda como valor propio
     (no se lee del producto por join) — mismo criterio de denormalización deliberada
     que MixSnapshot, para que el histórico no dependa de que el precio no haya
     cambiado después. `movimiento_id` referencia el Movimiento tipo Venta que esta
     línea generó, para trazabilidad."""
-    __tablename__ = "orden_ecommerce_items"
+    __tablename__ = "pedido_items"
 
     id = Column(Integer, primary_key=True, index=True)
-    orden_id = Column(Integer, ForeignKey("ordenes_ecommerce.id", ondelete="CASCADE"), nullable=False)
+    pedido_id = Column(Integer, ForeignKey("pedidos.id", ondelete="CASCADE"), nullable=False)
     producto_id = Column(Integer, ForeignKey("productos.id", ondelete="SET NULL"), nullable=True)
     variante_id = Column(Integer, ForeignKey("variantes.id", ondelete="SET NULL"), nullable=True)
     cantidad = Column(Integer, nullable=False)
     precio_unitario = Column(Numeric(12, 2), nullable=False)
     movimiento_id = Column(Integer, ForeignKey("movimientos.id", ondelete="SET NULL"), nullable=True)
 
-    orden = relationship("OrdenEcommerce", back_populates="items")
+    pedido = relationship("Pedido", back_populates="items")
     producto = relationship("Producto")
     variante = relationship("Variante")
     movimiento = relationship("Movimiento")

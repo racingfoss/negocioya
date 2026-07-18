@@ -9,7 +9,7 @@ import CostosFijos from './pages/CostosFijos'
 import Dashboard from './pages/Dashboard'
 import Importar from './pages/Importar'
 import Movimientos from './pages/Movimientos'
-import OrdenesEcommerce from './pages/OrdenesEcommerce'
+import Pedidos from './pages/Pedidos'
 import Productos from './pages/Productos'
 import SellThrough from './pages/SellThrough'
 
@@ -24,7 +24,7 @@ const links = [
   { to: '/costos-fijos', label: '🔧 Estructura Fija' },
   { to: '/bcg', label: '🎯 Análisis' },
   { to: '/sell-through', label: '📈 Stock' },
-  { to: '/ordenes-ecommerce', label: '🛒 Órdenes E-commerce' },
+  { to: '/pedidos', label: '📦 Pedidos' },
   { to: '/configuracion', label: '⚙️ Configuración' },
 ]
 
@@ -61,7 +61,7 @@ function App() {
             <Route path="/costos-fijos" element={<CostosFijos />} />
             <Route path="/bcg" element={<BCG />} />
             <Route path="/sell-through" element={<SellThrough />} />
-            <Route path="/ordenes-ecommerce" element={<OrdenesEcommerce />} />
+            <Route path="/pedidos" element={<Pedidos />} />
             <Route path="/configuracion" element={<Configuracion />} />
           </Routes>
         </main>

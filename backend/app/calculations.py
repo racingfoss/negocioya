@@ -633,6 +633,13 @@ def stock_disponible(db: Session, producto_id: int, variante_id: Optional[int] =
 
 TIPOS_MOVIMIENTO_VALIDOS = ("Venta", "Ingreso", "Egreso")
 
+# Cadena de estados de logística de un Pedido (Fase B), cualquier canal. "Listo para retirar"
+# y "Enviado" son ambos válidos para cualquier pedido (el frontend decide cuál ofrecer según
+# forma_entrega, no se acopla acá para no sumar una quinta categoría rara). Cancelado no
+# dispara ninguna reversión de stock todavía (eso es una fase futura) — es solo un valor
+# disponible en el selector.
+ESTADOS_PEDIDO_VALIDOS = ("Pendiente", "Preparando", "Listo para retirar", "Enviado", "Entregado", "Cancelado")
+
 
 # ---------------------------------------------------------------------------
 # Única función de este módulo que lanza HTTPException — excepción deliberada a
