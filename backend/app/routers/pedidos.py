@@ -1,23 +1,36 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
 
-from .. import calculations, models, schemas
+from .. import calculations, facturacion, models, schemas
 from ..database import get_db
 
 router = APIRouter(prefix="/pedidos", tags=["Pedidos"])
+
+
+def _pedido_out(db: Session, pedido: models.Pedido) -> schemas.PedidoOut:
+    """monto_neto no es un atributo del ORM (Fase C) — model_validate lo dejaría en su default
+    Decimal("0") SIN error si no se completa acá, así que este helper es obligatorio en los 3
+    endpoints que devuelven un Pedido, no solo en listar()."""
+    out = schemas.PedidoOut.model_validate(pedido)
+    out.monto_neto = calculations.monto_neto_pedido(db, pedido)
+    return out
 
 
 @router.get("/", response_model=list[schemas.PedidoOut])
 def listar(db: Session = Depends(get_db), limit: int = 300):
     """Pedidos de AMBOS canales (ecommerce y local), unificados (Fase B). Reemplaza al viejo
     GET /ecommerce/ordenes, que solo listaba el canal online."""
-    return (
+    pedidos = (
         db.query(models.Pedido)
-        .options(joinedload(models.Pedido.items).joinedload(models.PedidoItem.producto))
+        .options(
+            joinedload(models.Pedido.items).joinedload(models.PedidoItem.producto),
+            joinedload(models.Pedido.facturas),
+        )
         .order_by(models.Pedido.fecha.desc())
         .limit(limit)
         .all()
     )
+    return [_pedido_out(db, p) for p in pedidos]
 
 
 @router.post("/", response_model=schemas.PedidoOut)
@@ -101,7 +114,7 @@ def crear_local(payload: schemas.PedidoLocalCreate, db: Session = Depends(get_db
 
     db.commit()
     db.refresh(pedido)
-    return pedido
+    return _pedido_out(db, pedido)
 
 
 @router.put("/{pedido_id}/estado", response_model=schemas.PedidoOut)
@@ -116,4 +129,11 @@ def cambiar_estado(pedido_id: int, payload: schemas.PedidoEstadoUpdate, db: Sess
     pedido.estado = payload.estado
     db.commit()
     db.refresh(pedido)
-    return pedido
+    return _pedido_out(db, pedido)
+
+
+@router.post("/{pedido_id}/facturar", response_model=schemas.FacturaOut)
+def facturar(pedido_id: int, db: Session = Depends(get_db)):
+    """Pide un CAE real a ARCA para este pedido (Fase C) — ver facturacion.facturar_pedido para
+    la orquestación completa (validaciones, llamado a WSFEv1, persistencia del intento)."""
+    return facturacion.facturar_pedido(db, pedido_id)

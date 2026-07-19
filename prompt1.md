@@ -1,91 +1,104 @@
-Reserva de stock con vencimiento corto, para el pedido que se está armando en Caja (FashBalance) — así un
-producto/variante que ya está en un carrito local no se lo puede "robar" una venta de e-commerce mientras
-se termina de armar y confirmar. Alcance acotado a propósito, sin scheduler ni worker de limpieza — el
-mismo criterio "lazy" que ya se usa en el proyecto para los snapshots del mix real.
+Fase C: conectar el `Pedido` de la Fase B con el cliente de ARCA de la Fase A — botón "Facturar" real,
+que pide un CAE de verdad y lo guarda. Esta fase NO genera ningún comprobante imprimible ni código QR
+(eso es una fase futura, no planificada todavía) — el alcance es obtener el CAE y dejarlo persistido y
+visible, nada más. Tampoco emite Nota de Crédito (eso es la Fase D parte 2, más adelante).
 
-## El mecanismo (léelo antes de programar, no improvises otro)
+## 1. Tabla nueva `facturas`
 
-- Las reservas vencen solas por tiempo (TTL corto, ver más abajo) — **no hace falta un proceso que las
-  borre activamente**. Cualquier cálculo de stock disponible simplemente ignora las reservas cuyo
-  `expira_en` ya pasó (`WHERE expira_en > now()`), así que una reserva vencida deja de "contar" en el
-  instante exacto en que vence, sin que nadie tenga que borrarla para que deje de bloquear. Borrado físico
-  de filas viejas: hacelo de forma oportunista (al crear una reserva nueva, de paso borrá las que ya
-  vencieron hace rato) — no un cron, no un `BackgroundTask` periódico.
-- Cada "pedido en armado" en Caja tiene un `sesion_id` (UUID generado en el frontend al arrancar un pedido
-  nuevo tipo Venta), que viaja en cada reserva — así se sabe qué reservas pertenecen al mismo carrito en
-  construcción.
+`id`, `pedido_id` (FK a `Pedido`), `tipo_comprobante` (int, default `11` = Factura C — campo propio, no
+hardcodeado en la query, porque una futura Nota de Crédito C usaría `13` en esta misma tabla, aunque esta
+fase solo emite `11`), `punto_venta` (snapshot del valor de `configuracion` al momento de facturar, no
+una referencia viva), `numero_comprobante`, `cae`, `cae_vencimiento`, `fecha_emision`, `importe_total`
+(el monto realmente facturado — ver punto 4, no necesariamente igual a `Pedido.total`), `doc_tipo`/
+`doc_nro` (Consumidor Final en esta fase, ver punto 5), `estado` (`"Emitida"` | `"Error"`),
+`mensaje_error` (nullable), `created_at`. Un pedido puede tener más de una fila acá con el tiempo
+(intentos fallidos, y a futuro una Nota de Crédito) — no uses una relación 1:1 forzada.
 
-## 1. Tabla nueva `reservas_stock`
+## 2. `backend/app/facturacion.py` (nuevo, no adentro de `arca/`)
 
-`id`, `sesion_id` (string), `producto_id`, `variante_id` (nullable), `cantidad`, `creado_en` (default
-now), `expira_en` (default now + `reserva_stock_minutos`, ver punto 2).
+Orquesta entre `Pedido`/`Configuracion` y el paquete `arca/` de la Fase A — `arca/` sigue sin saber qué es
+un Pedido, este módulo es el que traduce.
 
-## 2. Configuración
+**`calculations.monto_neto_pedido(db, pedido_id)`** (nueva, en `calculations.py` — no en
+`facturacion.py`, es un cálculo de negocio reusable): `Pedido.total` menos lo que ya se devolvió de ese
+pedido. **Antes de escribir esta función, revisá si en `backend/app/models.py` ya existe una clase
+`Devolucion`/`DevolucionItem`** (o, si preferís confirmarlo contra la base viva, si existen las tablas
+`devoluciones`/`devolucion_items`):
+- **Si existen**: sumá, por cada `DevolucionItem` cuyo `PedidoItem` pertenezca a ese pedido, `cantidad ×
+  precio_unitario` del `PedidoItem` original, y restalo de `Pedido.total`.
+- **Si NO existen todavía**: la función devuelve directamente `Pedido.total`, sin restar nada — no hay
+  ningún otro lugar del proyecto que registre devoluciones todavía, así que no hace falta contemplar ese
+  caso.
+No asumas ninguno de los dos escenarios de antemano — confirmalo mirando el código/la base real antes de
+programar esta función.
 
-Agregar `reserva_stock_minutos` (int, default `20`) a `configuracion` — mismo patrón que el resto de los
-"números mágicos" del proyecto, editable desde ⚙️ Configuración sin tocar código.
+Función principal `facturar_pedido(db, pedido_id)`:
 
-## 3. `calculations.py`
+1. Buscar el `Pedido`, 404 si no existe.
+2. Si `facturar_arca` es `False`: error claro ("Este pedido no está marcado para facturar").
+3. Si ya existe una `Factura` con `tipo_comprobante=11` y `estado="Emitida"` para este `pedido_id`: error
+   claro ("Este pedido ya tiene una factura emitida") — evita facturar dos veces por un doble click. Sé
+   específico con el filtro (`tipo_comprobante=11`, no "cualquier fila en facturas") porque más adelante
+   van a convivir ahí también Notas de Crédito del mismo pedido.
+4. Calcular `monto = calculations.monto_neto_pedido(db, pedido_id)`. Si `monto <= 0`: error claro ("Este
+   pedido no tiene monto pendiente de facturar — fue devuelto o cancelado en su totalidad").
+5. Leer `arca_cuit`/`arca_punto_venta_defecto` de `configuracion`. Si `arca_cuit` es `null`: error claro
+   ("Configurá el CUIT de ARCA en ⚙️ Configuración antes de facturar").
+6. `FECompUltimoAutorizado` (de `arca/wsfe.py`, reusado tal cual) para tipo `11`, ese punto de venta.
+7. `FECAESolicitar` con `ImpNeto = monto` (el neto del punto 4, NO `Pedido.total` a secas), Consumidor
+   Final (`DocTipo=99`, `DocNro=0`).
+8. **Éxito**: crear `Factura` (`estado="Emitida"`, `importe_total=monto`, con el CAE/vencimiento/número
+   reales, `mensaje_error` con las observaciones si las hubo aunque haya salido aprobado).
+9. **Rechazo de ARCA o error de conexión**: crear igual una `Factura` con `estado="Error"` y el detalle en
+   `mensaje_error` (no numero/CAE, esos quedan `null`) — así queda historial del intento fallido. Devolver
+   el error al caller igual, para que el router lo propague.
 
-- **`stock_disponible(db, producto_id, variante_id=None, excluir_sesion=None)`**: extender la función que
-  ya existe (no crear una paralela) para que reste, además de lo que ya resta hoy, la suma de
-  `reservas_stock` activas (`expira_en > now()`) para ese producto/variante — **excluyendo** las reservas
-  de `excluir_sesion` si se pasa ese parámetro (una sesión no debe verse bloqueada por sus propias
-  reservas al querer agregar más del mismo producto). Parámetro nuevo con default `None`, así todos los
-  call sites existentes (`_validar()` en `movimientos.py`, etc.) siguen funcionando sin tocarlos.
-- **`reservar_stock(db, sesion_id, producto_id, variante_id, cantidad)`**: valida contra
-  `stock_disponible(..., excluir_sesion=sesion_id)`; si alcanza, crea o actualiza (upsert por
-  `sesion_id`+`producto_id`+`variante_id`) la fila de `reservas_stock` con la `cantidad` nueva (no
-  sumada — es "quiero tener reservado N en total para esta línea", reemplaza el valor, no lo acumula) y
-  `expira_en` renovado a `now() + reserva_stock_minutos`; si no alcanza, error claro con el detalle. De
-  paso, borra oportunistamente filas de `reservas_stock` con `expira_en` muy vencido (ej. más de un día)
-  — limpieza liviana, no una tarea aparte.
-- **`liberar_reserva(db, sesion_id, producto_id=None, variante_id=None)`**: borra la reserva puntual si se
-  pasan `producto_id`/`variante_id`, o todas las de esa `sesion_id` si no se pasan — para "sacar un ítem
-  del carrito en armado" y para "cancelar el pedido completo" respectivamente.
-- **`registrar_venta`** (ya existe, no cambiar su firma pública): que internamente use la versión
-  reservation-aware de `stock_disponible` — así una venta de e-commerce que intente llevarse unidades ya
-  reservadas por un pedido local en armado se rechaza igual que si el stock ya estuviera vendido de
-  verdad. Al confirmar un pedido local (ver punto 4), las reservas de esa `sesion_id` se liberan en la
-  MISMA transacción que crea los `Movimiento` reales — no antes, no en un paso aparte.
+## 3. Endpoint
 
-## 4. Endpoints nuevos (`routers/reservas.py` o dentro de `pedidos.py`, a tu criterio)
+`POST /pedidos/{id}/facturar` (en `routers/pedidos.py`, llama a `facturacion.facturar_pedido`). Devuelve
+el resultado de la `Factura` creada (o el error 400 correspondiente si falló alguna validación de los
+pasos 2-5, o 502 si ARCA rechazó/no respondió, con el detalle real del error, no uno genérico).
 
-- `POST /reservas`: `{sesion_id, producto_id, variante_id, cantidad}` → llama `reservar_stock`, 400 con
-  el detalle si no alcanza.
-- `DELETE /reservas`: por query params `sesion_id` (obligatorio) + `producto_id`/`variante_id`
-  (opcionales) → llama `liberar_reserva`.
+## 4. Consumidor Final — explícito, no un olvido
 
-`POST /pedidos` (ya existe, de la Fase B): agregar `sesion_id` opcional al payload — si viene, después de
-confirmar el pedido con éxito, liberar todas las reservas de esa sesión en la misma transacción (ya
-convertidas en `Movimiento` real, no hace falta que sigan "reservadas").
+Esta fase siempre factura con `DocTipo=99`/`DocNro=0` (Consumidor Final), sin pedirle a nadie un DNI/CUIT
+del comprador. Es válido y suficiente para venta minorista anónima. Que un comprador pueda pedir factura
+con sus propios datos (DNI/CUIT) queda explícitamente afuera — anotalo como pendiente en el CLAUDE.md, no
+lo implementes ahora.
 
-## 5. Frontend — `Movimientos.jsx`
+## 5. Frontend — `Pedidos.jsx`
 
-- Al arrancar a armar un pedido nuevo tipo Venta (primer "+ Agregar al pedido" de un carrito vacío),
-  generar un `sesionId` nuevo (`crypto.randomUUID()`) y guardarlo en el estado del componente.
-- "+ Agregar al pedido" pasa a llamar `POST /reservas` con ese `sesionId` antes de empujar el ítem al
-  carrito visual — si el backend rechaza (no alcanza contando reservas de otras sesiones), mostrar el
-  error y no agregar la línea. El tope de cantidad que ya se calculaba en el frontend sigue existiendo
-  como primera barrera visual, pero la reserva real del backend es la que importa.
-- "Sacar" un ítem del carrito en armado llama `DELETE /reservas` para esa línea puntual.
-- Al confirmar (`POST /pedidos`), mandar el `sesionId` en el payload.
-- Agregar un botón "Cancelar pedido" que vacíe el carrito visual y llame `DELETE /reservas` para toda la
-  sesión — para no depender solo del vencimiento por tiempo si Florencia decide no continuar.
+- Botón **"Facturar"** en cada fila donde `facturar_arca=true`, no tiene ya una `Factura` tipo `11` con
+  `estado="Emitida"`, y `monto_neto_pedido > 0` (si el backend igual lo rechaza por este último motivo,
+  mostrá el error tal cual, no hace falta duplicar la validación en el frontend si no la tenés a mano ahí
+  — el backend ya la hace). Al confirmar, llama al endpoint del punto 3; en éxito muestra el CAE, la
+  fecha de vencimiento, y el monto facturado (que puede ser menor al total del pedido si hubo una
+  devolución previa — mostralo así de claro, no solo el CAE pelado); en error, el mensaje real con
+  `getErrorMessage`, sin tocar el resto de la fila.
+- **Contador destacado arriba de la tabla**: "X pedidos pendientes de facturar" — cuenta los pedidos con
+  `facturar_arca=true`, sin `Factura` tipo `11` emitida, y con `monto_neto_pedido > 0` (un pedido
+  totalmente devuelto antes de facturarse no debería aparecer acá, no hay nada que facturar). Sumale un
+  filtro rápido (toggle o botón) que muestre solo esos, si no complica demasiado el componente que ya
+  existe.
 
 ## Qué NO hacer
 
-Nada de reserva para el carrito del e-commerce (`ecommerce/`) — ese sigue sin servidor detrás hasta el
-checkout, tal como está diseñado; la mejora de revalidación que armamos aparte es la mitigación de ese
-lado, no una reserva real. Nada de scheduler, worker, ni tarea en segundo plano para expirar reservas —
-el vencimiento es pasivo, por comparación de fecha en cada consulta.
+Nada de comprobante imprimible ni código QR — eso es una fase futura. No implementes Nota de Crédito
+todavía — es la Fase D parte 2, que se apoya en lo que construyas acá pero se hace después, cuando esto ya
+esté probado. No toques `Compras.jsx`, `Análisis`, `Importación`, `reservas_stock`, ni el storefront
+Next.js.
 
 ## Antes de terminar
 
-Probá el escenario real que motivó esto: reservar stock desde un pedido local en armado (`POST
-/reservas`), y mientras esa reserva sigue activa, intentar una compra de e-commerce por esas mismas
-unidades — confirmar que se rechaza. Confirmar el pedido local y verificar que la reserva se liberó y el
-`Movimiento` real se creó. Probar que una reserva vencida (esperá el TTL, o bajalo temporalmente para la
-prueba) deja de bloquear sola, sin que nadie la borre a mano. Avisame qué probar en el navegador (armar un
-pedido en Caja, sacar un ítem, cancelar el pedido completo). Actualizá el CLAUDE.md con esta sección
-nueva, documentando el mecanismo de vencimiento pasivo y por qué no hace falta un scheduler.
+Contra ARCA real (homologación), no simulado: crear un `Pedido` de prueba (local, `facturar_arca=true`)
+vía `POST /pedidos` ya existente, facturarlo con el endpoint nuevo y confirmar CAE real obtenido.
+Intentar facturarlo una segunda vez y confirmar el rechazo por "ya tiene factura emitida". Intentar
+facturar un pedido con `facturar_arca=false` y confirmar el rechazo correspondiente. **Si `Devolucion`/
+`DevolucionItem` ya existen en el proyecto** (revisalo igual que hiciste antes de programar
+`monto_neto_pedido`), probá además: un pedido con una devolución parcial ya procesada, facturarlo, y
+confirmar que el CAE se pide por el monto neto (no el total original) — si esas tablas todavía no
+existen, salteá esta prueba puntual y dejalo documentado como pendiente de verificar cuando se agregue
+esa funcionalidad. Avisame qué probar a mano en el navegador (el botón "Facturar" y el
+contador de pendientes, sobre todo). Actualizá el CLAUDE.md con esta sección nueva, y agregá a la lista de
+"ideas mencionadas pero no implementadas" el comprobante imprimible con QR y la opción de facturar con
+datos reales del comprador en vez de Consumidor Final.

@@ -119,6 +119,7 @@ def _interpretar_respuesta(resultado) -> dict:
         return {
             "aprobado": True,
             "cae": det.CAE,
+            "cbte_nro": det.CbteDesde,
             "vencimiento": det.CAEFchVto,
             "observaciones": observaciones,
         }

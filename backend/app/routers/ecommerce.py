@@ -193,4 +193,8 @@ def crear_orden(payload: schemas.OrdenEcommerceCreate, db: Session = Depends(get
 
     db.commit()
     db.refresh(orden)
-    return orden
+    # monto_neto (Fase C) no es un atributo del ORM — sin completarlo acá, PedidoOut.model_validate
+    # lo dejaría en su default Decimal("0") sin ningún error, mismo gotcha que en routers/pedidos.py.
+    out = schemas.PedidoOut.model_validate(orden)
+    out.monto_neto = calculations.monto_neto_pedido(db, orden)
+    return out

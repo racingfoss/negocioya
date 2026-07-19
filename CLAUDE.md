@@ -1033,6 +1033,84 @@ backend alcanzaba, sin tocar ni un archivo de `ecommerce/`.
 - **Nada de `ecommerce/` se tocó** — confirmado por investigación de código antes de implementar,
   no una suposición.
 
+## Facturación electrónica (Fase C — conectar Pedido con ARCA)
+
+Conecta el `Pedido` unificado (Fase B) con el cliente ARCA WSFEv1 ya probado en homologación
+(Fase A) para pedir un CAE real y persistirlo. Alcance acotado a propósito: **solo** obtener y
+guardar el CAE. Nada de comprobante imprimible ni código QR (fase futura, ver "Ideas mencionadas
+pero no implementadas"), y nada de Nota de Crédito (Fase D parte 2, que se apoya en esto pero se
+hace después). Siempre se factura como Consumidor Final (`DocTipo=99`/`DocNro=0`), sin pedirle
+datos al comprador — ver también "Ideas mencionadas pero no implementadas".
+
+- **Tabla nueva `facturas`** (`models.Factura`): `id`, `pedido_id` (FK, CASCADE), `tipo_comprobante`
+  (default 11 = Factura C — campo propio, no hardcodeado en la query, porque una futura Nota de
+  Crédito C usaría 13 en esta misma tabla), `punto_venta` (snapshot de `configuracion` al momento
+  de facturar, no una referencia viva), `numero_comprobante`, `cae`, `cae_vencimiento` (Date,
+  parseado del string `YYYYMMDD` que manda ARCA), `fecha_emision`, `importe_total` (el monto
+  realmente facturado, ver `monto_neto_pedido` más abajo — no necesariamente `Pedido.total`),
+  `doc_tipo`/`doc_nro` (Consumidor Final en esta fase), `estado` (`"Emitida"` | `"Error"`),
+  `mensaje_error` (nullable — también guarda las observaciones de ARCA aunque haya salido
+  aprobado, no solo errores reales), `created_at`. Un pedido puede tener más de una fila con el
+  tiempo (intentos fallidos, y a futuro una Nota de Crédito) — no es una relación 1:1 forzada.
+  Tabla nueva → se autocrea con `Base.metadata.create_all()`, sin `ALTER TABLE`.
+- **`calculations.monto_neto_pedido(db, pedido)`**: hoy simplemente `Pedido.total` — se confirmó
+  por búsqueda en todo el repo que `Devolucion`/`DevolucionItem` **no existen todavía**, así que no
+  hay nada que restar. Recibe el objeto `Pedido` ya cargado (no un id) para no volver a
+  consultarlo — se llama en loop desde `GET /pedidos`. Cuando exista `Devolucion`: restar, por cada
+  `DevolucionItem` cuyo `PedidoItem` pertenezca a este pedido, `cantidad × precio_unitario` del
+  `PedidoItem` original. **Pendiente de verificar** cuando esa tabla exista: que el CAE se pida por
+  el monto neto (no el total original) en un pedido con devolución parcial ya procesada.
+- **`backend/app/facturacion.py`** (nuevo, no adentro de `arca/`): orquesta entre `Pedido`/
+  `Configuracion` y el paquete `arca/` de la Fase A — `arca/` sigue sin saber qué es un Pedido.
+  `facturar_pedido(db, pedido_id)` valida en orden (404 si no existe el pedido; 400 si
+  `facturar_arca` es `False`; 400 si `estado == "Cancelado"` — guard nuevo, no estaba en el pedido
+  original de esta fase pero es la única red de seguridad posible hasta que exista Nota de Crédito,
+  porque sin eso un CAE real emitido sobre un pedido cancelado queda sin forma de revertirse; 400 si
+  ya hay una `Factura` con `tipo_comprobante=11` y `estado="Emitida"` para este pedido —filtro
+  específico por tipo porque a futuro conviven ahí Notas de Crédito del mismo pedido; 400 si
+  `monto_neto_pedido <= 0`; 400 si no hay `arca_cuit` cargado en Configuración), pide el CAE
+  (`wsfe.fe_cae_solicitar` con `ImpNeto = monto_neto_pedido`, NO `Pedido.total` a secas, y con
+  `doc_tipo`/`doc_nro` pasados explícitos en vez de depender del default de la función —así lo que
+  queda grabado en `facturas` siempre coincide con lo que se le mandó a ARCA, aunque algún día
+  cambien los defaults de un lado y no del otro) y persiste el resultado. En éxito crea la
+  `Factura` con `estado="Emitida"` y el CAE/vencimiento/número reales. En rechazo de ARCA o error de
+  conexión, crea igual una `Factura` con `estado="Error"` — **con commit inmediato**, antes de
+  lanzar el `HTTPException` (así queda historial del intento fallido aunque el request termine en
+  error; se confirmó seguro contra `database.py`: `get_db()` solo hace `close()` en el `finally`,
+  sin rollback implícito, así que ese commit no se pierde). Es el único módulo del proyecto, además
+  de `calculations.validar_movimiento`, que lanza `HTTPException` directo — no viola la convención
+  de `calculations.py` (esa convención es específica de ese módulo), acá es el punto:
+  `facturacion.py` funciona como un router grueso, no como una función de cálculo reusable.
+- **`arca/wsfe.py`** (único archivo de la Fase A tocado en esta ronda, cambio aditivo): la rama
+  aprobada de `_interpretar_respuesta` ahora también devuelve `cbte_nro` (`det.CbteDesde`, el
+  número real que ARCA asignó, tal cual lo hace eco en la respuesta) — evita que `facturacion.py`
+  tenga que llamar `fe_comp_ultimo_autorizado` una segunda vez solo para enterarse del número (esa
+  función ya se llama, una sola vez, adentro de `fe_cae_solicitar`, justo antes de armar el request
+  real a ARCA — eso no cambió). Sin este agregado hubiera habido una carrera teórica entre dos
+  llamados separados a `FECompUltimoAutorizado`.
+- **Endpoint `POST /pedidos/{id}/facturar`** (`routers/pedidos.py`): llama a
+  `facturacion.facturar_pedido`, `response_model=schemas.FacturaOut`. Devuelve 400 si falló alguna
+  validación previa, 502 si ARCA rechazó el comprobante o hubo un error de conexión (con el detalle
+  real, nunca un mensaje genérico).
+- **`monto_neto` en `PedidoOut`**: no es un atributo del ORM, así que `PedidoOut.model_validate(pedido)`
+  sin completarlo a mano cae **silenciosamente** al default `Decimal("0")` (confirmado con una
+  prueba directa contra pydantic 2.9.2), sin ningún error — por eso hay un helper `_pedido_out(db,
+  pedido)` en `routers/pedidos.py` usado en los 3 endpoints que devuelven un Pedido (`listar`,
+  `crear_local`, `cambiar_estado`), no solo en el listado. `POST /ecommerce/ordenes`
+  (`routers/ecommerce.py`) también usa `schemas.PedidoOut` como `response_model` y tiene el mismo
+  fix inline (no se creó un helper compartido entre routers, se mantuvo local a cada archivo,
+  mismo criterio que el resto del proyecto de no compartir helpers privados entre routers).
+- **Frontend (`Pedidos.jsx`)**: columna "Facturar" pasa a ser condicional — si el pedido ya tiene
+  una `Factura` tipo 11 emitida, muestra CAE/vencimiento/importe en vez del badge Sí/No; si es
+  `facturar_arca=true` sin factura emitida, `estado != "Cancelado"` y `monto_neto > 0`, muestra un
+  botón "Facturar"; si no, el badge Sí/No de siempre. **Protección de doble click obligatoria, no
+  cosmética**: facturar es una llamada SOAP de varios segundos con efecto externo irreversible (un
+  CAE real, sin forma de anularlo hasta que exista Nota de Crédito) — un estado `facturando` (Set de
+  ids en vuelo) deshabilita el botón de esa fila mientras la request está en curso, para que dos
+  clicks rápidos no pasen ambos la validación de "no tiene factura emitida" del backend antes de
+  que el primer commit termine. Banner ámbar arriba de la tabla (mismo estilo que `Movimientos.jsx`)
+  con la cuenta de pedidos pendientes de facturar y un toggle "ver solo pendientes".
+
 ## Convenciones de código
 
 - **Backend**: nombres de tablas, campos, funciones y mensajes de error en español. Sin Alembic (ver nota
@@ -1093,3 +1171,7 @@ que probar yo a mano en mi navegador antes de dar el cambio por bueno.
 - Normalización de tildes en el matching de importación (ver "gap conocido" arriba).
 - Columna `CodigoProducto` opcional en la planilla de importación, como fallback de búsqueda si el
   matching por nombre empieza a dar falsos duplicados.
+- Comprobante imprimible con código QR para las Facturas emitidas (Fase C solo pide y guarda el
+  CAE, no genera nada imprimible todavía).
+- Opción de facturar con los datos reales del comprador (DNI/CUIT) en vez de Consumidor Final
+  fijo — la Fase C siempre factura como Consumidor Final, sin pedirle datos a nadie.

@@ -303,6 +303,7 @@ class Pedido(Base):
     total = Column(Numeric(12, 2), nullable=False)
 
     items = relationship("PedidoItem", back_populates="pedido", cascade="all, delete-orphan")
+    facturas = relationship("Factura", back_populates="pedido", cascade="all, delete-orphan")
 
 
 class PedidoItem(Base):
@@ -325,6 +326,35 @@ class PedidoItem(Base):
     producto = relationship("Producto")
     variante = relationship("Variante")
     movimiento = relationship("Movimiento")
+
+
+class Factura(Base):
+    """Intento de facturación ARCA (WSFEv1) de un Pedido — Fase C. Un pedido puede tener más de
+    una fila con el tiempo (intentos fallidos, y a futuro una Nota de Crédito), por eso no es
+    una relación 1:1 forzada. `tipo_comprobante` es un campo propio (no hardcodeado en la
+    query) porque una futura Nota de Crédito C usaría 13 en esta misma tabla, aunque esta fase
+    solo emite 11 (Factura C). `punto_venta` es un snapshot del valor de `configuracion` al
+    momento de facturar, no una referencia viva. `doc_tipo`/`doc_nro` default a Consumidor
+    Final (99/0) pero `facturacion.py` siempre los pasa explícitos al crear la fila — el
+    default de columna es solo una red de seguridad, no la fuente de verdad."""
+    __tablename__ = "facturas"
+
+    id = Column(Integer, primary_key=True, index=True)
+    pedido_id = Column(Integer, ForeignKey("pedidos.id", ondelete="CASCADE"), nullable=False)
+    tipo_comprobante = Column(Integer, nullable=False, default=11)  # 11 = Factura C
+    punto_venta = Column(Integer, nullable=False)
+    numero_comprobante = Column(Integer, nullable=True)
+    cae = Column(String(20), nullable=True)
+    cae_vencimiento = Column(Date, nullable=True)
+    fecha_emision = Column(DateTime(timezone=True), nullable=True)
+    importe_total = Column(Numeric(12, 2), nullable=False)
+    doc_tipo = Column(Integer, nullable=False, default=99)  # 99 = Consumidor Final
+    doc_nro = Column(Integer, nullable=False, default=0)
+    estado = Column(String(20), nullable=False)  # "Emitida" | "Error"
+    mensaje_error = Column(Text, nullable=True)  # también guarda observaciones de ARCA en éxito
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    pedido = relationship("Pedido", back_populates="facturas")
 
 
 class ReservaStock(Base):

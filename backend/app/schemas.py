@@ -236,10 +236,32 @@ class PedidoItemOut(BaseModel):
     producto: Optional[Producto] = None
 
 
+class FacturaOut(BaseModel):
+    """Intento de facturación ARCA de un Pedido (Fase C) — ver models.Factura."""
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    pedido_id: int
+    tipo_comprobante: int
+    punto_venta: int
+    numero_comprobante: Optional[int]
+    cae: Optional[str]
+    cae_vencimiento: Optional[date]
+    fecha_emision: Optional[datetime]
+    importe_total: Decimal
+    doc_tipo: int
+    doc_nro: int
+    estado: str
+    mensaje_error: Optional[str]
+    created_at: datetime
+
+
 class PedidoOut(BaseModel):
     """Pedido unificado (Fase B), cualquier canal. `canal`/`facturar_arca` son campos
     aditivos sobre lo que antes era OrdenEcommerceOut — el storefront (POST /ecommerce/ordenes)
-    solo lee `id` de la respuesta, así que agregarlos no rompe su contrato."""
+    solo lee `id` de la respuesta, así que agregarlos no rompe su contrato. `monto_neto` (Fase
+    C) no es un atributo del ORM — lo completa a mano el router (`_pedido_out`) llamando a
+    calculations.monto_neto_pedido; el default acá es solo para que model_validate no falle si
+    algún caller se olvida de setearlo, nunca el valor real."""
     model_config = ConfigDict(from_attributes=True)
     id: int
     fecha: datetime
@@ -254,7 +276,9 @@ class PedidoOut(BaseModel):
     notas: Optional[str]
     metodo_pago_preferido: Optional[str]
     total: Decimal
+    monto_neto: Decimal = Decimal("0")
     items: list[PedidoItemOut] = []
+    facturas: list[FacturaOut] = []
 
 
 class PedidoLocalCreate(BaseModel):

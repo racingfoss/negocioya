@@ -814,6 +814,16 @@ TIPOS_MOVIMIENTO_VALIDOS = ("Venta", "Ingreso", "Egreso")
 ESTADOS_PEDIDO_VALIDOS = ("Pendiente", "Preparando", "Listo para retirar", "Enviado", "Entregado", "Cancelado")
 
 
+def monto_neto_pedido(db: Session, pedido: "models.Pedido") -> Decimal:
+    """Pedido.total menos lo ya devuelto de ese pedido. Hoy no existe Devolucion/DevolucionItem
+    en el proyecto (confirmado por búsqueda en todo el repo), así que devuelve pedido.total tal
+    cual. Cuando se agregue esa funcionalidad: restar, por cada DevolucionItem cuyo PedidoItem
+    pertenezca a este pedido, cantidad × precio_unitario del PedidoItem original. Recibe el
+    objeto Pedido ya cargado (no un id) para no re-consultarlo — se llama en loop desde
+    GET /pedidos, sobre pedidos que el caller ya tiene en memoria."""
+    return pedido.total
+
+
 # ---------------------------------------------------------------------------
 # Única función de este módulo que lanza HTTPException — excepción deliberada a
 # la convención "los routers validan, calculations calcula". Se justifica porque
