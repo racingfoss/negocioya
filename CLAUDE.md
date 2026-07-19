@@ -585,6 +585,27 @@ una fase futura no planificada todavía.
 - **`/carrito`** (Client Component completo, necesita `useCart()`): lista de líneas con foto,
   nombre, variante, cantidad editable (tope por línea), subtotal, botón "Sacar", total general y
   link a `/checkout`. Vacío: mensaje + link a `/`.
+  - **Revalidación de stock al montar `/carrito`** (ronda posterior): el `stock_actual` guardado en
+    cada `CartItem` es un snapshot de cuando se agregó el producto — si el carrito queda abierto un
+    rato, puede estar viejo. `app/carrito/actions.ts` (`"use server"`) expone
+    `obtenerStockFresco(productoIds)`, que por cada `producto_id` **distinto** presente en el
+    carrito pega a `GET /ecommerce/catalogo/{id}` (el mismo endpoint de siempre, sin endpoint nuevo)
+    con `fetch(..., { cache: "no-store" })` — a propósito no reusa `getProducto()`/`apiFetch()` de
+    `lib/api.ts`, que trae `next: { revalidate: 60 }`: sin bypasear esa cache, esta revalidación
+    podría devolver el mismo stock viejo que ya está en el carrito durante hasta 60s, justo el caso
+    que existe para cubrir. `page.tsx` la llama en un único `useEffect` al montar (no en cada cambio
+    de `items`, no hace falta pooling) y guarda el resultado en un `Record<producto_id,
+    StockFrescoProducto | null>` (`null` = el producto ya no existe o dejó de estar
+    activo/`visible_ecommerce`, se trata como stock 0). Por línea: `stockFrescoDeLinea()` resuelve
+    el stock fresco (de la variante puntual si tiene, si no del producto) y decide el aviso — nada
+    si alcanza, "Solo quedan N disponibles" (ámbar, no bloquea) si alcanza parcial, "Ya no hay
+    stock..." (rojo) si es 0. Con cualquier línea en 0, el link a `/checkout` se reemplaza por un
+    botón deshabilitado hasta que se ajuste o saque esa línea — el checkout ya rechaza atómicamente
+    de más, pero no tiene sentido dejar avanzar a algo que se sabe que va a fallar. Mientras la
+    revalidación no llegó (`undefined` en el record) no se muestra ningún aviso, sin spinner —
+    aceptable que aparezca un instante después de que la página ya se vio. **No implementa reserva
+    de stock** (eso sería para el lado de FashBalance/Caja, no para el storefront) — es solo refrescar
+    el dato para avisar mejor.
 - **`/checkout` — Server Action con lógica real separada, a propósito**: `src/lib/checkout.ts`
   expone `procesarCheckout(carrito, datosContacto)`, que arma el payload real y le pega a
   `POST /ecommerce/ordenes` con la `X-API-Key` (nunca en código de cliente) usando `fetch` con
