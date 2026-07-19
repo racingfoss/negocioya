@@ -203,6 +203,9 @@ class Configuracion(Base):
     motor_decoracion_pareto_pct = Column(Numeric(5, 2), nullable=False, default=80.0)
     mix_real_ventana_dias_default = Column(Integer, nullable=False, default=30)
     snapshot_periodo_dias = Column(Integer, nullable=False, default=30)
+    # Minutos de vida de una reserva de stock para un pedido en armado en Caja — ver
+    # ReservaStock más abajo y la sección "Reserva de stock" en CLAUDE.md.
+    reserva_stock_minutos = Column(Integer, nullable=False, default=20)
     # Identidad de la tienda para el storefront (ecommerce/) — reemplaza a las env vars fijas
     # WHATSAPP_NUMERO/INSTAGRAM_URL/FACEBOOK_URL de la Fase 1, editable sin rebuild.
     # Expuesto al storefront vía GET /ecommerce/configuracion-tienda (schema dedicado, con
@@ -322,3 +325,32 @@ class PedidoItem(Base):
     producto = relationship("Producto")
     variante = relationship("Variante")
     movimiento = relationship("Movimiento")
+
+
+class ReservaStock(Base):
+    """Reserva efímera de stock para un pedido en armado en Caja (Fase B+). Vence sola por
+    tiempo — cualquier cálculo de disponibilidad (calculations.stock_disponible) ignora las
+    filas con expira_en <= now(), sin que nadie tenga que borrarlas para que dejen de bloquear.
+    Limpieza física oportunista dentro de calculations.reservar_stock(), no hay cron ni
+    BackgroundTask. `expira_en` no lleva default de columna porque depende de
+    configuracion.reserva_stock_minutos (dinámico) — se calcula explícito en Python. Sin
+    relationships hacia Producto/Variante: no hace falta navegar desde ahí, mismo criterio
+    minimalista que MixSnapshot.
+
+    `nombre_producto`/`descripcion_variante`/`precio_unitario` son denormalizados a propósito
+    (mismo criterio ya documentado para PedidoItem/MixSnapshot): se completan en
+    calculations.reservar_stock() a partir del Producto/Variante en el momento de reservar, para
+    que GET /reservas alcance para reconstruir el carrito visual de Movimientos.jsx tras un
+    refresh de página, sin round-trips extra a /productos ni /productos/{id}/variantes."""
+    __tablename__ = "reservas_stock"
+
+    id = Column(Integer, primary_key=True, index=True)
+    sesion_id = Column(String(64), nullable=False, index=True)
+    producto_id = Column(Integer, ForeignKey("productos.id", ondelete="CASCADE"), nullable=False)
+    variante_id = Column(Integer, ForeignKey("variantes.id", ondelete="CASCADE"), nullable=True)
+    cantidad = Column(Integer, nullable=False)
+    creado_en = Column(DateTime(timezone=True), server_default=func.now())
+    expira_en = Column(DateTime(timezone=True), nullable=False)
+    nombre_producto = Column(String(200), nullable=True)
+    descripcion_variante = Column(String(255), nullable=True)
+    precio_unitario = Column(Numeric(12, 2), nullable=True)

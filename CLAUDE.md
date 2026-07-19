@@ -327,6 +327,7 @@ sale el número.
 | `motor_decoracion_pareto_pct` | 80.0 | % de Pareto usado como fallback de "Motor vs Decoración" en `analisis_combinado` cuando no hay costos fijos cargados. |
 | `mix_real_ventana_dias_default` | 30 | Solo afecta al frontend: con cuántos días viene tildado por defecto el selector de ventana al abrir el Punto de Equilibrio (el selector 7/30/90 sigue existiendo igual, esto no lo reemplaza). |
 | `snapshot_periodo_dias` | 30 | Cada cuántos días corresponde tomar un snapshot del mix real (ver sección siguiente). |
+| `reserva_stock_minutos` | 20 | Minutos de vida de una reserva de stock para un pedido en armado en Caja. Ver sección "Reserva de stock" más abajo. |
 | `arca_cuit` | `null` | CUIT que se usa para pedir el CAE a ARCA (WSFEv1). Ver sección "Facturación electrónica (Fase A)" más abajo. |
 | `arca_punto_venta_defecto` | 1 | Punto de venta habilitado en ARCA usado para `FECompUltimoAutorizado`/`FECAESolicitar`. |
 | `arca_razon_social` | `null` | Nombre completo para el comprobante. Todavía sin uso en código (fase pendiente del PDF/impresión). |
@@ -863,6 +864,174 @@ todavía (eso es una fase futura). El storefront Next.js (`ecommerce/`) no se to
 - **Qué NO se tocó**: `backend/app/arca/`, `ecommerce/` (storefront Next.js), la interfaz pública de
   `calculations.registrar_venta`/`validar_movimiento`/`stock_disponible` (se reusan sin cambiar firma),
   `Compras.jsx` (tiene su propia copia de la lógica de selectores, independiente de `Movimientos.jsx`).
+
+## Reserva de stock (pedido en armado en Caja)
+
+Mientras Florencia arma un pedido tipo Venta con varias líneas en Caja (`Movimientos.jsx`), esas
+unidades tienen que dejar de estar disponibles para cualquier otra venta (e-commerce u otro pedido
+local) mientras el pedido se termina de armar y confirmar, sin bloquear el stock para siempre si el
+pedido nunca se confirma. Alcance acotado a propósito: sin scheduler ni worker de limpieza — mismo
+criterio "lazy" que ya usa el proyecto para los snapshots del mix real.
+
+- **Tabla `reservas_stock`** (`backend/app/models.py`, clase `ReservaStock`): `sesion_id` (string,
+  UUID generado en el frontend al arrancar un pedido nuevo en Caja — ver más abajo), `producto_id`,
+  `variante_id` (nullable), `cantidad`, `creado_en`, `expira_en`, y 3 columnas denormalizadas
+  (`nombre_producto`, `descripcion_variante`, `precio_unitario`, agregadas en una ronda posterior
+  — ver más abajo "Reconstrucción del carrito al refrescar"). Sin relationships hacia
+  `Producto`/`Variante` (no hace falta navegar desde ahí, mismo criterio minimalista que
+  `MixSnapshot`). Tabla nueva → no necesitó `ALTER TABLE` en su alta original, pero las 3 columnas
+  denormalizadas sí (tabla ya existente para ese momento): `ALTER TABLE reservas_stock ADD COLUMN
+  nombre_producto VARCHAR(200); ALTER TABLE reservas_stock ADD COLUMN descripcion_variante
+  VARCHAR(255); ALTER TABLE reservas_stock ADD COLUMN precio_unitario NUMERIC(12,2);`.
+- **`reserva_stock_minutos`** (config, default 20): TTL de una reserva. Ver tabla de "Configuración
+  del negocio" más arriba. Editable desde ⚙️ Configuración (`frontend/src/pages/Configuracion.jsx`,
+  grupo "Stock y Reposición") — se agregó como un campo más de ese formulario genérico
+  data-driven (`GRUPOS`), mismo patrón que el resto de los campos numéricos de esa pantalla, sin
+  lógica especial.
+- **Vencimiento 100% pasivo, sin borrado activo**: una reserva vence sola por tiempo. Cualquier
+  cálculo de disponibilidad simplemente ignora las filas con `expira_en <= now()`
+  (`calculations.stock_disponible` filtra `ReservaStock.expira_en > func.now()`, comparación hecha
+  del lado de la base para no depender de que el reloj de la app y el de Postgres coincidan) — una
+  reserva vencida deja de "contar" en el instante exacto en que vence, sin que nadie tenga que
+  borrarla. El borrado físico de filas viejas es oportunista: `calculations.reservar_stock()`, cada
+  vez que crea/actualiza una reserva, de paso borra las que vencieron hace más de un día. No hay
+  cron ni `BackgroundTask` — mismo argumento ya usado para `verificar_y_tomar_snapshot_si_corresponde`
+  en la sección de snapshots del mix real: el atraso máximo real (hasta que alguien vuelva a tocar
+  `POST /reservas`) no justifica la complejidad de un scheduler de verdad.
+- **`stock_disponible` (extendida, no duplicada)**: ganó un parámetro `excluir_sesion:
+  Optional[str] = None`, retrocompatible (default `None`, los call sites existentes —
+  `validar_movimiento`, `routers/pedidos.py`, `routers/ecommerce.py` — no lo pasan y automáticamente
+  pasan a ser reservation-aware: cuentan TODAS las reservas activas de cualquier sesión). Además de
+  lo que ya restaba (comprado - vendido), resta la suma de reservas activas del mismo
+  producto/variante, excluyendo las de `excluir_sesion` si se pasa (para que una sesión no se vea
+  bloqueada por sus propias reservas al querer agregar más del mismo producto). Con esto, una venta
+  de e-commerce que intente llevarse unidades ya reservadas por un pedido local en armado se rechaza
+  igual que si el stock ya estuviera vendido de verdad — sin tocar `registrar_venta` ni
+  `validar_movimiento`. `POST /ecommerce/ordenes` (`crear_orden`) ya usaba `stock_disponible`, así
+  que el checkout final del storefront siempre rechazó correctamente una compra que chocara con una
+  reserva activa, desde el primer día de esta feature — el gap real (corregido en la ronda
+  siguiente, ver "Catálogo de e-commerce reservation-aware" más abajo) era que el catálogo
+  (`GET /ecommerce/catalogo*`) todavía no avisaba de eso ANTES de llegar al checkout.
+- **`calculations.reservar_stock(db, sesion_id, producto_id, variante_id, cantidad)`**: valida
+  contra `stock_disponible(..., excluir_sesion=sesion_id)`; si alcanza, crea o actualiza (upsert
+  manual en Python — busca por `sesion_id`+`producto_id`+`variante_id`, mismo criterio que
+  `resolver_o_crear_variante`, sin `UniqueConstraint` de Postgres porque `NULL` no colisiona en un
+  UNIQUE compuesto) la fila con la `cantidad` nueva **reemplazando** el valor (no sumándolo — es "quiero
+  tener reservado N en total para esta línea") y `expira_en` renovado a `now() + reserva_stock_minutos`.
+  Si no alcanza, lanza `ValueError` (no `HTTPException`) — decisión deliberada para mantener el
+  invariante ya documentado de que `validar_movimiento` es la única función de `calculations.py` que
+  lanza `HTTPException`; el router (`POST /reservas`) capta el `ValueError` y arma el 400. No hace
+  `commit()` (solo `flush()`), el caller controla la transacción, mismo criterio que
+  `registrar_venta`.
+- **`calculations.liberar_reserva(db, sesion_id, producto_id=None, variante_id=None)`**: borra la
+  reserva puntual si se pasan `producto_id`/`variante_id`, o todas las de esa `sesion_id` si no —
+  "sacar un ítem del carrito en armado" y "cancelar el pedido completo" respectivamente. Tampoco
+  commitea.
+- **Endpoints — `backend/app/routers/reservas.py`**: `POST /reservas` (`{sesion_id, producto_id,
+  variante_id, cantidad}` → `reservar_stock`, 400 con el detalle si no alcanza) y `DELETE /reservas`
+  (query params `sesion_id` obligatorio + `producto_id`/`variante_id` opcionales → `liberar_reserva`).
+- **`POST /pedidos` (`routers/pedidos.py`, `crear_local`) — gotcha real encontrado al probar el
+  flujo end-to-end, no solo el diseño de arriba**: la primera versión liberaba las reservas de la
+  sesión recién antes del `db.commit()` final (después de crear los `Movimiento`). Eso rompía la
+  confirmación de un pedido cuya cantidad coincidía con lo reservado: `registrar_venta()` valida el
+  stock internamente vía `validar_movimiento()`, que llama a `stock_disponible()` **sin**
+  `excluir_sesion` (esa función no cambió de firma pública) — con la reserva propia todavía activa
+  en ese momento, se restaba dos veces contra sí misma y una confirmación 100% legítima se
+  rechazaba con "no hay stock suficiente". Fix: `liberar_reserva(db, payload.sesion_id)` se llama
+  como el PRIMER paso de la función, antes del loop de validación de líneas — sigue siendo la MISMA
+  transacción sin commit intermedio (si cualquier línea falla después, todo se revierte junto,
+  incluida esa liberación), así que no hay ninguna ventana de carrera nueva; simplemente para el
+  momento en que el resto del flujo valida stock, las reservas de esa sesión ya no existen y no se
+  cuentan dos veces. `PedidoLocalCreate` ganó un campo `sesion_id: Optional[str] = None` para esto.
+- **Frontend (`Movimientos.jsx`)**: al primer "+ Agregar al pedido" de un carrito vacío se genera un
+  `sesionId` (`crypto.randomUUID()` con fallback a un id `Date.now()+Math.random()` si esa API no
+  está disponible — este panel se accede seguido por IP de LAN sobre `http`, no `https`/`localhost`,
+  contexto en el que `crypto.randomUUID` puede no existir en algunos navegadores). `agregarAlCarrito`
+  pasa a `async`: antes de tocar el carrito visual llama `POST /reservas` con la cantidad TOTAL que
+  va a quedar reservada para esa línea (si ya había una línea del mismo producto+variante, es
+  `existente + agregado`, no solo el incremento — `reservar_stock` reemplaza el valor, no lo suma);
+  si el backend rechaza, se muestra el error y no se agrega la línea. `sacarDelCarrito` llama
+  `DELETE /reservas` para esa línea puntual antes de sacarla (best-effort: si el DELETE falla, la
+  línea se saca igual del carrito visual — la reserva vieja se autolimpia sola por TTL, no tiene
+  sentido trabar a la usuaria por un error de red en un cleanup no crítico). Nuevo botón "Cancelar
+  pedido" llama `DELETE /reservas` para toda la sesión y vacía el carrito — para no depender solo
+  del vencimiento por tiempo si Florencia decide no continuar. `confirmarPedido` manda `sesion_id` en
+  el body de `POST /pedidos` y resetea `sesionId` a `null` al confirmar con éxito.
+- **Qué NO hace esta funcionalidad**: nada de reserva real para el carrito del storefront
+  (`ecommerce/`) — sigue sin servidor detrás hasta el checkout, tal como está diseñado; ver
+  "Catálogo de e-commerce reservation-aware" más abajo para la mitigación real que sí se hizo de
+  ese lado. Nada de scheduler, worker ni tarea en segundo plano para expirar reservas.
+  `Compras.jsx` no se tocó. `registrar_venta`/`validar_movimiento` no cambiaron de firma pública.
+
+### Reconstrucción del carrito al refrescar (sin `localStorage`)
+
+Bug real encontrado al probar a mano: si se refrescaba la página de Caja mientras había un pedido
+en armado, el carrito visual desaparecía (vivía solo en memoria de React) pero la reserva de stock
+en Postgres seguía activa — bloqueaba esas unidades hasta el TTL o hasta cancelarla a mano por API,
+sin que la usuaria pudiera verlo ni actuar desde la UI. El panel tiene una convención explícita de
+no usar `localStorage`/`sessionStorage` (ver "Convenciones de código" más abajo) — la solución la
+respeta: la fuente de verdad para "hay un pedido en armado" ya es `reservas_stock`, así que alcanza
+con poder reconstruir el carrito visual a partir de esa tabla en vez de depender de un `sesionId`
+que solo vivía en memoria.
+
+- **Columnas denormalizadas en `ReservaStock`**: `nombre_producto`, `descripcion_variante`,
+  `precio_unitario` (mismo criterio ya documentado para `PedidoItem`/`MixSnapshot`). Se completan
+  en `calculations.reservar_stock()` — busca el `Producto` (nombre, precio_venta) y arma la
+  descripción de variante con el helper `descripcion_variante(db, variante_id)` (ver punto
+  siguiente) tanto al crear como al actualizar la fila. Así `GET /reservas` alcanza para
+  reconstruir el carrito sin round-trips extra a `/productos` ni `/productos/{id}/variantes`.
+- **`calculations.descripcion_variante(db, variante_id)`** (nueva función de módulo): arma el
+  texto legible de una variante (ej. "M / Verde") a partir de sus valores de atributo ordenados
+  por `ProductoAtributo.orden`. Extraída de una closure local que vivía duplicada (armaba
+  exactamente la misma query) dentro de `routers/importacion.py` — ese archivo ahora importa y
+  usa `calculations.descripcion_variante(db, variante_id)` en sus 2 call sites, sin cambiar el
+  resultado (misma query, mismo join, mismo orden).
+- **`calculations.listar_reservas_activas(db, sesion_id=None)`** (nueva): reservas vigentes
+  (`expira_en > now()`), opcionalmente acotadas a una sesión, más recientes primero.
+- **`GET /reservas`** (nuevo, `routers/reservas.py`, junto a `POST`/`DELETE`): query param
+  opcional `sesion_id`; sin filtrar devuelve TODAS las reservas activas de cualquier sesión.
+- **Frontend (`Movimientos.jsx`)**: nuevo `useEffect` al montar el componente que llama
+  `GET /reservas` sin filtrar. Si hay filas activas, se agrupan por `sesion_id` y se toma la más
+  reciente (primera del array, ya viene ordenado por `creado_en` desc) — cubre el caso raro de dos
+  sesiones activas a la vez (ej. dos pestañas) sin agregar más sofisticación, dado que es software
+  de una sola usuaria. Se reconstruye `itemsPedido` directo desde los campos denormalizados de esas
+  filas (sin llamar a ningún otro endpoint) y se restaura `sesionId`. Se muestra un aviso
+  ("Recuperamos un pedido que tenías en armado...") para que no sea un cambio silencioso — estado
+  `carritoRecuperado`, se resetea a `false` al confirmar o cancelar el pedido. El resto del flujo
+  (agregar/sacar/confirmar/cancelar) no cambió: una vez reconstruido el estado, funciona igual que
+  con un carrito armado en la sesión actual.
+
+### Catálogo de e-commerce reservation-aware
+
+Segundo bug real encontrado al probar a mano: el storefront (`ecommerce/`) dejaba agregar al
+carrito y mostraba como disponibles unidades que en realidad ya estaban reservadas por un pedido
+en armado en Caja. Investigación de código confirmó el alcance exacto: `POST /ecommerce/ordenes`
+(`crear_orden`) ya usaba `stock_disponible` (reservation-aware desde el día 1 de esta feature), así
+que el checkout final **nunca tuvo un problema de integridad de datos** — una compra que chocara
+con una reserva activa siempre se rechazó correctamente. El problema real estaba acotado a
+`GET /ecommerce/catalogo` y `GET /ecommerce/catalogo/{id}` (`routers/ecommerce.py`), que arman su
+`stock_actual` con `calculations.stock_por_producto`/`stock_por_variante` — funciones que no restan
+reservas (a propósito, ver abajo). Se confirmó además (leyendo `ecommerce/src/lib/api.ts`,
+`AddToCartButton.tsx`, `VariantSelector.tsx` y `carrito/actions.ts`) que absolutamente todo el
+número de stock que usa el storefront —tope al agregar al carrito, aviso "Solo quedan N
+disponibles"/"Ya no hay stock" en la revalidación de `/carrito`— sale directo de esos dos campos,
+sin ningún cómputo propio del lado de `ecommerce/`. Consecuencia: arreglando esos dos GET en el
+backend alcanzaba, sin tocar ni un archivo de `ecommerce/`.
+
+- **`stock_por_producto(db, considerar_reservas: bool = False)` y `stock_por_variante(db,
+  considerar_reservas: bool = False)`**: nuevo parámetro opcional, retrocompatible. Con `False`
+  (el default, para TODOS los call sites que ya existían: pantalla de Stock, dashboard,
+  BCG/`analisis_combinado`) siguen mostrando stock físico puro — decisión deliberada: son para
+  decisiones de reposición, no de venta en el instante, así que una reserva momentánea de Caja no
+  tiene por qué mover esos números. Con `True`, restan además la suma de reservas activas de cada
+  producto/variante — UNA sola query agregada (`group_by`) para todo el catálogo de una vez, mismo
+  criterio de performance que ya se cuidó al armar `stock_por_variante(db)` una sola vez para todo
+  el catálogo en la Fase 0.
+- **`routers/ecommerce.py`**: `catalogo()` y `catalogo_detalle()` pasan `considerar_reservas=True`
+  en sus llamadas a `stock_por_producto`/`stock_por_variante`. `crear_orden()` no se tocó — ya
+  estaba bien.
+- **Nada de `ecommerce/` se tocó** — confirmado por investigación de código antes de implementar,
+  no una suposición.
 
 ## Convenciones de código
 

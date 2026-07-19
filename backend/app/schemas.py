@@ -262,11 +262,34 @@ class PedidoLocalCreate(BaseModel):
     cliente_nombre: Optional[str] = None
     facturar_arca: bool = False
     notas: Optional[str] = None
+    sesion_id: Optional[str] = None
     lineas: list[LineaOrdenIn]
 
 
 class PedidoEstadoUpdate(BaseModel):
     estado: str
+
+
+# --- Reserva de stock efímera (pedido en armado en Caja) ---
+
+class ReservaStockCreate(BaseModel):
+    sesion_id: str
+    producto_id: int
+    variante_id: Optional[int] = None
+    cantidad: int
+
+
+class ReservaStockOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    sesion_id: str
+    producto_id: int
+    variante_id: Optional[int] = None
+    cantidad: int
+    expira_en: datetime
+    nombre_producto: Optional[str] = None
+    descripcion_variante: Optional[str] = None
+    precio_unitario: Optional[Decimal] = None
 
 
 # --- Stock (calculado, no se carga a mano) ---
@@ -311,6 +334,7 @@ class ConfiguracionBase(BaseModel):
     motor_decoracion_pareto_pct: Decimal
     mix_real_ventana_dias_default: int
     snapshot_periodo_dias: int
+    reserva_stock_minutos: int
     nombre_ecommerce: str = "Adorante"
     whatsapp_numero: Optional[str] = None
     instagram_url: Optional[str] = None
@@ -340,6 +364,7 @@ class ConfiguracionUpdate(BaseModel):
     motor_decoracion_pareto_pct: Optional[Decimal] = None
     mix_real_ventana_dias_default: Optional[int] = None
     snapshot_periodo_dias: Optional[int] = None
+    reserva_stock_minutos: Optional[int] = None
     nombre_ecommerce: Optional[str] = None
     whatsapp_numero: Optional[str] = None
     instagram_url: Optional[str] = None

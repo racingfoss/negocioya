@@ -60,8 +60,17 @@ def catalogo(db: Session = Depends(get_db)):
     )
 
     # los mapas de stock se calculan una sola vez para todo el catálogo, no por producto
-    stock_producto_map = {s["producto_id"]: s["stock_actual"] for s in calculations.stock_por_producto(db)}
-    stock_variante_map = {s["variante_id"]: s["stock_actual"] for s in calculations.stock_por_variante(db)}
+    # considerar_reservas=True: el stock que ve el storefront tiene que descontar las reservas
+    # activas de un pedido en armado en Caja (ver sección "Reserva de stock" en CLAUDE.md) — a
+    # diferencia de la pantalla interna de Stock, que sigue mostrando stock físico puro.
+    stock_producto_map = {
+        s["producto_id"]: s["stock_actual"]
+        for s in calculations.stock_por_producto(db, considerar_reservas=True)
+    }
+    stock_variante_map = {
+        s["variante_id"]: s["stock_actual"]
+        for s in calculations.stock_por_variante(db, considerar_reservas=True)
+    }
 
     return [_producto_a_catalogo_dict(db, p, stock_producto_map, stock_variante_map) for p in productos_db]
 
@@ -89,8 +98,17 @@ def catalogo_detalle(producto_id: int, db: Session = Depends(get_db)):
     if not p:
         raise HTTPException(404, "Producto no encontrado o no disponible en el e-commerce.")
 
-    stock_producto_map = {s["producto_id"]: s["stock_actual"] for s in calculations.stock_por_producto(db)}
-    stock_variante_map = {s["variante_id"]: s["stock_actual"] for s in calculations.stock_por_variante(db)}
+    # considerar_reservas=True: el stock que ve el storefront tiene que descontar las reservas
+    # activas de un pedido en armado en Caja (ver sección "Reserva de stock" en CLAUDE.md) — a
+    # diferencia de la pantalla interna de Stock, que sigue mostrando stock físico puro.
+    stock_producto_map = {
+        s["producto_id"]: s["stock_actual"]
+        for s in calculations.stock_por_producto(db, considerar_reservas=True)
+    }
+    stock_variante_map = {
+        s["variante_id"]: s["stock_actual"]
+        for s in calculations.stock_por_variante(db, considerar_reservas=True)
+    }
     return _producto_a_catalogo_dict(db, p, stock_producto_map, stock_variante_map)
 
 

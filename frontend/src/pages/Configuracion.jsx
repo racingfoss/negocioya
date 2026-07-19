@@ -35,6 +35,12 @@ const GRUPOS = [
         label: 'Alerta de stock estancado (días)',
         ayuda: 'Si una prenda lleva más de estos días sin venderse, se marca como estancada (rotación lenta).',
       },
+      {
+        key: 'reserva_stock_minutos',
+        label: 'Minutos de reserva al armar un pedido en Caja',
+        ayuda:
+          'Mientras armás un pedido en Caja, el stock de cada línea agregada queda reservado por esta cantidad de minutos (así no te lo puede "robar" una venta de e-commerce mientras terminás de armarlo). Si no confirmás ni cancelás el pedido a tiempo, la reserva vence sola.',
+      },
     ],
   },
   {

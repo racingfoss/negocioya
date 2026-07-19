@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from .database import Base, engine
 from .routers import (
     atributos, categorias, compras, configuracion, costos_fijos, dashboard, ecommerce, importacion,
-    mix_snapshots, movimientos, pedidos, productos, stock,
+    mix_snapshots, movimientos, pedidos, productos, reservas, stock,
 )
 
 Base.metadata.create_all(bind=engine)
@@ -42,6 +42,7 @@ app.include_router(configuracion.router)
 app.include_router(mix_snapshots.router)
 app.include_router(ecommerce.router)
 app.include_router(pedidos.router)
+app.include_router(reservas.router)
 
 
 @app.get("/")

@@ -156,6 +156,29 @@ def resolver_o_crear_variante(db: Session, producto_id: int, valor_ids: list[int
     return variante
 
 
+def descripcion_variante(db: Session, variante_id: Optional[int]) -> Optional[str]:
+    """Texto legible de una variante (ej. "M / Verde"), armado a partir de sus valores de
+    atributo ordenados por ProductoAtributo.orden. Extraída de una closure local que vivía
+    duplicada en routers/importacion.py (armaba la misma query dos veces) — se reusa acá y
+    también desde reservar_stock() para denormalizar el nombre de línea de una reserva."""
+    if variante_id is None:
+        return None
+    filas = (
+        db.query(models.ValorAtributo.valor, models.ProductoAtributo.orden)
+        .join(models.VarianteValor, models.VarianteValor.valor_atributo_id == models.ValorAtributo.id)
+        .join(models.Variante, models.VarianteValor.variante_id == models.Variante.id)
+        .join(
+            models.ProductoAtributo,
+            (models.ProductoAtributo.producto_id == models.Variante.producto_id)
+            & (models.ProductoAtributo.atributo_id == models.ValorAtributo.atributo_id),
+        )
+        .filter(models.VarianteValor.variante_id == variante_id)
+        .order_by(models.ProductoAtributo.orden)
+        .all()
+    )
+    return " / ".join(v for v, _ in filas)
+
+
 # ---------------------------------------------------------------------------
 # Panel de control: caja
 # "Venta" e "Ingreso" suman a la caja; "Egreso" resta.
@@ -480,19 +503,35 @@ def _estado_stock(
     return "OK", False
 
 
-def stock_por_producto(db: Session) -> list:
+def stock_por_producto(db: Session, considerar_reservas: bool = False) -> list:
+    """`considerar_reservas` (default False, retrocompatible con todos los call sites existentes
+    — pantalla de Stock, dashboard, BCG/analisis_combinado — que deliberadamente siguen mostrando
+    stock físico puro para decisiones de reposición, sin descontar reservas momentáneas de un
+    pedido en armado en Caja). Cuando es True (usado por GET /ecommerce/catalogo*, ver
+    routers/ecommerce.py), resta además la suma de reservas activas de cada producto — mismo
+    criterio que stock_disponible, pero calculado en una sola query agregada para todo el
+    catálogo de una vez, no una consulta por producto."""
     config = get_configuracion(db)
     productos = db.query(models.Producto).filter(models.Producto.activo.is_(True)).all()
     ventas_total = unidades_vendidas_por_producto(db, dias=None)
     ventas_ventana = unidades_vendidas_por_producto(db, dias=config.demanda_ventana_dias)
     hoy = date.today()
 
+    reservas_map: dict = {}
+    if considerar_reservas:
+        reservas_map = dict(
+            db.query(models.ReservaStock.producto_id, func.sum(models.ReservaStock.cantidad))
+            .filter(models.ReservaStock.expira_en > func.now())
+            .group_by(models.ReservaStock.producto_id)
+            .all()
+        )
+
     resultado = []
     for p in productos:
         compras = db.query(models.Compra).filter(models.Compra.producto_id == p.id).all()
         total_comprado = sum(c.cantidad for c in compras)
         total_vendido = ventas_total.get(p.id, 0)
-        stock_actual = total_comprado - total_vendido
+        stock_actual = total_comprado - total_vendido - reservas_map.get(p.id, 0)
         dias_en_stock = _fifo_dias_en_stock(compras, total_vendido, hoy) if stock_actual > 0 else None
         alerta_rotacion = dias_en_stock is not None and dias_en_stock > config.rotacion_alerta_dias
 
@@ -567,19 +606,30 @@ def stock_por_categoria(db: Session, rollup: bool = False) -> list:
 # por producto_id, que siempre está poblado (con o sin variante), así que ya
 # dan el total correcto sin necesidad de reescribirlos.
 # ---------------------------------------------------------------------------
-def stock_por_variante(db: Session) -> list:
+def stock_por_variante(db: Session, considerar_reservas: bool = False) -> list:
+    """Ver docstring de stock_por_producto — mismo parámetro `considerar_reservas`, mismo default
+    retrocompatible. Acá la reserva se resta por variante_id puntual, no por producto_id."""
     config = get_configuracion(db)
     variantes = db.query(models.Variante).filter(models.Variante.activo.is_(True)).all()
     ventas_total = unidades_vendidas_por_variante(db, dias=None)
     ventas_ventana = unidades_vendidas_por_variante(db, dias=config.demanda_ventana_dias)
     hoy = date.today()
 
+    reservas_map: dict = {}
+    if considerar_reservas:
+        reservas_map = dict(
+            db.query(models.ReservaStock.variante_id, func.sum(models.ReservaStock.cantidad))
+            .filter(models.ReservaStock.expira_en > func.now(), models.ReservaStock.variante_id.isnot(None))
+            .group_by(models.ReservaStock.variante_id)
+            .all()
+        )
+
     resultado = []
     for v in variantes:
         compras = db.query(models.Compra).filter(models.Compra.variante_id == v.id).all()
         total_comprado = sum(c.cantidad for c in compras)
         total_vendido = ventas_total.get(v.id, 0)
-        stock_actual = total_comprado - total_vendido
+        stock_actual = total_comprado - total_vendido - reservas_map.get(v.id, 0)
         dias_en_stock = _fifo_dias_en_stock(compras, total_vendido, hoy) if stock_actual > 0 else None
         alerta_rotacion = dias_en_stock is not None and dias_en_stock > config.rotacion_alerta_dias
 
@@ -610,10 +660,25 @@ def stock_por_variante(db: Session) -> list:
     return resultado
 
 
-def stock_disponible(db: Session, producto_id: int, variante_id: Optional[int] = None) -> int:
-    """Unidades disponibles ahora mismo (total comprado - total vendido), acotado a un producto o
-    a una variante puntual. Mismo cálculo que stock_por_producto/stock_por_variante, pero sin
-    recorrer todo el catálogo — pensado para validar una Venta puntual (POST/PUT /movimientos)."""
+def stock_disponible(
+    db: Session,
+    producto_id: int,
+    variante_id: Optional[int] = None,
+    excluir_sesion: Optional[str] = None,
+) -> int:
+    """Unidades disponibles ahora mismo (total comprado - total vendido - reservas activas),
+    acotado a un producto o a una variante puntual. Mismo cálculo que
+    stock_por_producto/stock_por_variante, pero sin recorrer todo el catálogo — pensado para
+    validar una Venta puntual (POST/PUT /movimientos, POST /pedidos, POST /ecommerce/ordenes).
+
+    Reservas activas (ReservaStock con expira_en > now(), ver reservar_stock/liberar_reserva)
+    también restan — una reserva de un pedido en armado en Caja bloquea esas unidades para
+    cualquier otra venta, igual que si ya estuvieran vendidas. `excluir_sesion` existe para que
+    una sesión no se vea bloqueada por sus propias reservas al querer agregar más del mismo
+    producto (lo usa reservar_stock al validar antes de upsertear). Parámetro nuevo con default
+    None, así los call sites existentes (validar_movimiento, routers/pedidos.py,
+    routers/ecommerce.py) siguen funcionando sin tocarlos — y de paso pasan a ser
+    reservation-aware automáticamente, que es el comportamiento deseado."""
     if variante_id is not None:
         total_comprado = db.query(func.coalesce(func.sum(models.Compra.cantidad), 0)).filter(
             models.Compra.variante_id == variante_id
@@ -628,7 +693,115 @@ def stock_disponible(db: Session, producto_id: int, variante_id: Optional[int] =
         total_vendido = db.query(func.coalesce(func.sum(models.Movimiento.cantidad), 0)).filter(
             models.Movimiento.tipo == "Venta", models.Movimiento.producto_id == producto_id
         ).scalar()
-    return int(total_comprado) - int(total_vendido)
+
+    reservas_q = db.query(func.coalesce(func.sum(models.ReservaStock.cantidad), 0)).filter(
+        models.ReservaStock.expira_en > func.now()
+    )
+    if variante_id is not None:
+        reservas_q = reservas_q.filter(models.ReservaStock.variante_id == variante_id)
+    else:
+        reservas_q = reservas_q.filter(models.ReservaStock.producto_id == producto_id)
+    if excluir_sesion is not None:
+        reservas_q = reservas_q.filter(models.ReservaStock.sesion_id != excluir_sesion)
+    reservado = reservas_q.scalar()
+
+    return int(total_comprado) - int(total_vendido) - int(reservado)
+
+
+# ---------------------------------------------------------------------------
+# Reserva de stock efímera para un pedido en armado en Caja (Fase B+) — ver la
+# sección "Reserva de stock" en CLAUDE.md para el mecanismo completo. Vence
+# sola por tiempo (stock_disponible ya ignora expira_en <= now()), no hay
+# scheduler ni BackgroundTask que las borre para que dejen de bloquear.
+# reservar_stock lanza ValueError (no HTTPException) cuando no alcanza el
+# stock: mantiene el invariante de que validar_movimiento es la única función
+# de este módulo que lanza HTTPException — el router (POST /reservas) capta el
+# ValueError y lo convierte en un 400 con el mismo detalle.
+# ---------------------------------------------------------------------------
+def reservar_stock(
+    db: Session, sesion_id: str, producto_id: int, variante_id: Optional[int], cantidad: int
+) -> models.ReservaStock:
+    disponible = stock_disponible(db, producto_id, variante_id, excluir_sesion=sesion_id)
+    if cantidad > disponible:
+        referencia = "esta variante" if variante_id else "este producto"
+        raise ValueError(
+            f"No hay stock suficiente para {referencia}: disponible {disponible}, pediste {cantidad}."
+        )
+
+    existente = (
+        db.query(models.ReservaStock)
+        .filter(
+            models.ReservaStock.sesion_id == sesion_id,
+            models.ReservaStock.producto_id == producto_id,
+            models.ReservaStock.variante_id == variante_id,  # SQLAlchemy traduce None a IS NULL
+        )
+        .first()
+    )
+    expira = datetime.now(timezone.utc) + timedelta(
+        minutes=int(get_configuracion(db).reserva_stock_minutos)
+    )
+    # Datos denormalizados de display (nombre, precio, descripción de variante) — mismo criterio
+    # ya documentado para PedidoItem/MixSnapshot: así GET /reservas alcanza para reconstruir el
+    # carrito visual de Movimientos.jsx tras un refresh de página, sin round-trips extra a
+    # /productos o /productos/{id}/variantes.
+    producto = db.get(models.Producto, producto_id)
+    nombre_producto = producto.nombre if producto else None
+    precio_unitario = producto.precio_venta if producto else None
+    desc_variante = descripcion_variante(db, variante_id)
+    if existente:
+        existente.cantidad = cantidad  # reemplaza el total reservado, no lo acumula
+        existente.expira_en = expira
+        existente.nombre_producto = nombre_producto
+        existente.precio_unitario = precio_unitario
+        existente.descripcion_variante = desc_variante
+        reserva = existente
+    else:
+        reserva = models.ReservaStock(
+            sesion_id=sesion_id,
+            producto_id=producto_id,
+            variante_id=variante_id,
+            cantidad=cantidad,
+            expira_en=expira,
+            nombre_producto=nombre_producto,
+            precio_unitario=precio_unitario,
+            descripcion_variante=desc_variante,
+        )
+        db.add(reserva)
+
+    # limpieza física oportunista de reservas muy vencidas — no una tarea aparte
+    db.query(models.ReservaStock).filter(
+        models.ReservaStock.expira_en < datetime.now(timezone.utc) - timedelta(days=1)
+    ).delete(synchronize_session=False)
+
+    db.flush()  # reserva.id disponible sin comprometer la transacción — el caller controla el commit
+    return reserva
+
+
+def liberar_reserva(
+    db: Session, sesion_id: str, producto_id: Optional[int] = None, variante_id: Optional[int] = None
+) -> None:
+    """Borra la reserva puntual (producto_id/variante_id) o todas las de la sesión (si no se
+    pasan) — 'sacar un ítem del carrito en armado' y 'cancelar el pedido completo'
+    respectivamente. No hace commit: el caller controla la transacción (en POST /pedidos, se
+    llama en la MISMA transacción que crea los Movimiento reales, antes del commit final)."""
+    q = db.query(models.ReservaStock).filter(models.ReservaStock.sesion_id == sesion_id)
+    if producto_id is not None:
+        q = q.filter(
+            models.ReservaStock.producto_id == producto_id,
+            models.ReservaStock.variante_id == variante_id,
+        )
+    q.delete(synchronize_session=False)
+
+
+def listar_reservas_activas(db: Session, sesion_id: Optional[str] = None) -> list["models.ReservaStock"]:
+    """Reservas vigentes (expira_en > now()), opcionalmente acotadas a una sesión, más recientes
+    primero. Usado por GET /reservas — en particular por Movimientos.jsx al montar, para
+    reconstruir un pedido en armado que quedó "huérfano" en el backend tras un refresh de
+    página (el sesion_id solo vivía en memoria de React, la reserva en Postgres sigue viva)."""
+    q = db.query(models.ReservaStock).filter(models.ReservaStock.expira_en > func.now())
+    if sesion_id is not None:
+        q = q.filter(models.ReservaStock.sesion_id == sesion_id)
+    return q.order_by(models.ReservaStock.creado_en.desc()).all()
 
 
 TIPOS_MOVIMIENTO_VALIDOS = ("Venta", "Ingreso", "Egreso")

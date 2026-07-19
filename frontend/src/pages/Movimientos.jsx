@@ -8,6 +8,12 @@ const nowLocal = () => {
   return d.toISOString().slice(0, 16) // formato datetime-local: YYYY-MM-DDTHH:mm
 }
 
+// crypto.randomUUID() requiere contexto seguro (https o localhost) en varios navegadores — este
+// panel se accede seguido por IP de LAN sobre http (ver CLAUDE.md, nota de VITE_API_URL), donde
+// esa función puede no existir. Fallback simple si no está disponible.
+const generarSesionId = () =>
+  crypto?.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+
 const empty = {
   tipo: 'Venta',
   categoria_id: '',
@@ -42,6 +48,12 @@ export default function Movimientos() {
   const [itemsPedido, setItemsPedido] = useState([])
   const [facturarArca, setFacturarArca] = useState(false)
   const [clienteNombreCarrito, setClienteNombreCarrito] = useState('')
+  // Identifica este carrito en armado ante el backend de reservas de stock (POST/DELETE /reservas):
+  // se genera al agregar el primer ítem de un carrito vacío y se resetea al confirmar/cancelar.
+  const [sesionId, setSesionId] = useState(null)
+  // true si itemsPedido se reconstruyó desde reservas activas del backend (ver useEffect de abajo),
+  // para avisarle a la usuaria que no es un carrito nuevo vacío.
+  const [carritoRecuperado, setCarritoRecuperado] = useState(false)
 
   const cargar = () => {
     api.get('/movimientos').then((r) => setMovimientos(r.data))
@@ -51,6 +63,34 @@ export default function Movimientos() {
   }
   useEffect(() => {
     cargar()
+  }, [])
+
+  // Si al entrar a la pantalla ya hay reservas de stock activas (ej. la usuaria armó un pedido y
+  // refrescó la página antes de confirmarlo o cancelarlo), se reconstruye el carrito visual a
+  // partir de esas reservas en vez de perderlo — la reserva en Postgres es la fuente de verdad,
+  // el sesionId en memoria de React no. Sin localStorage: se arma 100% desde GET /reservas.
+  useEffect(() => {
+    api.get('/reservas').then((r) => {
+      const activas = r.data
+      if (activas.length === 0) return
+      // se queda con la sesión más reciente (primera, ya viene ordenado por creado_en desc) —
+      // cubre el caso raro de dos carritos activos a la vez sin agregar más complejidad.
+      const sesionMasReciente = activas[0].sesion_id
+      const deEstaSesion = activas.filter((a) => a.sesion_id === sesionMasReciente)
+      setSesionId(sesionMasReciente)
+      setItemsPedido(
+        deEstaSesion.map((a) => ({
+          key: `${a.producto_id}-${a.variante_id ?? 'sv'}-${a.id}`,
+          producto_id: a.producto_id,
+          variante_id: a.variante_id,
+          nombre_producto: a.nombre_producto,
+          descripcion_variante: a.descripcion_variante,
+          cantidad: a.cantidad,
+          precio_unitario: Number(a.precio_unitario),
+        }))
+      )
+      setCarritoRecuperado(true)
+    })
   }, [])
 
   const categoriasArbol = aplanarArbol(categorias)
@@ -222,8 +262,10 @@ export default function Movimientos() {
 
   // Agrega el ítem resuelto (producto + variante si aplica + cantidad) al pedido en armado, en vez
   // de guardarlo directo — mismas validaciones que guardar() tenía para una Venta nueva, pero contra
-  // el tope ajustado por lo que ya está en el carrito.
-  const agregarAlCarrito = () => {
+  // el tope ajustado por lo que ya está en el carrito. Antes de tocar el carrito visual, reserva el
+  // stock contra el backend (POST /reservas) — si otra sesión (otro pedido en armado, o el checkout
+  // de e-commerce) ya se llevó ese stock, el backend rechaza y acá no se agrega la línea.
+  const agregarAlCarrito = async () => {
     setError('')
     if (!productoSeleccionado) {
       setError('Elegí un producto.')
@@ -248,18 +290,36 @@ export default function Movimientos() {
       )
       return
     }
+    const varianteId = varianteResuelta?.id || null
+    const existente = itemsPedido.find(
+      (i) => i.producto_id === productoSeleccionado.id && (i.variante_id || null) === varianteId
+    )
+    // reservar_stock reemplaza el total reservado de la línea, no lo suma — hay que mandar la
+    // cantidad TOTAL que va a quedar en el carrito para esta línea, no solo lo que se agrega ahora.
+    const cantidadTotalLinea = (existente?.cantidad || 0) + cantidad
+    const sesion = sesionId || generarSesionId()
+    if (!sesionId) setSesionId(sesion)
+    try {
+      await api.post('/reservas', {
+        sesion_id: sesion,
+        producto_id: productoSeleccionado.id,
+        variante_id: varianteId,
+        cantidad: cantidadTotalLinea,
+      })
+    } catch (e) {
+      setError(getErrorMessage(e))
+      return
+    }
     const descripcionVariante = varianteResuelta
       ? atributosProducto
           .map((a) => varianteResuelta.valores.find((x) => x.atributo_id === a.atributo_id)?.valor)
           .filter(Boolean)
           .join(' / ')
       : null
-    const varianteId = varianteResuelta?.id || null
     setItemsPedido((prev) => {
       // si ya hay una línea del mismo producto+variante, se suma la cantidad en vez de duplicar la línea
-      const existente = prev.find((i) => i.producto_id === productoSeleccionado.id && (i.variante_id || null) === varianteId)
       if (existente) {
-        return prev.map((i) => (i.key === existente.key ? { ...i, cantidad: i.cantidad + cantidad } : i))
+        return prev.map((i) => (i.key === existente.key ? { ...i, cantidad: cantidadTotalLinea } : i))
       }
       return [
         ...prev,
@@ -269,7 +329,7 @@ export default function Movimientos() {
           variante_id: varianteId,
           nombre_producto: productoSeleccionado.nombre,
           descripcion_variante: descripcionVariante,
-          cantidad,
+          cantidad: cantidadTotalLinea,
           precio_unitario: Number(productoSeleccionado.precio_venta),
         },
       ]
@@ -278,7 +338,39 @@ export default function Movimientos() {
     setValoresElegidos({})
   }
 
-  const sacarDelCarrito = (key) => setItemsPedido((prev) => prev.filter((i) => i.key !== key))
+  // Best-effort: si el DELETE de la reserva falla (ej. error de red), igual se saca la línea del
+  // carrito visual — la reserva vieja se autolimpia sola por TTL, no tiene sentido trabar a la
+  // usuaria por un error de un cleanup que no es crítico.
+  const sacarDelCarrito = async (key) => {
+    const item = itemsPedido.find((i) => i.key === key)
+    if (item && sesionId) {
+      try {
+        await api.delete('/reservas', {
+          params: { sesion_id: sesionId, producto_id: item.producto_id, variante_id: item.variante_id },
+        })
+      } catch (e) {
+        setError(getErrorMessage(e))
+      }
+    }
+    setItemsPedido((prev) => prev.filter((i) => i.key !== key))
+  }
+
+  // Vacía el carrito en armado sin confirmar el pedido — libera todas las reservas de esta sesión
+  // de una, para no depender solo del vencimiento por tiempo si Florencia decide no continuar.
+  const cancelarPedido = async () => {
+    if (sesionId) {
+      try {
+        await api.delete('/reservas', { params: { sesion_id: sesionId } })
+      } catch (e) {
+        setError(getErrorMessage(e))
+      }
+    }
+    setItemsPedido([])
+    setFacturarArca(false)
+    setClienteNombreCarrito('')
+    setSesionId(null)
+    setCarritoRecuperado(false)
+  }
 
   const totalCarrito = itemsPedido.reduce((acc, i) => acc + i.cantidad * i.precio_unitario, 0)
 
@@ -288,11 +380,14 @@ export default function Movimientos() {
       await api.post('/pedidos', {
         cliente_nombre: clienteNombreCarrito || null,
         facturar_arca: facturarArca,
+        sesion_id: sesionId,
         lineas: itemsPedido.map((i) => ({ producto_id: i.producto_id, variante_id: i.variante_id, cantidad: i.cantidad })),
       })
       setItemsPedido([])
       setFacturarArca(false)
       setClienteNombreCarrito('')
+      setSesionId(null)
+      setCarritoRecuperado(false)
       setForm({ ...empty, fecha: nowLocal() })
       setMontoEditadoManualmente(false)
       cargar()
@@ -508,6 +603,12 @@ export default function Movimientos() {
       {enModoCarrito && (
         <div className="bg-[#151b2b] rounded-xl p-5 space-y-3">
           <h2 className="font-bold">Pedido en armado</h2>
+          {carritoRecuperado && itemsPedido.length > 0 && (
+            <p className="text-sm text-amber-400 bg-amber-950/30 border border-amber-800 rounded-lg p-3">
+              Recuperamos un pedido que tenías en armado (todavía no lo habías confirmado). Podés
+              seguir agregando ítems, sacar alguno, cancelarlo o confirmarlo.
+            </p>
+          )}
           {itemsPedido.length === 0 ? (
             <p className="text-gray-500 text-sm">Todavía no agregaste ningún ítem a este pedido.</p>
           ) : (
@@ -557,9 +658,16 @@ export default function Movimientos() {
               onChange={(e) => setClienteNombreCarrito(e.target.value)}
             />
             <button
+              onClick={cancelarPedido}
+              disabled={itemsPedido.length === 0}
+              className="bg-gray-700 hover:bg-gray-600 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 rounded-lg font-medium ml-auto"
+            >
+              Cancelar pedido
+            </button>
+            <button
               onClick={confirmarPedido}
               disabled={itemsPedido.length === 0}
-              className="bg-green-600 hover:bg-green-700 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 rounded-lg font-medium ml-auto"
+              className="bg-green-600 hover:bg-green-700 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 rounded-lg font-medium"
             >
               Confirmar venta
             </button>

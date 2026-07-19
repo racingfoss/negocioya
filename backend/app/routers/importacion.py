@@ -157,24 +157,6 @@ async def procesar(file: UploadFile = File(...), db: Session = Depends(get_db)):
             }
         return valores_por_atributo_cache[atributo_id].get(texto_norm)
 
-    def descripcion_variante(variante_id):
-        if variante_id is None:
-            return None
-        filas_desc = (
-            db.query(models.ValorAtributo.valor, models.ProductoAtributo.orden)
-            .join(models.VarianteValor, models.VarianteValor.valor_atributo_id == models.ValorAtributo.id)
-            .join(models.Variante, models.VarianteValor.variante_id == models.Variante.id)
-            .join(
-                models.ProductoAtributo,
-                (models.ProductoAtributo.producto_id == models.Variante.producto_id)
-                & (models.ProductoAtributo.atributo_id == models.ValorAtributo.atributo_id),
-            )
-            .filter(models.VarianteValor.variante_id == variante_id)
-            .order_by(models.ProductoAtributo.orden)
-            .all()
-        )
-        return " / ".join(v for v, _ in filas_desc)
-
     def resolver_variante_para_fila(producto, atributos_fila):
         """Devuelve (variante_id, error). Si el producto no tiene (ni necesita) variantes para esta
         fila, devuelve (None, None). Si es la primera vez que este producto ve atributos (recién
@@ -318,7 +300,7 @@ async def procesar(file: UploadFile = File(...), db: Session = Depends(get_db)):
                     "categoria": categoria.nombre if categoria else "Sin categoría",
                     "stock_inicial": cantidad, "costo": float(costo_final), "precio_venta": float(precio_venta),
                     "variante_id": variante_id,
-                    "variante_descripcion": descripcion_variante(variante_id),
+                    "variante_descripcion": calculations.descripcion_variante(db, variante_id),
                 })
             else:
                 variante_id, error_variante = resolver_variante_para_fila(producto, atributos_fila)
@@ -349,7 +331,7 @@ async def procesar(file: UploadFile = File(...), db: Session = Depends(get_db)):
                     "producto_id": producto.id, "producto": nombre, "cantidad": cantidad,
                     "costo_unitario": float(costo_final), "fecha": fecha.isoformat(),
                     "variante_id": variante_id,
-                    "variante_descripcion": descripcion_variante(variante_id),
+                    "variante_descripcion": calculations.descripcion_variante(db, variante_id),
                 })
 
                 # El aviso se dispara comparando contra el costo de reposición (última compra

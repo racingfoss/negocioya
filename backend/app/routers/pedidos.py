@@ -30,6 +30,18 @@ def crear_local(payload: schemas.PedidoLocalCreate, db: Session = Depends(get_db
     if not payload.lineas:
         raise HTTPException(400, "El pedido necesita al menos una línea.")
 
+    # Si este pedido viene de un carrito con reservas propias (sesion_id de Movimientos.jsx), se
+    # liberan ACÁ, antes de validar/vender — no antes de la transacción, en el sentido de "un paso
+    # aparte" con su propio commit (eso dejaría una ventana de carrera), sino como el primer paso de
+    # ESTA MISMA transacción: si cualquier línea falla más abajo, todo (incluida esta liberación) se
+    # revierte junto. Hacerlo acá (y no recién antes del commit final) es necesario porque
+    # registrar_venta() valida el stock internamente vía validar_movimiento(), que llama a
+    # stock_disponible() SIN excluir esta sesión (no se le cambió la firma) — si la reserva propia
+    # siguiera activa en ese momento, se restaría dos veces contra sí misma y una confirmación
+    # legítima (cantidad == lo reservado) se rechazaría por "falta de stock".
+    if payload.sesion_id:
+        calculations.liberar_reserva(db, payload.sesion_id)
+
     productos_cache: dict[int, models.Producto] = {}
     for idx, linea in enumerate(payload.lineas, start=1):
         producto = productos_cache.get(linea.producto_id)
