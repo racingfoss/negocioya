@@ -1053,13 +1053,13 @@ datos al comprador — ver también "Ideas mencionadas pero no implementadas".
   aprobado, no solo errores reales), `created_at`. Un pedido puede tener más de una fila con el
   tiempo (intentos fallidos, y a futuro una Nota de Crédito) — no es una relación 1:1 forzada.
   Tabla nueva → se autocrea con `Base.metadata.create_all()`, sin `ALTER TABLE`.
-- **`calculations.monto_neto_pedido(db, pedido)`**: hoy simplemente `Pedido.total` — se confirmó
-  por búsqueda en todo el repo que `Devolucion`/`DevolucionItem` **no existen todavía**, así que no
-  hay nada que restar. Recibe el objeto `Pedido` ya cargado (no un id) para no volver a
-  consultarlo — se llama en loop desde `GET /pedidos`. Cuando exista `Devolucion`: restar, por cada
-  `DevolucionItem` cuyo `PedidoItem` pertenezca a este pedido, `cantidad × precio_unitario` del
-  `PedidoItem` original. **Pendiente de verificar** cuando esa tabla exista: que el CAE se pida por
-  el monto neto (no el total original) en un pedido con devolución parcial ya procesada.
+- **`calculations.monto_neto_pedido(db, pedido)`**: resta de `Pedido.total`, vía join
+  `DevolucionItem` → `PedidoItem` → `Devolucion` filtrado por `pedido_id`, `cantidad ×
+  precio_unitario` del `PedidoItem` original — implementado en Fase D parte 1 (`Devolucion`/
+  `DevolucionItem` ya existen). Recibe el objeto `Pedido` ya cargado (no un id) para no volver a
+  consultarlo — se llama en loop desde `GET /pedidos`. Probado end-to-end contra la API real: un
+  pedido con una devolución parcial ya procesada, consultado por `GET /pedidos`, muestra
+  `monto_neto` correcto — cierra el punto que había quedado pendiente en esta sección.
 - **`backend/app/facturacion.py`** (nuevo, no adentro de `arca/`): orquesta entre `Pedido`/
   `Configuracion` y el paquete `arca/` de la Fase A — `arca/` sigue sin saber qué es un Pedido.
   `facturar_pedido(db, pedido_id)` valida en orden (404 si no existe el pedido; 400 si
@@ -1110,6 +1110,85 @@ datos al comprador — ver también "Ideas mencionadas pero no implementadas".
   clicks rápidos no pasen ambos la validación de "no tiene factura emitida" del backend antes de
   que el primer commit termine. Banner ámbar arriba de la tabla (mismo estilo que `Movimientos.jsx`)
   con la cuenta de pedidos pendientes de facturar y un toggle "ver solo pendientes".
+
+## Fase D, parte 1 — reversión de ventas (devoluciones y cancelaciones)
+
+Permite revertir una Venta ya confirmada de un `Pedido`: cancelación (antes de entregar) o
+devolución (después), con soporte de devolución **parcial por línea** — el caso más común en
+indumentaria ("me quedo con una prenda, devuelvo otra"). Esta ronda **no toca ARCA**
+(`backend/app/arca/`, `facturacion.py` no se modificaron) — la Nota de Crédito queda para una
+Fase D parte 2 futura, que se apoya en esto.
+
+- **Evento nuevo, nunca una edición retroactiva**: mismo criterio ya aplicado en todo el
+  proyecto (nunca se edita un `Movimiento` de Venta para "corregir" algo después). Se modela con
+  un `Movimiento` tipo `"Devolucion"` nuevo, espejo de `"Venta"`: donde `"Venta"` resta stock y
+  suma caja, `"Devolucion"` suma stock y resta caja. `Movimiento.tipo` es `String(10)` —
+  `"Devolucion"` entra justo (10 caracteres), no hizo falta migrar esa columna.
+- **Modelo nuevo** (`models.py`): `Devolucion` (`pedido_id`, `fecha`, `motivo` nullable, `tipo`
+  `"Cancelacion"` | `"Devolucion"` — solo para UI, la mecánica es idéntica para los dos) y
+  `DevolucionItem` (`devolucion_id`, `pedido_item_id` FK al `PedidoItem` que se revierte,
+  `cantidad`, `movimiento_id` FK al `Movimiento` "Devolucion" que generó — mismo patrón de
+  trazabilidad que `PedidoItem.movimiento_id`). Dos tablas nuevas, autocreadas por
+  `Base.metadata.create_all()`, sin `ALTER TABLE`.
+- **Neteo contra `"Devolucion"` en las queries que agregan por tipo de Movimiento**, vía un
+  helper nuevo `calculations._neto_venta_devolucion(columna)` (un `case()` de SQLAlchemy: Venta
+  suma la columna, Devolucion la resta) reusado en 4 lugares: `unidades_vendidas_por_producto`,
+  `unidades_vendidas_por_variante`, `facturacion_por_producto` (estas tres alimentan BCG,
+  Análisis, Stock y el mix real del Punto de Equilibrio — una venta revertida ya no infla
+  volumen ni facturación en esas pantallas) y `stock_disponible`. `stock_por_producto`/
+  `stock_por_variante` no se tocaron directo — ya consumen las funciones de arriba, así que
+  netean automáticamente. `get_caja_actual`: `"Devolucion"` resta de la caja, mismo lado que
+  `"Egreso"` (es plata que sale). `TIPOS_MOVIMIENTO_VALIDOS` ganó `"Devolucion"`.
+  `validar_movimiento`/`registrar_venta` no cambiaron de comportamiento para `tipo="Venta"` —
+  confirmado con pruebas reales contra la API, no solo por lectura de código.
+- **`calculations.procesar_devolucion(db, pedido_id, items, motivo=None, tipo="Devolucion")`**
+  (nueva): valida que cada `pedido_item_id` pertenezca a ese `pedido_id` y que la `cantidad` a
+  devolver no supere `cantidad_original - ya_devuelto_antes` (sumando TODAS las devoluciones
+  previas de esa misma línea, no solo la última). Si algo no cierra, **lanza `ValueError`** (no
+  `HTTPException`) sin escribir nada — mismo patrón ya usado por `reservar_stock`/
+  `liberar_reserva`, para mantener el invariante de que `validar_movimiento` es la única función
+  de este módulo que lanza `HTTPException` directamente; el router atrapa el `ValueError` y arma
+  el 400. Si todo valida, en una única transacción (con su propio commit, mismo criterio que
+  `facturacion.facturar_pedido`): crea `Devolucion`, y por cada línea un `Movimiento` tipo
+  `"Devolucion"` (`monto = cantidad × precio_unitario` **del `PedidoItem` original**, no el
+  `precio_venta` actual del producto — mismo criterio de denormalización que `MixSnapshot`/
+  `ReservaStock`) + su `DevolucionItem`. Al final, si la suma de todo lo devuelto en la vida del
+  pedido iguala la cantidad original de TODAS sus líneas, `Pedido.estado` pasa a `"Cancelado"`
+  solo — sin agregar ningún estado nuevo tipo "parcialmente devuelto".
+- **`PUT /pedidos/{id}/estado` no se tocó**: seguir permitiendo poner `"Cancelado"` a mano desde
+  ahí sin reversión de stock/caja es el comportamiento ya existente — la única vía que dispara
+  reversión real es el endpoint nuevo de abajo.
+- **Endpoints** (`routers/pedidos.py`): `POST /pedidos/{id}/devoluciones` (404 si el pedido no
+  existe, 400 con el detalle si `procesar_devolucion` rechaza algo) y
+  `GET /pedidos/{id}/devoluciones` (historial completo, más reciente primero — lo usa tanto el
+  frontend para mostrar cuánto se devolvió antes por línea, como potenciales validaciones futuras).
+- **`PedidoItemOut.variante_descripcion`** (nuevo, opcional): no es un atributo del ORM — se
+  completa en `_pedido_out` con `calculations.descripcion_variante(db, item.variante_id)` (helper
+  que ya existía, usado por `ReservaStock`), para que el panel de devolución del frontend pueda
+  mostrar "M / Verde" sin armar su propia query.
+- **Frontend (`Pedidos.jsx`)**: nueva columna "Devolución" con un botón "Devolver / Cancelar" por
+  pedido (oculto si `estado === "Cancelado"`) que abre un panel — no hay modal en el proyecto, es
+  una sección condicional debajo de la tabla, mismo criterio que el bloque `enModoCarrito` de
+  `Movimientos.jsx`. El panel trae el historial de devoluciones de ese pedido
+  (`GET /pedidos/{id}/devoluciones`) para calcular, por línea, cuánto ya se devolvió y cuánto
+  queda disponible, con un `<input type="number" max={disponible}>` por línea (deshabilitado si
+  ya no queda nada disponible), un select de tipo y un motivo opcional. Confirmar llama
+  `POST /pedidos/{id}/devoluciones`, refresca `GET /pedidos` entero (para que `estado` y
+  `monto_neto` se actualicen) y cierra el panel. Mismo patrón `devolviendo` (Set de ids en vuelo)
+  que ya usa `facturando` para deshabilitar el botón de confirmar mientras la request está en
+  curso. La celda de Total muestra además el `monto_neto` en gris chico cuando difiere del total
+  (pedido con alguna devolución).
+- **Qué NO se tocó**: `backend/app/arca/`, `facturacion.py`, `Compras.jsx`, el storefront
+  (`ecommerce/`), `reservas_stock`/`reservar_stock`/`liberar_reserva` (una devolución de un
+  pedido ya confirmado no interactúa con reservas de un pedido en armado — son mecanismos
+  independientes). Ningún estado nuevo de `Pedido` más allá de reusar `"Cancelado"`.
+- **Probado end-to-end contra la API real** (no solo por lectura de código): devolución parcial
+  de una línea (stock sube, caja baja, `GET /stock/productos` y el mix real de
+  `GET /dashboard/punto-equilibrio?modo=real` reflejan el neto, no la venta bruta); intento de
+  devolver más de lo disponible en una línea con una devolución parcial previa (rechazado con
+  400 y mensaje claro, sin escribir nada); devolución que completa el 100% de todas las líneas de
+  un pedido (`Pedido.estado` pasa a `"Cancelado"` solo); y el cierre de punta a punta con Fase C
+  (`GET /pedidos` de un pedido con devolución parcial ya procesada muestra `monto_neto` correcto).
 
 ## Convenciones de código
 

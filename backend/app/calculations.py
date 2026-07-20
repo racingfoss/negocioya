@@ -5,7 +5,7 @@ from statistics import median
 from typing import Optional
 
 from fastapi import HTTPException
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session, joinedload
 
 from . import models
@@ -181,7 +181,8 @@ def descripcion_variante(db: Session, variante_id: Optional[int]) -> Optional[st
 
 # ---------------------------------------------------------------------------
 # Panel de control: caja
-# "Venta" e "Ingreso" suman a la caja; "Egreso" resta.
+# "Venta" e "Ingreso" suman a la caja; "Egreso" resta. "Devolucion" (Fase D
+# parte 1) resta también, mismo lado que "Egreso" — es plata que sale.
 # ---------------------------------------------------------------------------
 def get_caja_actual(db: Session) -> dict:
     ingresos = db.query(
@@ -189,7 +190,7 @@ def get_caja_actual(db: Session) -> dict:
     ).filter(models.Movimiento.tipo.in_(["Venta", "Ingreso"])).scalar()
     egresos = db.query(
         func.coalesce(func.sum(models.Movimiento.monto), 0)
-    ).filter(models.Movimiento.tipo == "Egreso").scalar()
+    ).filter(models.Movimiento.tipo.in_(["Egreso", "Devolucion"])).scalar()
     ingresos, egresos = float(ingresos), float(egresos)
     return {
         "ingresos_reales": ingresos,
@@ -355,15 +356,31 @@ def punto_equilibrio_ponderado(db: Session, modo: str = "real", dias: int = 30) 
 
 
 # ---------------------------------------------------------------------------
-# Utilidad: unidades vendidas por producto (ventana de días opcional)
-# Solo cuenta movimientos tipo "Venta".
+# Helper: expresión SQL para netear Venta (suma) contra Devolucion (resta) sobre
+# una misma columna (cantidad o monto) de Movimiento. Usado por las 4 queries
+# que agregan por tipo de Movimiento más abajo y en stock_disponible — evita
+# repetir el mismo case() cuatro veces (Fase D parte 1: una venta revertida no
+# debe seguir contando como venta en ningún reporte).
+# ---------------------------------------------------------------------------
+def _neto_venta_devolucion(columna):
+    return case(
+        (models.Movimiento.tipo == "Venta", columna),
+        (models.Movimiento.tipo == "Devolucion", -columna),
+        else_=0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Utilidad: unidades vendidas por producto (ventana de días opcional), netas
+# de cualquier Devolucion asociada a esas ventas (Fase D parte 1) — usada por
+# BCG, Stock y Sell-through.
 # ---------------------------------------------------------------------------
 def unidades_vendidas_por_producto(db: Session, dias: Optional[int] = None) -> dict:
     q = db.query(
         models.Movimiento.producto_id,
-        func.coalesce(func.sum(models.Movimiento.cantidad), 0).label("unidades"),
+        func.coalesce(func.sum(_neto_venta_devolucion(models.Movimiento.cantidad)), 0).label("unidades"),
     ).filter(
-        models.Movimiento.tipo == "Venta",
+        models.Movimiento.tipo.in_(["Venta", "Devolucion"]),
         models.Movimiento.producto_id.isnot(None),
     )
     if dias:
@@ -378,14 +395,15 @@ def unidades_vendidas_por_producto(db: Session, dias: Optional[int] = None) -> d
 # mix% del Punto de Equilibrio Ponderado. Mismo patrón de query que
 # unidades_vendidas_por_producto, pero sumando `monto` en vez de `cantidad` —
 # función separada a propósito, no se toca unidades_vendidas_por_producto
-# porque la usan BCG, Stock y Sell-through.
+# porque la usan BCG, Stock y Sell-through. También neta contra Devolucion
+# (Fase D parte 1): una venta revertida no debe inflar facturación acá.
 # ---------------------------------------------------------------------------
 def facturacion_por_producto(db: Session, dias: Optional[int] = None) -> dict:
     q = db.query(
         models.Movimiento.producto_id,
-        func.coalesce(func.sum(models.Movimiento.monto), 0).label("monto"),
+        func.coalesce(func.sum(_neto_venta_devolucion(models.Movimiento.monto)), 0).label("monto"),
     ).filter(
-        models.Movimiento.tipo == "Venta",
+        models.Movimiento.tipo.in_(["Venta", "Devolucion"]),
         models.Movimiento.producto_id.isnot(None),
     )
     if dias:
@@ -398,9 +416,9 @@ def facturacion_por_producto(db: Session, dias: Optional[int] = None) -> dict:
 def unidades_vendidas_por_variante(db: Session, dias: Optional[int] = None) -> dict:
     q = db.query(
         models.Movimiento.variante_id,
-        func.coalesce(func.sum(models.Movimiento.cantidad), 0).label("unidades"),
+        func.coalesce(func.sum(_neto_venta_devolucion(models.Movimiento.cantidad)), 0).label("unidades"),
     ).filter(
-        models.Movimiento.tipo == "Venta",
+        models.Movimiento.tipo.in_(["Venta", "Devolucion"]),
         models.Movimiento.variante_id.isnot(None),
     )
     if dias:
@@ -683,15 +701,19 @@ def stock_disponible(
         total_comprado = db.query(func.coalesce(func.sum(models.Compra.cantidad), 0)).filter(
             models.Compra.variante_id == variante_id
         ).scalar()
-        total_vendido = db.query(func.coalesce(func.sum(models.Movimiento.cantidad), 0)).filter(
-            models.Movimiento.tipo == "Venta", models.Movimiento.variante_id == variante_id
+        total_vendido = db.query(
+            func.coalesce(func.sum(_neto_venta_devolucion(models.Movimiento.cantidad)), 0)
+        ).filter(
+            models.Movimiento.tipo.in_(["Venta", "Devolucion"]), models.Movimiento.variante_id == variante_id
         ).scalar()
     else:
         total_comprado = db.query(func.coalesce(func.sum(models.Compra.cantidad), 0)).filter(
             models.Compra.producto_id == producto_id
         ).scalar()
-        total_vendido = db.query(func.coalesce(func.sum(models.Movimiento.cantidad), 0)).filter(
-            models.Movimiento.tipo == "Venta", models.Movimiento.producto_id == producto_id
+        total_vendido = db.query(
+            func.coalesce(func.sum(_neto_venta_devolucion(models.Movimiento.cantidad)), 0)
+        ).filter(
+            models.Movimiento.tipo.in_(["Venta", "Devolucion"]), models.Movimiento.producto_id == producto_id
         ).scalar()
 
     reservas_q = db.query(func.coalesce(func.sum(models.ReservaStock.cantidad), 0)).filter(
@@ -804,7 +826,7 @@ def listar_reservas_activas(db: Session, sesion_id: Optional[str] = None) -> lis
     return q.order_by(models.ReservaStock.creado_en.desc()).all()
 
 
-TIPOS_MOVIMIENTO_VALIDOS = ("Venta", "Ingreso", "Egreso")
+TIPOS_MOVIMIENTO_VALIDOS = ("Venta", "Ingreso", "Egreso", "Devolucion")
 
 # Cadena de estados de logística de un Pedido (Fase B), cualquier canal. "Listo para retirar"
 # y "Enviado" son ambos válidos para cualquier pedido (el frontend decide cuál ofrecer según
@@ -815,13 +837,126 @@ ESTADOS_PEDIDO_VALIDOS = ("Pendiente", "Preparando", "Listo para retirar", "Envi
 
 
 def monto_neto_pedido(db: Session, pedido: "models.Pedido") -> Decimal:
-    """Pedido.total menos lo ya devuelto de ese pedido. Hoy no existe Devolucion/DevolucionItem
-    en el proyecto (confirmado por búsqueda en todo el repo), así que devuelve pedido.total tal
-    cual. Cuando se agregue esa funcionalidad: restar, por cada DevolucionItem cuyo PedidoItem
-    pertenezca a este pedido, cantidad × precio_unitario del PedidoItem original. Recibe el
-    objeto Pedido ya cargado (no un id) para no re-consultarlo — se llama en loop desde
-    GET /pedidos, sobre pedidos que el caller ya tiene en memoria."""
-    return pedido.total
+    """Pedido.total menos lo ya devuelto de ese pedido (Fase D parte 1: por cada DevolucionItem
+    cuyo PedidoItem pertenezca a este pedido, cantidad × precio_unitario del PedidoItem
+    original). Recibe el objeto Pedido ya cargado (no un id) para no re-consultarlo — se llama en
+    loop desde GET /pedidos, sobre pedidos que el caller ya tiene en memoria."""
+    devuelto = (
+        db.query(
+            func.coalesce(
+                func.sum(models.DevolucionItem.cantidad * models.PedidoItem.precio_unitario), 0
+            )
+        )
+        .join(models.PedidoItem, models.PedidoItem.id == models.DevolucionItem.pedido_item_id)
+        .join(models.Devolucion, models.Devolucion.id == models.DevolucionItem.devolucion_id)
+        .filter(models.Devolucion.pedido_id == pedido.id)
+        .scalar()
+    )
+    return pedido.total - Decimal(devuelto)
+
+
+# ---------------------------------------------------------------------------
+# Fase D parte 1: reversión de una Venta ya confirmada de un Pedido — cancelación
+# (antes de entregar) o devolución (después), misma mecánica para las dos, con
+# soporte de devolución PARCIAL por línea. Es un evento NUEVO (crea Movimiento
+# tipo "Devolucion" + Devolucion/DevolucionItem), nunca una edición retroactiva
+# del Movimiento de Venta original. Lanza ValueError (no HTTPException) cuando
+# algo no cierra — mismo patrón que reservar_stock/liberar_reserva, para
+# mantener el invariante de que validar_movimiento es la única función de este
+# módulo que lanza HTTPException directamente; el router (POST
+# /pedidos/{id}/devoluciones) atrapa el ValueError y arma el 400. Hace su
+# propio commit (operación atómica de punta a punta), mismo criterio que
+# facturacion.facturar_pedido — el router solo la llama y devuelve el
+# resultado.
+# ---------------------------------------------------------------------------
+def procesar_devolucion(
+    db: Session,
+    pedido_id: int,
+    items: list,
+    motivo: Optional[str] = None,
+    tipo: str = "Devolucion",
+) -> "models.Devolucion":
+    if tipo not in ("Cancelacion", "Devolucion"):
+        raise ValueError("El tipo debe ser 'Cancelacion' o 'Devolucion'.")
+    if not items:
+        raise ValueError("La devolución necesita al menos una línea.")
+
+    pedido = db.get(models.Pedido, pedido_id)
+    if pedido is None:
+        raise ValueError("Pedido no encontrado.")
+
+    # Cuánto se devolvió antes de cada pedido_item_id, sumando TODAS las Devoluciones previas
+    # de este pedido (no solo la última) — una línea puede devolverse en más de una tanda.
+    devuelto_antes = dict(
+        db.query(
+            models.DevolucionItem.pedido_item_id,
+            func.coalesce(func.sum(models.DevolucionItem.cantidad), 0),
+        )
+        .join(models.Devolucion, models.Devolucion.id == models.DevolucionItem.devolucion_id)
+        .filter(models.Devolucion.pedido_id == pedido_id)
+        .group_by(models.DevolucionItem.pedido_item_id)
+        .all()
+    )
+
+    pedido_items_cache: dict[int, models.PedidoItem] = {}
+    for idx, item in enumerate(items, start=1):
+        pi = db.get(models.PedidoItem, item.pedido_item_id)
+        if pi is None or pi.pedido_id != pedido_id:
+            raise ValueError(f"Línea {idx}: el ítem indicado no pertenece a este pedido.")
+        disponible = pi.cantidad - devuelto_antes.get(pi.id, 0)
+        if item.cantidad <= 0 or item.cantidad > disponible:
+            raise ValueError(
+                f"Línea {idx}: no se puede devolver {item.cantidad} unidad(es) — "
+                f"disponible para devolver: {disponible}."
+            )
+        pedido_items_cache[item.pedido_item_id] = pi
+
+    devolucion = models.Devolucion(pedido_id=pedido_id, motivo=motivo, tipo=tipo)
+    db.add(devolucion)
+    db.flush()  # devolucion.id disponible sin comprometer la transacción
+
+    for item in items:
+        pi = pedido_items_cache[item.pedido_item_id]
+        # monto = precio_unitario DEL PedidoItem original, no producto.precio_venta actual —
+        # mismo criterio de denormalización que el resto del proyecto (MixSnapshot, ReservaStock).
+        mov = models.Movimiento(
+            tipo="Devolucion",
+            concepto=f"{tipo} — pedido #{pedido_id}",
+            cantidad=item.cantidad,
+            monto=pi.precio_unitario * item.cantidad,
+            producto_id=pi.producto_id,
+            variante_id=pi.variante_id,
+        )
+        db.add(mov)
+        db.flush()  # mov.id disponible para el DevolucionItem
+        db.add(
+            models.DevolucionItem(
+                devolucion_id=devolucion.id,
+                pedido_item_id=pi.id,
+                cantidad=item.cantidad,
+                movimiento_id=mov.id,
+            )
+        )
+
+    # Si lo devuelto en la vida del pedido ya cubre el 100% de TODAS sus líneas, se cancela solo.
+    db.flush()
+    devuelto_total = dict(
+        db.query(
+            models.DevolucionItem.pedido_item_id,
+            func.coalesce(func.sum(models.DevolucionItem.cantidad), 0),
+        )
+        .join(models.Devolucion, models.Devolucion.id == models.DevolucionItem.devolucion_id)
+        .filter(models.Devolucion.pedido_id == pedido_id)
+        .group_by(models.DevolucionItem.pedido_item_id)
+        .all()
+    )
+    todos_los_items = db.query(models.PedidoItem).filter(models.PedidoItem.pedido_id == pedido_id).all()
+    if all(devuelto_total.get(pi.id, 0) >= pi.cantidad for pi in todos_los_items):
+        pedido.estado = "Cancelado"
+
+    db.commit()
+    db.refresh(devolucion)
+    return devolucion
 
 
 # ---------------------------------------------------------------------------
@@ -844,7 +979,7 @@ def validar_movimiento(
     actual: Optional["models.Movimiento"] = None,
 ) -> None:
     if tipo not in TIPOS_MOVIMIENTO_VALIDOS:
-        raise HTTPException(400, "El tipo debe ser 'Venta', 'Ingreso' o 'Egreso'.")
+        raise HTTPException(400, "El tipo debe ser 'Venta', 'Ingreso', 'Egreso' o 'Devolucion'.")
     if tipo == "Venta" and not producto_id:
         raise HTTPException(400, "Una Venta debe tener un producto asociado.")
     if producto_id is not None:

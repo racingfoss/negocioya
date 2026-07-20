@@ -10,9 +10,13 @@ router = APIRouter(prefix="/pedidos", tags=["Pedidos"])
 def _pedido_out(db: Session, pedido: models.Pedido) -> schemas.PedidoOut:
     """monto_neto no es un atributo del ORM (Fase C) — model_validate lo dejaría en su default
     Decimal("0") SIN error si no se completa acá, así que este helper es obligatorio en los 3
-    endpoints que devuelven un Pedido, no solo en listar()."""
+    endpoints que devuelven un Pedido, no solo en listar(). variante_descripcion (Fase D parte 1)
+    tampoco es un atributo del ORM, mismo criterio."""
     out = schemas.PedidoOut.model_validate(pedido)
     out.monto_neto = calculations.monto_neto_pedido(db, pedido)
+    for item in out.items:
+        if item.variante_id is not None:
+            item.variante_descripcion = calculations.descripcion_variante(db, item.variante_id)
     return out
 
 
@@ -137,3 +141,31 @@ def facturar(pedido_id: int, db: Session = Depends(get_db)):
     """Pide un CAE real a ARCA para este pedido (Fase C) — ver facturacion.facturar_pedido para
     la orquestación completa (validaciones, llamado a WSFEv1, persistencia del intento)."""
     return facturacion.facturar_pedido(db, pedido_id)
+
+
+@router.post("/{pedido_id}/devoluciones", response_model=schemas.DevolucionOut)
+def crear_devolucion(pedido_id: int, payload: schemas.DevolucionCreate, db: Session = Depends(get_db)):
+    """Cancelación (antes de entregar) o devolución (después) de una o varias líneas de un Pedido
+    ya confirmado (Fase D parte 1) — ver calculations.procesar_devolucion para la mecánica
+    completa (reversión de stock/caja vía un Movimiento tipo "Devolucion" por línea)."""
+    if not db.get(models.Pedido, pedido_id):
+        raise HTTPException(404, "Pedido no encontrado.")
+    try:
+        return calculations.procesar_devolucion(
+            db, pedido_id, payload.items, motivo=payload.motivo, tipo=payload.tipo
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.get("/{pedido_id}/devoluciones", response_model=list[schemas.DevolucionOut])
+def listar_devoluciones(pedido_id: int, db: Session = Depends(get_db)):
+    """Historial de devoluciones/cancelaciones de un Pedido — usado tanto por el backend (validar
+    cuánto queda disponible por línea) como por el frontend (mostrarlo en el panel de devolución)."""
+    return (
+        db.query(models.Devolucion)
+        .options(joinedload(models.Devolucion.items))
+        .filter(models.Devolucion.pedido_id == pedido_id)
+        .order_by(models.Devolucion.fecha.desc())
+        .all()
+    )

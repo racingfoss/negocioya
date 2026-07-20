@@ -234,6 +234,10 @@ class PedidoItemOut(BaseModel):
     precio_unitario: Decimal
     movimiento_id: Optional[int]
     producto: Optional[Producto] = None
+    # No es un atributo del ORM (Fase D parte 1) — lo completa a mano el router (_pedido_out) con
+    # calculations.descripcion_variante, mismo criterio que monto_neto en PedidoOut. Sirve para
+    # mostrar "M / Verde" en el panel de devolución sin que el frontend arme la query.
+    variante_descripcion: Optional[str] = None
 
 
 class FacturaOut(BaseModel):
@@ -292,6 +296,37 @@ class PedidoLocalCreate(BaseModel):
 
 class PedidoEstadoUpdate(BaseModel):
     estado: str
+
+
+# --- Devoluciones/cancelaciones de un Pedido (Fase D parte 1) ---
+
+class DevolucionItemIn(BaseModel):
+    pedido_item_id: int
+    cantidad: int
+
+
+class DevolucionCreate(BaseModel):
+    motivo: Optional[str] = None
+    tipo: str = "Devolucion"  # "Cancelacion" | "Devolucion" — validado en calculations.procesar_devolucion
+    items: list[DevolucionItemIn]
+
+
+class DevolucionItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    pedido_item_id: int
+    cantidad: int
+    movimiento_id: Optional[int]
+
+
+class DevolucionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    pedido_id: int
+    fecha: datetime
+    motivo: Optional[str]
+    tipo: str
+    items: list[DevolucionItemOut] = []
 
 
 # --- Reserva de stock efímera (pedido en armado en Caja) ---

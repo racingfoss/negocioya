@@ -1,82 +1,101 @@
-# Resumen de la última modificación — Facturación electrónica (Fase C, conectar Pedido con ARCA)
+# Resumen de la última modificación — Fase D, parte 1: reversión de ventas (devoluciones y cancelaciones)
 
-Implementación de `prompt1.md`: conecta el `Pedido` unificado (Fase B) con el cliente ARCA WSFEv1
-ya probado en homologación (Fase A) para pedir un CAE real y persistirlo. Alcance acotado a
-propósito: solo obtener y guardar el CAE — nada de comprobante imprimible/QR ni Nota de Crédito
-(fases futuras). Siempre se factura como Consumidor Final (`DocTipo=99`/`DocNro=0`).
+Implementación de `prompt1.md`: permite revertir una Venta ya confirmada de un `Pedido` —
+cancelación (antes de entregar) o devolución (después) — con soporte de devolución **parcial por
+línea** (el caso más común en indumentaria: "me quedo con una prenda, devuelvo otra"). Esta ronda
+no toca ARCA (`backend/app/arca/`, `facturacion.py`) — la Nota de Crédito queda para una Fase D
+parte 2 futura, que se apoya en esto.
 
 ## Backend
 
-- **Tabla nueva `facturas`** (modelo `Factura`): `pedido_id`, `tipo_comprobante` (default 11 =
-  Factura C, campo propio para que a futuro convivan Notas de Crédito en la misma tabla),
-  `punto_venta` (snapshot, no referencia viva), `numero_comprobante`, `cae`, `cae_vencimiento`,
-  `fecha_emision`, `importe_total`, `doc_tipo`/`doc_nro`, `estado` (`"Emitida"` | `"Error"`),
-  `mensaje_error`. Un pedido puede tener más de una fila (intentos fallidos, a futuro Nota de
-  Crédito) — no es 1:1.
-- **`calculations.monto_neto_pedido(db, pedido)`**: hoy es simplemente `Pedido.total` —
-  `Devolucion`/`DevolucionItem` no existen todavía en el proyecto (confirmado por búsqueda en todo
-  el repo), así que no hay nada que restar. Documentado como pendiente para cuando esa tabla
-  exista.
-- **`backend/app/facturacion.py`** (nuevo): orquesta entre `Pedido`/`Configuracion` y `arca/`
-  (que sigue sin saber qué es un Pedido). `facturar_pedido(db, pedido_id)` valida en orden: pedido
-  existe, `facturar_arca=True`, **`estado != "Cancelado"`** (guard agregado durante el diseño, no
-  estaba en el pedido original — única red de seguridad posible hasta que exista Nota de Crédito),
-  no tiene ya una Factura tipo 11 emitida, `monto_neto_pedido > 0`, hay `arca_cuit` cargado. Pide
-  el CAE con `ImpNeto = monto_neto_pedido` (no `Pedido.total` a secas) y `doc_tipo`/`doc_nro`
-  pasados explícitos (no los defaults de la función ni de la columna, para que lo grabado siempre
-  coincida con lo mandado a ARCA). En éxito o en rechazo/error de conexión, persiste igual una
-  `Factura` (con commit inmediato en el caso de error, antes de lanzar la excepción, para que quede
-  historial del intento fallido).
-- **`arca/wsfe.py`** (único archivo de la Fase A tocado, cambio aditivo): la respuesta aprobada
-  ahora también incluye `cbte_nro` (el número real que ARCA asignó, leído de la propia respuesta)
-  — evita que `facturacion.py` tenga que consultar `FECompUltimoAutorizado` una segunda vez y la
-  carrera teórica que eso implicaba.
-- **Endpoint `POST /pedidos/{id}/facturar`** (`routers/pedidos.py`): 400 si falla alguna
-  validación previa, 502 si ARCA rechaza o hay error de conexión (con el detalle real).
-- **`PedidoOut` ganó `monto_neto` y `facturas`**: como `monto_neto` no es un atributo del ORM,
-  `model_validate` sin completarlo a mano cae silenciosamente a `0` (confirmado con una prueba
-  directa) — se agregó un helper `_pedido_out()` usado en los 3 endpoints de `routers/pedidos.py`,
-  y el mismo fix inline en `routers/ecommerce.py` (`POST /ecommerce/ordenes` usa el mismo
-  `PedidoOut` y tenía el mismo riesgo).
+- **Tablas nuevas `Devolucion`/`DevolucionItem`** (`models.py`): `Devolucion` (`pedido_id`,
+  `fecha`, `motivo` nullable, `tipo` `"Cancelacion"` | `"Devolucion"` — solo para UI, la mecánica
+  es idéntica para los dos). `DevolucionItem` (`devolucion_id`, `pedido_item_id` FK al
+  `PedidoItem` que se revierte, `cantidad`, `movimiento_id` FK al `Movimiento` "Devolucion" que
+  generó, mismo patrón de trazabilidad que `PedidoItem.movimiento_id`). Autocreadas por
+  `Base.metadata.create_all()`, sin `ALTER TABLE`.
+- **Evento nuevo, nunca una edición retroactiva**: se modela con un `Movimiento` tipo
+  `"Devolucion"` nuevo, espejo de `"Venta"` (suma stock, resta caja en vez de restar/sumar).
+  `Movimiento.tipo` es `String(10)` — `"Devolucion"` entra justo (10 caracteres), no hizo falta
+  migrar esa columna.
+- **Neteo contra `"Devolucion"` en `calculations.py`**, vía un helper nuevo
+  `_neto_venta_devolucion(columna)` (un `case()` de SQLAlchemy) reusado en 4 lugares:
+  `unidades_vendidas_por_producto`, `unidades_vendidas_por_variante`, `facturacion_por_producto`
+  (alimentan BCG, Análisis, Stock y el mix real del Punto de Equilibrio) y `stock_disponible`.
+  `stock_por_producto`/`stock_por_variante` no se tocaron directo — ya consumen esas funciones,
+  netean solos. `get_caja_actual`: `"Devolucion"` resta de la caja, mismo lado que `"Egreso"`.
+  `TIPOS_MOVIMIENTO_VALIDOS` ganó `"Devolucion"`. `validar_movimiento`/`registrar_venta` no
+  cambiaron de comportamiento para `tipo="Venta"` — confirmado con pruebas reales, no solo lectura.
+- **`calculations.procesar_devolucion(db, pedido_id, items, motivo=None, tipo="Devolucion")`**
+  (nueva): valida que cada `pedido_item_id` pertenezca al pedido y que la cantidad a devolver no
+  supere `cantidad_original - ya_devuelto_antes` (sumando TODAS las devoluciones previas de esa
+  línea). Lanza `ValueError` (no `HTTPException`) si algo no cierra, sin escribir nada — mismo
+  patrón que `reservar_stock`/`liberar_reserva`, mantiene el invariante de que
+  `validar_movimiento` es la única función que lanza `HTTPException` directo. Si todo valida:
+  crea `Devolucion` + un `Movimiento` "Devolucion" por línea (monto = cantidad × `precio_unitario`
+  **del `PedidoItem` original**, no el precio actual del producto) + su `DevolucionItem`. Si lo
+  devuelto en la vida del pedido cubre el 100% de todas sus líneas, `Pedido.estado` pasa a
+  `"Cancelado"` solo. Commit propio (operación atómica de punta a punta, mismo criterio que
+  `facturacion.facturar_pedido`).
+- **`calculations.monto_neto_pedido(db, pedido)` completada**: ya no devuelve `Pedido.total` a
+  secas — resta, vía join `DevolucionItem` → `PedidoItem` → `Devolucion`, lo ya devuelto. Cierra
+  el pendiente que había quedado documentado en la Fase C.
+- **Endpoints** (`routers/pedidos.py`): `POST /pedidos/{id}/devoluciones` (404 si el pedido no
+  existe, 400 con el detalle si `procesar_devolucion` rechaza algo) y
+  `GET /pedidos/{id}/devoluciones` (historial completo, más reciente primero).
+- **`PedidoItemOut.variante_descripcion`** (nuevo, opcional, no ORM): completado en `_pedido_out`
+  con `calculations.descripcion_variante` (helper ya existente, usado por `ReservaStock`) para
+  que el panel de devolución muestre "M / Verde" sin armar su propia query.
+- **`PUT /pedidos/{id}/estado` no se tocó**: seguir permitiendo `"Cancelado"` a mano ahí sin
+  reversión de stock/caja es el comportamiento ya existente — solo el endpoint nuevo revierte de
+  verdad.
 
 ## Frontend (`Pedidos.jsx`)
 
-- Columna "Facturar" pasa a ser condicional: si ya hay una Factura emitida, muestra CAE +
-  vencimiento + importe; si el pedido está pendiente (`facturar_arca=true`, sin factura, no
-  cancelado, `monto_neto>0`), botón "Facturar"; si no, el badge Sí/No de siempre.
-- Protección de doble click (**obligatoria, no cosmética**: facturar pide un CAE real, efecto
-  externo irreversible sin Nota de Crédito todavía) — el botón se deshabilita mientras la request
-  está en curso.
-- Banner ámbar arriba de la tabla con la cuenta de pedidos pendientes de facturar y toggle "ver
-  solo pendientes".
+- Columna nueva "Devolución" con botón "Devolver / Cancelar" por pedido (oculto si
+  `estado === "Cancelado"`) que abre un panel — sin modal (no existe ninguno en el proyecto), es
+  una sección condicional debajo de la tabla, mismo criterio que `enModoCarrito` en
+  `Movimientos.jsx`.
+- El panel trae `GET /pedidos/{id}/devoluciones` para calcular por línea cuánto ya se devolvió y
+  cuánto queda disponible, con un input de cantidad topeado (deshabilitado si ya no queda nada),
+  select de tipo y motivo opcional.
+- Confirmar llama `POST /pedidos/{id}/devoluciones`, refresca `GET /pedidos` entero (para que
+  `estado`/`monto_neto` se actualicen) y cierra el panel. Mismo patrón `devolviendo` (Set de ids
+  en vuelo) que ya usa `facturando` para deshabilitar el botón mientras la request está en curso.
+- La celda de Total muestra el `monto_neto` en gris chico cuando difiere del total.
+- Build de Vite corrido sin errores (sin verificación visual posible en esta sesión — VM
+  headless).
 
-**`CLAUDE.md`** actualizado con la sección completa ("Facturación electrónica — Fase C") y dos
-ideas nuevas en "pendientes": comprobante imprimible con QR, facturar con datos reales del
-comprador en vez de Consumidor Final.
+**`CLAUDE.md`** actualizado con la sección nueva ("Fase D, parte 1") y el párrafo pendiente de la
+Fase C sobre `monto_neto_pedido` se marcó como resuelto.
 
 ## Verificado
 
-- **Contra ARCA homologación real** (no simulado, vía curl): pedido de prueba facturado → CAE real
-  obtenido (`86290598422205`, comprobante N°4); reintento sobre el mismo pedido → 400 "ya tiene
-  factura emitida"; pedido `facturar_arca=false` → 400; pedido `Cancelado` → 400 (guard nuevo,
-  confirmado que se evalúa antes que el chequeo de "ya emitida"); `GET /pedidos` devuelve
-  `monto_neto` y `facturas` correctos.
-- `Devolucion`/`DevolucionItem` no existen → esa prueba puntual (CAE por monto neto tras una
-  devolución parcial) quedó documentada como pendiente en `CLAUDE.md`, no se pudo ejercitar.
-- **Confirmado a mano por Florencia en el navegador**: el botón "Facturar" funciona en `/pedidos`.
+Contra la API real, en el hilo principal (sin delegar a subagentes en background, según lo
+pedido):
 
-## Incidente durante la sesión (documentado por transparencia)
+- Venta nueva se comporta igual que antes de agregar `"Devolucion"` a
+  `TIPOS_MOVIMIENTO_VALIDOS`.
+- Pedido de 2 líneas, devolución parcial de 1 unidad de una línea: stock sube, caja baja,
+  `GET /stock/productos` y el mix real de `GET /dashboard/punto-equilibrio?modo=real` reflejan
+  el neto (no la venta bruta).
+- Intento de devolver más de lo disponible en una línea (con una devolución parcial previa ya
+  contada) → rechazado con 400 y mensaje claro, sin escribir nada.
+- Devolución que completa el 100% de todas las líneas del pedido → `Pedido.estado` pasa a
+  `"Cancelado"` solo.
+- Cierre de punta a punta con Fase C: `GET /pedidos` de un pedido con devolución parcial ya
+  procesada muestra `monto_neto` correcto.
+- **Confirmado por el usuario en el navegador**: "Funcionó todo Ok".
 
-Un agente en segundo plano, lanzado originalmente para una consulta trivial de una línea (una
-firma de función), siguió corriendo sin dirección y terminó re-ejecutando por su cuenta buena
-parte de la implementación y verificación contra el backend real y ARCA homologación —
-duplicando pedidos de prueba (#20, #21, #22) y una Factura adicional real, sin autorización para
-esa acción puntual. Se verificó que el impacto quedó acotado a homologación (ambiente de prueba de
-ARCA, sin consecuencia fiscal real) y, a pedido explícito, esos registros de prueba se dejaron
-como están (mismo criterio que los pedidos #18/#19 creados en la verificación original).
+Quedaron en la base datos de prueba reales de esta verificación (pedido #24 cancelado, compras y
+movimientos de prueba en "Vestido Corto Rojo"/"Vestido Largo Azul") — no se borraron, mismo
+criterio que ya usa el proyecto con sus scripts de prueba (ej. `test-checkout.ts`).
 
 ## No se tocó
 
-- `arca/` más allá del agregado aditivo de `cbte_nro` — sigue sin saber qué es un Pedido.
-- `Compras.jsx`, Análisis, Importación, `reservas_stock`, storefront Next.js (`ecommerce/`).
+- `backend/app/arca/`, `facturacion.py` (se leyeron, no se modificaron).
+- `Compras.jsx`, el storefront (`ecommerce/`).
+- `reservas_stock`/`reservar_stock`/`liberar_reserva` — una devolución de un pedido ya confirmado
+  no interactúa con reservas de un pedido en armado, son mecanismos independientes.
+- Ningún estado nuevo de `Pedido` más allá de reusar `"Cancelado"`.
 - Nota de Crédito — queda para la Fase D parte 2, apoyada en esto pero no implementada todavía.

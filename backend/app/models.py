@@ -304,6 +304,7 @@ class Pedido(Base):
 
     items = relationship("PedidoItem", back_populates="pedido", cascade="all, delete-orphan")
     facturas = relationship("Factura", back_populates="pedido", cascade="all, delete-orphan")
+    devoluciones = relationship("Devolucion", back_populates="pedido", cascade="all, delete-orphan")
 
 
 class PedidoItem(Base):
@@ -355,6 +356,40 @@ class Factura(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     pedido = relationship("Pedido", back_populates="facturas")
+
+
+class Devolucion(Base):
+    """Reversión de una Venta ya confirmada de un Pedido (Fase D parte 1) — cancelación (antes de
+    entregar) o devolución (después), misma mecánica para las dos. `tipo` es solo para mostrar en
+    la UI. Es un evento nuevo, nunca una edición retroactiva del Movimiento de Venta original —
+    mismo criterio ya aplicado en todo el proyecto."""
+    __tablename__ = "devoluciones"
+
+    id = Column(Integer, primary_key=True, index=True)
+    pedido_id = Column(Integer, ForeignKey("pedidos.id", ondelete="CASCADE"), nullable=False)
+    fecha = Column(DateTime(timezone=True), nullable=False, default=_now_utc)
+    motivo = Column(Text, nullable=True)
+    tipo = Column(String(20), nullable=False)  # "Cancelacion" | "Devolucion"
+
+    pedido = relationship("Pedido", back_populates="devoluciones")
+    items = relationship("DevolucionItem", back_populates="devolucion", cascade="all, delete-orphan")
+
+
+class DevolucionItem(Base):
+    """Línea de una Devolución — cuánto se devuelve de un PedidoItem puntual (puede ser menor a
+    su cantidad original). `movimiento_id` referencia el Movimiento tipo "Devolucion" que esta
+    línea generó, mismo patrón de trazabilidad que PedidoItem.movimiento_id."""
+    __tablename__ = "devolucion_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    devolucion_id = Column(Integer, ForeignKey("devoluciones.id", ondelete="CASCADE"), nullable=False)
+    pedido_item_id = Column(Integer, ForeignKey("pedido_items.id", ondelete="CASCADE"), nullable=False)
+    cantidad = Column(Integer, nullable=False)
+    movimiento_id = Column(Integer, ForeignKey("movimientos.id", ondelete="SET NULL"), nullable=True)
+
+    devolucion = relationship("Devolucion", back_populates="items")
+    pedido_item = relationship("PedidoItem")
+    movimiento = relationship("Movimiento")
 
 
 class ReservaStock(Base):
