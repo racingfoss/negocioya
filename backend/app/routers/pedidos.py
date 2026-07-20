@@ -20,6 +20,26 @@ def _pedido_out(db: Session, pedido: models.Pedido) -> schemas.PedidoOut:
     return out
 
 
+def _devolucion_out(db: Session, devolucion: models.Devolucion) -> schemas.DevolucionOut:
+    """requiere_nota_credito y nota_credito (Fase D parte 2) no son atributos del ORM, mismo
+    criterio que _pedido_out con monto_neto: hay que completarlos a mano en cualquier endpoint
+    que devuelva una Devolucion, no solo en el listado."""
+    out = schemas.DevolucionOut.model_validate(devolucion)
+    out.requiere_nota_credito = calculations.devolucion_requiere_nota_credito(db, devolucion)
+    nota_credito = (
+        db.query(models.Factura)
+        .filter(
+            models.Factura.devolucion_id == devolucion.id,
+            models.Factura.tipo_comprobante == calculations.TIPO_COMPROBANTE_NOTA_CREDITO_C,
+            models.Factura.estado == "Emitida",
+        )
+        .first()
+    )
+    if nota_credito is not None:
+        out.nota_credito = schemas.FacturaOut.model_validate(nota_credito)
+    return out
+
+
 @router.get("/", response_model=list[schemas.PedidoOut])
 def listar(db: Session = Depends(get_db), limit: int = 300):
     """Pedidos de AMBOS canales (ecommerce y local), unificados (Fase B). Reemplaza al viejo
@@ -151,21 +171,37 @@ def crear_devolucion(pedido_id: int, payload: schemas.DevolucionCreate, db: Sess
     if not db.get(models.Pedido, pedido_id):
         raise HTTPException(404, "Pedido no encontrado.")
     try:
-        return calculations.procesar_devolucion(
+        devolucion = calculations.procesar_devolucion(
             db, pedido_id, payload.items, motivo=payload.motivo, tipo=payload.tipo
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
+    return _devolucion_out(db, devolucion)
 
 
 @router.get("/{pedido_id}/devoluciones", response_model=list[schemas.DevolucionOut])
 def listar_devoluciones(pedido_id: int, db: Session = Depends(get_db)):
     """Historial de devoluciones/cancelaciones de un Pedido — usado tanto por el backend (validar
-    cuánto queda disponible por línea) como por el frontend (mostrarlo en el panel de devolución)."""
-    return (
+    cuánto queda disponible por línea) como por el frontend (mostrarlo en el panel de devolución,
+    incluido si corresponde ofrecer "Emitir Nota de Crédito" por fila, Fase D parte 2)."""
+    devoluciones = (
         db.query(models.Devolucion)
         .options(joinedload(models.Devolucion.items))
         .filter(models.Devolucion.pedido_id == pedido_id)
         .order_by(models.Devolucion.fecha.desc())
         .all()
     )
+    return [_devolucion_out(db, d) for d in devoluciones]
+
+
+@router.post(
+    "/{pedido_id}/devoluciones/{devolucion_id}/nota-credito",
+    response_model=schemas.FacturaOut,
+)
+def emitir_nota_credito(pedido_id: int, devolucion_id: int, db: Session = Depends(get_db)):
+    """Pide un CAE real a ARCA para la Nota de Crédito C de esta devolución (Fase D parte 2) — ver
+    facturacion.emitir_nota_credito para la orquestación completa (elegibilidad, llamado a
+    WSFEv1 con CbtesAsoc, persistencia del intento). `pedido_id` en la ruta es solo para el
+    anidamiento consistente con el resto de este router — la validación real es contra
+    devolucion_id, que ya identifica su pedido de forma unívoca."""
+    return facturacion.emitir_nota_credito(db, devolucion_id)

@@ -1,98 +1,110 @@
-Fase D, parte 1: reversión de ventas — devoluciones (después de entregado) y cancelaciones (antes de
-entregar), con soporte de devolución PARCIAL por línea (no solo cancelar el pedido entero completo — es
-el caso más común en indumentaria: "me quedo con una prenda, devuelvo otra"). Esta ronda NO toca ARCA —
-la Nota de Crédito es una parte 2 aparte, para cuando esto ya esté probado funcionando.
+Fase D, parte 2: Nota de Crédito C, para cuando una devolución/cancelación corresponde a un pedido que ya
+tenía una Factura C emitida. Manual (un botón aparte, "Emitir Nota de Crédito"), nunca automática al
+procesar la devolución — mismo criterio que "Facturar".
 
-## El mecanismo (léelo antes de programar)
+## Antes de programar nada: no deleguen a agentes en segundo plano sin supervisión
 
-**No delegues ninguna parte de esta implementación ni de las pruebas a agentes en segundo plano sin
-supervisión** (subagentes/Task para "verificar" o "confirmar" algo puntual que terminen actuando por su
-cuenta). Esta fase toca funciones centrales del sistema (stock, caja, BCG, mix real) — si necesitás
-confirmar algo, hacelo vos mismo, en el hilo principal, visible. Nada de esto se prueba contra ARCA (esta
-fase no lo toca), pero sí contra la base real del negocio — el mismo cuidado aplica.
+Esta fase toca ARCA real (homologación) y una tabla que ya usa la Fase C — mismo cuidado que la vez
+pasada. Si necesitás confirmar algo puntual, hacelo en el hilo principal, visible.
 
-Una devolución/cancelación es un evento **nuevo**, no una edición de la venta original — mismo criterio
-ya aplicado en todo el proyecto (nunca se edita retroactivamente un `Movimiento` de Venta para "corregir"
-una devolución). Se modela con un `Movimiento` tipo `"Devolucion"` nuevo, espejo de `"Venta"`: donde
-`"Venta"` resta stock y suma caja, `"Devolucion"` suma stock y resta caja. Esto obliga a tocar las
-funciones centrales que agregan por tipo de movimiento — hacelo, es necesario para que Stock, BCG y el
-mix real dejen de contar una venta que en los hechos se revirtió, no es opcional.
+## 1. Cuándo corresponde (y cuándo NO)
 
-## 1. Modelo de datos
+Una `Devolucion` necesita Nota de Crédito si y solo si: el `Pedido` al que pertenece tiene una `Factura`
+(`tipo_comprobante=11`, `estado="Emitida"`) cuyo `created_at` es **anterior** a la `fecha` de esa
+`Devolucion`, Y esa `Devolucion` todavía no tiene su propia Nota de Crédito emitida. Si la factura no
+existe, o se emitió DESPUÉS de la devolución (`facturar_pedido` ya cobró el neto correcto gracias a
+`monto_neto_pedido`), no corresponde nada — no muestres el botón ni dejes que se llame el endpoint en ese
+caso.
 
-`Devolucion`: `id`, `pedido_id` (FK), `fecha`, `motivo` (nullable), `tipo` (`"Cancelacion"` |
-`"Devolucion"` — solo para mostrar en la UI, la mecánica es idéntica para los dos).
+Como la Fase C ya impide una segunda Factura C (`tipo_comprobante=11`) para el mismo pedido, en la
+práctica hay como mucho una factura original por pedido — no hace falta contemplar varias, alcanza con la
+relación 1 devolución → 1 Nota de Crédito.
 
-`DevolucionItem`: `id`, `devolucion_id` (FK), `pedido_item_id` (FK al `PedidoItem` original que se está
-revirtiendo), `cantidad` (cuántas unidades de esa línea se devuelven — puede ser menor a la cantidad
-original), `movimiento_id` (FK al `Movimiento` tipo Devolución que generó, mismo patrón de trazabilidad
-que ya usa `PedidoItem.movimiento_id`).
+**Nueva función `calculations.devolucion_requiere_nota_credito(db, devolucion) -> bool`**, encapsulando
+exactamente esa regla — usala tanto en la validación del endpoint como en lo que le devuelvas al
+frontend para decidir si mostrar el botón.
 
-## 2. `calculations.py` — extender, no duplicar
+**Nueva función `calculations.monto_devolucion(db, devolucion) -> Decimal`**: suma, por cada
+`DevolucionItem` de esa `devolucion_id`, `cantidad × precio_unitario` (del `PedidoItem` original, mismo
+criterio de siempre) — es el monto de ESA devolución puntual, no del pedido entero.
 
-- **`TIPOS_MOVIMIENTO_VALIDOS`**: agregar `"Devolucion"`.
-- **`stock_por_producto`, `stock_por_variante`, `stock_disponible`**: donde hoy restan
-  `total_vendido = sum(cantidad WHERE tipo="Venta")`, pasan a restar el neto:
-  `total_vendido - sum(cantidad WHERE tipo="Devolucion")`. Mismo criterio para las reservas ya
-  existentes (`excluir_sesion`, `considerar_reservas`) — no toques esa lógica, solo el cálculo base sobre
-  el que actúan.
-- **`get_caja_actual`**: `"Devolucion"` resta de la caja, mismo lado que `"Egreso"` (es plata que sale).
-- **`unidades_vendidas_por_producto`/`facturacion_por_producto`** (usadas por BCG, Análisis, y el mix real
-  del Punto de Equilibrio): también netean contra `"Devolucion"` — una venta revertida no debe inflar
-  volumen ni facturación en esas pantallas.
-- **`validar_movimiento`/`registrar_venta`**: no deberían necesitar cambios de comportamiento para
-  `tipo="Venta"` — confirmalo con una prueba, no asumas. La creación del `Movimiento` tipo `Devolucion` en
-  sí puede ir directo (no pasa por las mismas validaciones de stock que una Venta, porque va en sentido
-  contrario — no hace falta "verificar que haya stock" para devolver algo).
-- **Nueva función `procesar_devolucion(db, pedido_id, items, motivo=None, tipo="Devolucion")`**: valida
-  que cada `pedido_item_id` pertenezca a ese `pedido_id`, y que la `cantidad` a devolver no supere
-  `cantidad_original - cantidad_ya_devuelta_antes` (sumá las devoluciones previas de esa misma línea, si
-  las hay). Si algo no cierra, error claro sin escribir nada (mismo criterio atómico de siempre). Si todo
-  valida, en una transacción: crea `Devolucion`, por cada línea un `Movimiento` tipo `Devolucion`
-  (`monto = cantidad × precio_unitario` — usá el `precio_unitario` **del `PedidoItem` original**, no el
-  `precio_venta` actual del producto, por la misma razón de denormalización ya documentada en todo el
-  proyecto) + su `DevolucionItem`. Al final, si la suma de todo lo devuelto en la vida de ese pedido
-  iguala la cantidad original de TODAS sus líneas, actualizá `Pedido.estado` a `"Cancelado"` — si es
-  parcial, dejá el estado como está (no hace falta un estado nuevo tipo "parcialmente devuelto", alcanza
-  con poder ver la lista de devoluciones de ese pedido).
-- **Completá `calculations.monto_neto_pedido(db, pedido)`, no la reescribas ni le cambies la firma** — ya
-  existe (Fase C, facturación ARCA), hoy devuelve `Pedido.total` sin restar nada porque estas tablas no
-  existían todavía, y `PedidoOut`/`Pedidos.jsx`/`facturacion.py` ya dependen de ella tal cual está (recibe
-  el objeto `Pedido` ya cargado, no un id). Agregale la resta real: por cada `DevolucionItem` cuyo
-  `PedidoItem` pertenezca a este pedido, `cantidad × precio_unitario` del `PedidoItem` original, restado
-  de `Pedido.total`. No hace falta tocar nada de `facturacion.py` — en cuanto esta función devuelva el
-  neto real, el monto a facturar de un pedido con devolución previa se corrige solo.
+## 2. `Factura` — dos columnas nuevas (tabla existente, necesita `ALTER TABLE`)
 
-## 3. Endpoint
+`devolucion_id` (nullable, FK a `devoluciones.id`) y `factura_original_id` (nullable, FK a `facturas.id`,
+autorreferencial) — las dos se completan SOLO en filas `tipo_comprobante=13`. `devolucion_id` identifica
+a qué devolución corresponde esa Nota de Crédito; `factura_original_id` apunta a la Factura C que se está
+acreditando (necesario para armar `CbtesAsoc` en el pedido a ARCA, y para poder mostrar "esta NC
+corresponde a la factura #X" después). Migración manual, `facturas` ya existe:
+```sql
+ALTER TABLE facturas ADD COLUMN devolucion_id INTEGER REFERENCES devoluciones(id);
+ALTER TABLE facturas ADD COLUMN factura_original_id INTEGER REFERENCES facturas(id);
+```
 
-`POST /pedidos/{id}/devoluciones`: `{motivo, tipo, items: [{pedido_item_id, cantidad}]}` → llama
-`procesar_devolucion`. `GET /pedidos/{id}/devoluciones`: historial de devoluciones de ese pedido (para
-saber cuánto de cada línea ya se devolvió antes, tanto en el backend para validar como en el frontend para
-mostrar).
+## 3. `backend/app/arca/wsfe.py` — extender, no duplicar
 
-## 4. Frontend — `Pedidos.jsx`
+`fe_cae_solicitar` (la función que ya existe) gana un parámetro opcional `cbtes_asoc:
+Optional[list[dict]] = None` — cuando se pasa, arma el array `<CbtesAsoc>` en el request (cada dict con
+`tipo`, `pto_vta`, `nro`, correspondientes a la Factura original). No crees una función nueva paralela
+para Nota de Crédito — es el mismo método `FECAESolicitar` de ARCA, la única diferencia real es el
+`CbteTipo` (13 en vez de 11) y este array opcional. Confirmá con el `cbte_tipo` que ya recibe la función
+que `FECompUltimoAutorizado` se siga consultando correctamente para tipo 13 (numeración independiente de
+la de tipo 11 — cada tipo de comprobante tiene su propia secuencia en ARCA).
 
-Acción nueva por pedido ("Devolver / Cancelar") que abre el detalle de sus líneas, mostrando por cada una
-cantidad original, cuánto ya se devolvió antes (si algo), y cuánto queda disponible para devolver — con
-un input de cantidad por línea (tope = lo disponible) y motivo opcional. Al confirmar, llama al endpoint
-del punto 3 y refresca. Sin ningún botón de Nota de Crédito todavía — eso es la parte 2.
+**Verificá el signo del importe antes de armar el request** — no lo asumas. Según lo que se leyó del
+manual de WSFEv1 en la Fase A, `ImpNeto`/`ImpTotal` para un comprobante tipo 13 deberían mandarse en
+positivo (el tipo de comprobante, no el signo, es lo que le dice a ARCA que es una nota de crédito) —
+pero confirmalo releyendo la sección correspondiente del manual (`manual-desarrollador-ARCA-COMPG.pdf`,
+ya descargado/consultado en la Fase A) antes de darlo por sentado, porque un signo incorrecto acá es el
+tipo de error caro de detectar tarde.
+
+## 4. `backend/app/facturacion.py`
+
+`emitir_nota_credito(db, devolucion_id)`, mismo estilo que `facturar_pedido` (podés extraer un helper
+compartido para la parte de "llamar a ARCA y persistir el resultado, éxito o error", ya que la lógica es
+casi idéntica entre las dos — a tu criterio, no es obligatorio si preferís mantenerlas separadas y
+duplicar poco):
+
+1. Buscar la `Devolucion`, 404 si no existe.
+2. Si `not devolucion_requiere_nota_credito(db, devolucion)`: 400 con el motivo correspondiente (sin
+   factura emitida antes de esta devolución, o ya tiene su Nota de Crédito).
+3. `monto = monto_devolucion(db, devolucion)`.
+4. Leer `arca_cuit`/`arca_punto_venta_defecto` de configuración (mismo chequeo que `facturar_pedido`).
+5. Ubicar la `Factura` original (`tipo_comprobante=11`, `estado="Emitida"`, `created_at` anterior a la
+   devolución) para armar `cbtes_asoc=[{tipo: 11, pto_vta: ..., nro: ...}]`.
+6. `wsfe.fe_cae_solicitar(..., cbte_tipo=13, cbtes_asoc=[...])`.
+7. Éxito: crear `Factura(tipo_comprobante=13, pedido_id=devolucion.pedido_id, devolucion_id=...,
+   factura_original_id=..., estado="Emitida", importe_total=monto, ...)`.
+8. Error/rechazo: mismo criterio que `facturar_pedido` — crear igual la fila con `estado="Error"`, commit
+   inmediato antes de propagar el error.
+
+## 5. Endpoint
+
+`POST /pedidos/{pedido_id}/devoluciones/{devolucion_id}/nota-credito` (mismo estilo de anidamiento que
+`POST /pedidos/{id}/devoluciones` que ya existe), llama a `facturacion.emitir_nota_credito`.
+
+## 6. Frontend — `Pedidos.jsx`
+
+En el historial de devoluciones de cada pedido (el que ya se muestra en el panel de devolución), agregar
+un botón "Emitir Nota de Crédito" por cada `Devolucion` donde corresponda — podés confiar en que el
+backend rechace con 400 si no corresponde y mostrar ese error, no hace falta duplicar toda la regla de
+elegibilidad en el frontend si te resulta más simple así. Misma protección de doble-click que ya usa
+"Facturar" (`facturando`) — reusá el mismo patrón, mismo motivo (llamada SOAP externa e irreversible). En
+éxito, mostrar el CAE de la Nota de Crédito en esa fila del historial.
 
 ## Qué NO hacer
 
-Nada de ARCA (`backend/app/arca/`, `facturacion.py`) — ni tocarlos ni llamarlos. No implementes ningún
-estado nuevo de `Pedido` más allá de reusar `"Cancelado"` (ya existe desde la Fase B). No toques
-`Compras.jsx`, el storefront (`ecommerce/`), ni la reserva de stock (`reservas_stock`) — una devolución no
-tiene por qué interactuar con reservas activas, son mecanismos independientes.
+Nada de CAEA. Ningún otro tipo de comprobante más allá de Nota de Crédito C (13). No toques
+`reservas_stock`, `Compras.jsx`, el storefront. No conviertas esto en algo automático — sigue siendo un
+botón que Florencia aprieta cuando quiere, igual que "Facturar".
 
 ## Antes de terminar
 
-Probá contra la API real: una devolución parcial (pedido con 2 líneas, devolver solo 1 unidad de una)
-confirmando que el stock sube bien, la caja baja bien, y `GET /stock/productos`/`Análisis` reflejan el
-neto (no la venta bruta). Intentar devolver más de lo disponible en una línea (contando una devolución
-previa parcial de esa misma línea) y confirmar el rechazo. Una devolución que cubre el 100% de todas las
-líneas de un pedido y confirmar que `Pedido.estado` pasa a `"Cancelado"` solo. **Cerrá el círculo con la
-Fase C**: un pedido con una devolución parcial ya procesada, consultado por `GET /pedidos`, tiene que
-mostrar `monto_neto` correcto (Fase C ya lo expone en la respuesta) — esa era la prueba que había quedado
-pendiente documentada en el CLAUDE.md, ahora ya se puede ejercitar. Avisame qué probar a mano en el
-navegador. Actualizá el CLAUDE.md con esta sección nueva, y sacá de "pendientes" la prueba de
-`monto_neto_pedido` que ahora ya está cubierta.
+Contra ARCA real (homologación): un pedido facturado de verdad (Fase C), con una devolución posterior
+(Fase D parte 1) de parte de ese pedido, emitir la Nota de Crédito y confirmar CAE real + que
+`CbtesAsoc` efectivamente referencia la factura original (podés confirmarlo con `FECompConsultar` sobre
+el comprobante nuevo, o revisando la respuesta). Intentar emitir una segunda Nota de Crédito para la
+misma devolución y confirmar el rechazo. Intentar emitir Nota de Crédito para una devolución que no
+corresponde (pedido nunca facturado, o devolución anterior a la factura) y confirmar el rechazo con el
+motivo correcto. Avisame qué probar a mano en el navegador. Actualizá el CLAUDE.md con esta sección
+nueva, y con esto ya se puede sacar "Nota de Crédito" de cualquier lista de pendientes donde apareciera.
+Reemplazá el contenido de resumenultimamodif.md con el resumen que armes al terminar.

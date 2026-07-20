@@ -257,6 +257,9 @@ class FacturaOut(BaseModel):
     estado: str
     mensaje_error: Optional[str]
     created_at: datetime
+    # Solo poblados en Notas de Crédito (tipo_comprobante=13, Fase D parte 2) — ver models.Factura.
+    devolucion_id: Optional[int] = None
+    factura_original_id: Optional[int] = None
 
 
 class PedidoOut(BaseModel):
@@ -327,6 +330,11 @@ class DevolucionOut(BaseModel):
     motivo: Optional[str]
     tipo: str
     items: list[DevolucionItemOut] = []
+    # Fase D parte 2 — ninguno de los dos es atributo del ORM, los completa el router
+    # (_devolucion_out) llamando a calculations.devolucion_requiere_nota_credito y buscando la
+    # Factura tipo 13 ya emitida para esta devolución, si existe.
+    requiere_nota_credito: bool = False
+    nota_credito: Optional[FacturaOut] = None
 
 
 # --- Reserva de stock efímera (pedido en armado en Caja) ---

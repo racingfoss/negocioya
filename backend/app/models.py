@@ -331,18 +331,23 @@ class PedidoItem(Base):
 
 class Factura(Base):
     """Intento de facturación ARCA (WSFEv1) de un Pedido — Fase C. Un pedido puede tener más de
-    una fila con el tiempo (intentos fallidos, y a futuro una Nota de Crédito), por eso no es
-    una relación 1:1 forzada. `tipo_comprobante` es un campo propio (no hardcodeado en la
-    query) porque una futura Nota de Crédito C usaría 13 en esta misma tabla, aunque esta fase
-    solo emite 11 (Factura C). `punto_venta` es un snapshot del valor de `configuracion` al
-    momento de facturar, no una referencia viva. `doc_tipo`/`doc_nro` default a Consumidor
-    Final (99/0) pero `facturacion.py` siempre los pasa explícitos al crear la fila — el
-    default de columna es solo una red de seguridad, no la fuente de verdad."""
+    una fila con el tiempo (intentos fallidos, y desde Fase D parte 2 también Notas de Crédito),
+    por eso no es una relación 1:1 forzada. `tipo_comprobante` es un campo propio (no
+    hardcodeado en la query): 11 = Factura C, 13 = Nota de Crédito C. `punto_venta` es un
+    snapshot del valor de `configuracion` al momento de facturar, no una referencia viva.
+    `doc_tipo`/`doc_nro` default a Consumidor Final (99/0) pero `facturacion.py` siempre los
+    pasa explícitos al crear la fila — el default de columna es solo una red de seguridad, no la
+    fuente de verdad. `devolucion_id`/`factura_original_id` se completan SOLO en filas
+    `tipo_comprobante=13`: identifican a qué Devolucion corresponde la Nota de Crédito y qué
+    Factura C se está acreditando (necesario para armar CbtesAsoc contra ARCA). Sin
+    relationships nuevas para esas dos — mismo criterio minimalista que ReservaStock, las
+    queries que las usan (calculations.devolucion_requiere_nota_credito, facturacion.py) son
+    explícitas y no necesitan navegar desde el ORM."""
     __tablename__ = "facturas"
 
     id = Column(Integer, primary_key=True, index=True)
     pedido_id = Column(Integer, ForeignKey("pedidos.id", ondelete="CASCADE"), nullable=False)
-    tipo_comprobante = Column(Integer, nullable=False, default=11)  # 11 = Factura C
+    tipo_comprobante = Column(Integer, nullable=False, default=11)  # 11 = Factura C, 13 = Nota de Crédito C
     punto_venta = Column(Integer, nullable=False)
     numero_comprobante = Column(Integer, nullable=True)
     cae = Column(String(20), nullable=True)
@@ -354,6 +359,9 @@ class Factura(Base):
     estado = Column(String(20), nullable=False)  # "Emitida" | "Error"
     mensaje_error = Column(Text, nullable=True)  # también guarda observaciones de ARCA en éxito
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Solo poblados en Notas de Crédito (tipo_comprobante=13) — ver docstring de la clase.
+    devolucion_id = Column(Integer, ForeignKey("devoluciones.id"), nullable=True)
+    factura_original_id = Column(Integer, ForeignKey("facturas.id"), nullable=True)
 
     pedido = relationship("Pedido", back_populates="facturas")
 

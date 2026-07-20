@@ -1190,6 +1190,121 @@ Fase D parte 2 futura, que se apoya en esto.
   un pedido (`Pedido.estado` pasa a `"Cancelado"` solo); y el cierre de punta a punta con Fase C
   (`GET /pedidos` de un pedido con devolución parcial ya procesada muestra `monto_neto` correcto).
 
+## Fase D, parte 2 — Nota de Crédito C
+
+Conecta la reversión de ventas (Fase D parte 1) con ARCA (Fase C): cuando una `Devolucion` corresponde a
+un `Pedido` que ya tenía una Factura C emitida, el CAE real queda por un monto que ya no coincide con lo
+efectivamente cobrado, sin forma de corregirlo ante ARCA. Manual, un botón "Emitir Nota de Crédito" — igual
+que "Facturar", nunca se dispara solo al procesar la devolución. Esta ronda no toca CAEA ni ningún otro
+tipo de comprobante fuera de Nota de Crédito C (13).
+
+- **Cuándo corresponde (y cuándo no)**: una `Devolucion` necesita Nota de Crédito si y solo si el
+  `Pedido` tiene una `Factura` (`tipo_comprobante=11`, `estado="Emitida"`) cuyo `created_at` es
+  **anterior** a la `fecha` de esa `Devolucion` (si la factura no existe, o se emitió DESPUÉS de la
+  devolución, `facturar_pedido` ya cobró el neto correcto vía `monto_neto_pedido` y no corresponde nada),
+  Y esa `Devolucion` todavía no tiene su propia Nota de Crédito emitida. Como la Fase C ya impide una
+  segunda Factura C para el mismo pedido, en la práctica alcanza con la relación 1 devolución → 1 Nota de
+  Crédito. **`calculations.devolucion_requiere_nota_credito(db, devolucion) -> bool`** encapsula
+  exactamente esta regla — se usa tanto en la validación del endpoint como en lo que recibe el frontend
+  (`DevolucionOut.requiere_nota_credito`) para decidir si mostrar el botón, sin duplicar la regla ahí.
+  **`calculations.monto_devolucion(db, devolucion) -> Decimal`** suma `cantidad × precio_unitario` (del
+  `PedidoItem` original) de cada `DevolucionItem` de ESA devolución puntual — a diferencia de
+  `monto_neto_pedido`, que calcula el neto acumulado de todo el pedido, no sirve para el monto de una
+  devolución individual. Ambas constantes de tipo de comprobante (`TIPO_COMPROBANTE_FACTURA_C = 11`,
+  `TIPO_COMPROBANTE_NOTA_CREDITO_C = 13`) están duplicadas como literales locales en `calculations.py`
+  (además de las ya existentes en `facturacion.py`) a propósito: `facturacion.py` ya importa
+  `calculations.py`, así que importarlas al revés generaría un ciclo — mismo criterio de no compartir
+  constantes/helpers chicos entre módulos que ya usa el proyecto (`_pedido_out` duplicado entre
+  `routers/pedidos.py` y `routers/ecommerce.py`).
+- **`models.Factura` — dos columnas nuevas** (`ALTER TABLE` manual, tabla ya existente):
+  `devolucion_id` (FK a `devoluciones.id`) y `factura_original_id` (FK a `facturas.id`,
+  autorreferencial) — las dos se completan SOLO en filas `tipo_comprobante=13`. `devolucion_id`
+  identifica a qué devolución corresponde la Nota de Crédito; `factura_original_id` apunta a la Factura C
+  que se está acreditando (necesario para armar `CbtesAsoc` contra ARCA, y para poder mostrar "esta NC
+  corresponde a la factura #X"). Sin relationships nuevas — mismo criterio minimalista que
+  `ReservaStock`, las queries que las usan son explícitas.
+- **`arca/wsfe.py::fe_cae_solicitar` — extendida, no duplicada**: gana un parámetro opcional
+  `cbtes_asoc: list[dict] | None = None`; cuando se pasa, arma `detalle["CbtesAsoc"] = {"CbteAsoc":
+  cbtes_asoc}`, cada dict con las claves `"Tipo"`, `"PtoVta"`, `"Nro"` (los 3 obligatorios, mismos
+  nombres de campo que ya usa `detalle` para hablarle a ARCA). `fe_comp_ultimo_autorizado` ya recibía
+  `cbte_tipo` como parámetro simple, así que la numeración de la Nota de Crédito (secuencia
+  independiente de la de Factura C en ARCA) sale bien sin ningún cambio ahí — confirmado contra
+  homologación real: la primera Nota de Crédito C emitida salió con `CbteNro=1`, sin importar que la
+  Factura C llevara ya varios números. **Signo de los importes, confirmado (no asumido) contra los
+  ejemplos oficiales de FECAESolicitar para Nota de Crédito C (AFIP SDK) y el manual de WSFEv1**:
+  `ImpNeto`/`ImpTotal` se informan en **positivo**, igual que en una Factura — es el `cbte_tipo` (13) el
+  que le indica a ARCA que es una nota de crédito, no el signo del importe. Confirmado además
+  end-to-end contra homologación real con `FECompConsultar` sobre el comprobante emitido: ARCA devolvió
+  `ImpNeto`/`ImpTotal` en positivo y `CbtesAsoc` con el `Tipo`/`PtoVta`/`Nro` exactos de la Factura C
+  original.
+- **`backend/app/facturacion.py`**: se extrajo un helper privado compartido
+  `_solicitar_cae_y_persistir(db, *, pedido_id, tipo_comprobante, monto, cuit, pto_vta, cbtes_asoc=None,
+  devolucion_id=None, factura_original_id=None)` que encapsula "llamar a `wsfe.fe_cae_solicitar`,
+  interpretar la respuesta, persistir la `Factura` (Emitida o Error, con commit)" — usado tanto por
+  `facturar_pedido` (refactor sin cambio de comportamiento) como por la función nueva
+  `emitir_nota_credito(db, devolucion_id)`. Esta última: 404 si la `Devolucion` no existe; 400 (con el
+  motivo específico — sin Factura previa, o ya tiene su Nota de Crédito) si
+  `devolucion_requiere_nota_credito` da `False`; calcula `monto = calculations.monto_devolucion(...)`;
+  valida `arca_cuit` de Configuración (mismo chequeo que `facturar_pedido`); ubica la Factura C original
+  con el helper `_factura_original_de` (mismo filtro que la regla de elegibilidad: tipo 11, Emitida,
+  `created_at` anterior a la devolución) para armar `cbtes_asoc=[{"Tipo": ..., "PtoVta": ..., "Nro":
+  ...}]` con sus datos reales; llama al helper compartido con `tipo_comprobante=13`.
+- **Endpoint**: `POST /pedidos/{pedido_id}/devoluciones/{devolucion_id}/nota-credito`
+  (`routers/pedidos.py`, `response_model=schemas.FacturaOut`), delega en `facturacion.emitir_nota_credito`
+  — `pedido_id` en la ruta es solo por el anidamiento consistente con el resto del router, la
+  validación real es contra `devolucion_id`. Nuevo helper `_devolucion_out(db, devolucion)` (mismo
+  criterio que `_pedido_out` con `monto_neto`) completa `DevolucionOut.requiere_nota_credito` y
+  `DevolucionOut.nota_credito` (la `Factura` tipo 13 ya emitida para esa devolución, si existe) — se usa
+  en `GET /pedidos/{id}/devoluciones` y en el `POST` que crea la devolución, no solo en el listado.
+- **Frontend (`Pedidos.jsx`)**: el panel de devolución (antes solo usaba el historial internamente para
+  calcular `yaDevuelto`/`disponible`, sin renderizarlo) ahora también **lista** `devolucionesPanel`
+  (fecha, tipo, motivo, resumen de ítems). Por cada `Devolucion` con `requiere_nota_credito === true` y
+  sin `nota_credito` todavía: botón "Emitir Nota de Crédito" — mismo patrón de protección de doble-click
+  que `facturando` (nuevo `Set` de estado `emitiendoNC`, deshabilita el botón de esa fila mientras la
+  request SOAP está en curso). En éxito, muestra el CAE/importe de la Nota de Crédito en esa fila del
+  historial (reemplazando el botón); en error, lo muestra en `errorPanel`, mismo lugar que el resto del
+  panel.
+- **Probado end-to-end contra ARCA real (homologación)**: pedido facturado de verdad (Factura C, CAE
+  real) con una devolución parcial posterior → Nota de Crédito emitida con CAE real, confirmado con
+  `FECompConsultar` que `CbtesAsoc` referencia exactamente la Factura original y que los importes viajan
+  en positivo. Reintento de una segunda Nota de Crédito para la misma devolución → rechazado con 400
+  ("ya tiene su Nota de Crédito emitida"). Devolución procesada ANTES de facturar el pedido (por lo tanto
+  la Factura queda con `created_at` posterior a esa devolución) → intento de Nota de Crédito rechazado
+  con 400 y el motivo correcto ("no tiene una Factura C emitida antes de esta devolución"), mismo
+  resultado para una devolución de un pedido que nunca se facturó.
+- **Qué NO se tocó**: `reservas_stock`, `Compras.jsx`, el storefront (`ecommerce/`). Nada de CAEA.
+  Ningún estado nuevo de `Pedido`. Sigue siendo un botón manual, igual que "Facturar" — nunca se dispara
+  solo al procesar una devolución.
+
+### Dos bugs de UX encontrados en uso real (ronda de fixes posterior)
+
+- **El botón que abre el panel de devolución desaparecía en un pedido `Cancelado`**: la columna
+  "Devolución" de `Pedidos.jsx` ocultaba el botón con la condición `p.estado !== 'Cancelado'`. Como una
+  devolución que cubre el 100% de las líneas pone `Pedido.estado = "Cancelado"`
+  (`calculations.procesar_devolucion`), después de una devolución total quedaba sin forma de volver a
+  entrar al panel para ver el historial ni el botón "Emitir Nota de Crédito". Fix: el botón siempre se
+  muestra, con el texto "Ver devoluciones" en vez de "Devolver / Cancelar" cuando `estado === "Cancelado"`
+  (no queda nada para devolver, pero sigue teniendo sentido entrar a ver/facturar NC).
+- **Confirmar una devolución cerraba el panel solo**: `confirmarDevolucion` llamaba
+  `cerrarPanelDevolucion()` en el camino de éxito, así que el historial actualizado (con la devolución
+  recién creada y su elegibilidad de NC) recién se volvía a pedir la próxima vez que se abría el panel.
+  Fix: ya no se cierra — se refresca `devolucionesPanel` in situ (además de `GET /pedidos`) y solo se
+  limpian los campos del formulario de carga, dejando el panel abierto con el historial al día.
+- **Timeout del cliente HTTP cortaba `Facturar`/`Emitir Nota de Crédito` con un mensaje engañoso**: la
+  instancia axios de `frontend/src/api.js` tiene un timeout global de 10s. Esas dos acciones disparan un
+  SOAP real contra ARCA (WSAA, con renovación de ticket cada ~12hs, + 2 llamadas WSFEv1) que en la
+  práctica puede superar los 10s. Cuando el timeout cortaba la request, `getErrorMessage` mostraba "No se
+  pudo conectar con la API..." (engañoso: no es un problema de conectividad, el backend no tiene ningún
+  timeout propio — `uvicorn --reload` sin límite — y sigue procesando y guarda la Factura/NC real igual).
+  Confirmado además que ambos endpoints son `def` sincrónicos (no `async def`): FastAPI/Starlette ya los
+  corre en un thread aparte del pool de workers automáticamente, así que mientras se factura un pedido el
+  resto del sistema (storefront incluido) sigue respondiendo normal — no hizo falta ningún cambio de
+  concurrencia del lado del backend. Fix, 100% en `Pedidos.jsx`: `facturar`/`emitirNotaCredito` pasan
+  `{ timeout: 30000 }` puntual en esas dos llamadas (el default global de `api.js` se deja igual para el
+  resto de la app), y en el `catch` refrescan el pedido/devolución real desde el backend — si resulta que
+  la Factura/NC ya existe (porque el timeout cortó una request que en realidad terminó bien, o porque era
+  un reintento sobre algo ya emitido), la UI se corrige sola mostrando el CAE real sin mostrar error.
+
 ## Convenciones de código
 
 - **Backend**: nombres de tablas, campos, funciones y mensajes de error en español. Sin Alembic (ver nota

@@ -960,6 +960,68 @@ def procesar_devolucion(
 
 
 # ---------------------------------------------------------------------------
+# Fase D parte 2: Nota de Crédito C. Estas dos constantes duplican
+# TIPO_COMPROBANTE_FACTURA_C / el futuro TIPO_COMPROBANTE_NOTA_CREDITO_C de
+# facturacion.py a propósito — no se importan de ahí porque facturacion.py ya
+# importa este módulo (calculations.py) y crear el import inverso generaría un
+# ciclo. Mismo criterio de no compartir constantes/helpers chicos entre
+# módulos que ya se usa en el proyecto (ej. _pedido_out duplicado entre
+# routers/pedidos.py y routers/ecommerce.py).
+# ---------------------------------------------------------------------------
+TIPO_COMPROBANTE_FACTURA_C = 11
+TIPO_COMPROBANTE_NOTA_CREDITO_C = 13
+
+
+def monto_devolucion(db: Session, devolucion: "models.Devolucion") -> Decimal:
+    """Monto de ESA Devolucion puntual (no el neto acumulado del pedido entero, para eso está
+    monto_neto_pedido): suma cantidad × precio_unitario del PedidoItem original, por cada
+    DevolucionItem de esta devolución — mismo criterio de denormalización de siempre."""
+    monto = (
+        db.query(
+            func.coalesce(
+                func.sum(models.DevolucionItem.cantidad * models.PedidoItem.precio_unitario), 0
+            )
+        )
+        .join(models.PedidoItem, models.PedidoItem.id == models.DevolucionItem.pedido_item_id)
+        .filter(models.DevolucionItem.devolucion_id == devolucion.id)
+        .scalar()
+    )
+    return Decimal(monto)
+
+
+def devolucion_requiere_nota_credito(db: Session, devolucion: "models.Devolucion") -> bool:
+    """True si y solo si: el Pedido de esta Devolucion tiene una Factura C (tipo_comprobante=11,
+    estado="Emitida") emitida ANTES de esta Devolucion (created_at < devolucion.fecha) — si no
+    existe o se emitió después, facturar_pedido ya cobró el neto correcto vía monto_neto_pedido
+    y no corresponde nada — Y esa Devolucion todavía no tiene su propia Nota de Crédito
+    (tipo_comprobante=13, estado="Emitida", devolucion_id=devolucion.id) emitida. Usada tanto
+    para la validación del endpoint como para lo que el frontend recibe y decide si mostrar el
+    botón "Emitir Nota de Crédito"."""
+    factura_previa = (
+        db.query(models.Factura)
+        .filter(
+            models.Factura.pedido_id == devolucion.pedido_id,
+            models.Factura.tipo_comprobante == TIPO_COMPROBANTE_FACTURA_C,
+            models.Factura.estado == "Emitida",
+            models.Factura.created_at < devolucion.fecha,
+        )
+        .first()
+    )
+    if factura_previa is None:
+        return False
+    ya_tiene_nota_credito = (
+        db.query(models.Factura)
+        .filter(
+            models.Factura.devolucion_id == devolucion.id,
+            models.Factura.tipo_comprobante == TIPO_COMPROBANTE_NOTA_CREDITO_C,
+            models.Factura.estado == "Emitida",
+        )
+        .first()
+    )
+    return ya_tiene_nota_credito is None
+
+
+# ---------------------------------------------------------------------------
 # Única función de este módulo que lanza HTTPException — excepción deliberada a
 # la convención "los routers validan, calculations calcula". Se justifica porque
 # POST/PUT /movimientos (Caja) y POST /ecommerce/ordenes necesitan literalmente

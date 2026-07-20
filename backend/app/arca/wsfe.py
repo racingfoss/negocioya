@@ -50,12 +50,25 @@ def fe_cae_solicitar(
     doc_nro: int = 0,
     condicion_iva_receptor_id: int = 5,
     cbte_tipo: int = 11,
+    cbtes_asoc: list[dict] | None = None,
     _incluir_iva_invalido: bool = False,
 ) -> dict:
-    """Pide un CAE para una Factura C (cbte_tipo=11 por default). doc_tipo/doc_nro default a
-    Consumidor Final (99/0), condicion_iva_receptor_id default a 5 (Consumidor Final) — este
-    campo lo exige ARCA hoy en FECAEDetRequest aunque no estaba en el detalle original del
-    prompt de esta fase.
+    """Pide un CAE para una Factura C (cbte_tipo=11 por default) o, desde Fase D parte 2, una
+    Nota de Crédito C (cbte_tipo=13). doc_tipo/doc_nro default a Consumidor Final (99/0),
+    condicion_iva_receptor_id default a 5 (Consumidor Final) — este campo lo exige ARCA hoy en
+    FECAEDetRequest aunque no estaba en el detalle original del prompt de esta fase.
+    `fe_comp_ultimo_autorizado` ya toma `cbte_tipo` como parámetro, así que la numeración de la
+    Nota de Crédito (independiente de la de Factura C) sale bien sin cambios ahí.
+
+    `cbtes_asoc`, si se pasa (Nota de Crédito/Débito), arma el array `CbtesAsoc` con el/los
+    comprobante(s) que se están acreditando/debitando — cada dict con las claves `"Tipo"`,
+    `"PtoVta"`, `"Nro"` (mismos nombres de campo que ya usa `detalle` para hablarle a ARCA, los
+    3 obligatorios). Confirmado contra los ejemplos oficiales de FECAESolicitar para Nota de
+    Crédito C (AFIP SDK) y el manual de WSFEv1: los importes (`ImpNeto`/`ImpTotal`) se informan
+    en POSITIVO igual que en una Factura — es el `cbte_tipo` (13) el que le indica a ARCA que es
+    una nota de crédito, no el signo del importe. Por eso `fe_cae_solicitar` no le hace ningún
+    tratamiento especial al signo de `imp_neto` acá: el caller (`facturacion.py`) le pasa el
+    monto de la devolución tal cual, en positivo.
 
     `_incluir_iva_invalido` es solo para el script de prueba (caso de rechazo esperado): manda
     el array `Iva`, que WSFEv1 rechaza para tipo C. Nunca se usa en el camino normal.
@@ -79,6 +92,8 @@ def fe_cae_solicitar(
         "CondicionIVAReceptorId": condicion_iva_receptor_id,
         # Sin la clave "Iva": está prohibida para Factura C, WSFEv1 la rechaza si viene.
     }
+    if cbtes_asoc:
+        detalle["CbtesAsoc"] = {"CbteAsoc": cbtes_asoc}
     if _incluir_iva_invalido:
         detalle["Iva"] = {
             "AlicIva": [{"Id": 5, "BaseImp": imp_neto, "Importe": imp_neto * 0.21}]

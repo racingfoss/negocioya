@@ -27,6 +27,9 @@ export default function Pedidos() {
   const [tipoDevolucion, setTipoDevolucion] = useState('Devolucion')
   const [devolviendo, setDevolviendo] = useState(new Set())
   const [errorPanel, setErrorPanel] = useState('')
+  // Nota de Crédito (Fase D parte 2), Set de ids de Devolucion en vuelo — mismo patrón que
+  // facturando/devolviendo, para que un doble click no dispare dos SOAP contra ARCA.
+  const [emitiendoNC, setEmitiendoNC] = useState(new Set())
 
   useEffect(() => {
     api.get('/pedidos').then((r) => setPedidos(r.data)).catch((e) => setError(getErrorMessage(e)))
@@ -47,12 +50,27 @@ export default function Pedidos() {
     setError('')
     setFacturando((prev) => new Set(prev).add(pedido.id))
     try {
-      const { data: factura } = await api.post(`/pedidos/${pedido.id}/facturar`)
+      // Timeout más largo que el default (10s) de la instancia `api`: esto dispara un SOAP
+      // real contra ARCA (WSAA + WSFEv1), que puede tardar más que una llamada CRUD normal,
+      // sobre todo cuando toca renovar el ticket de WSAA (cada ~12hs).
+      const { data: factura } = await api.post(`/pedidos/${pedido.id}/facturar`, null, { timeout: 30000 })
       setPedidos((prev) =>
         prev.map((p) => (p.id === pedido.id ? { ...p, facturas: [...(p.facturas || []), factura] } : p))
       )
     } catch (e) {
-      setError(getErrorMessage(e))
+      const mensaje = getErrorMessage(e)
+      // La request puede haber fallado del lado del navegador (timeout) DESPUÉS de que el
+      // backend ya terminó de facturar, o puede ser un reintento que choca con "ya facturado"
+      // de un intento anterior. En los dos casos, el pedido ya tiene la factura real del lado
+      // del servidor — se refresca y, si es así, se muestra el CAE en vez de un error falso.
+      try {
+        const { data } = await api.get('/pedidos')
+        setPedidos(data)
+        const actualizado = data.find((p) => p.id === pedido.id)
+        setError(actualizado && facturaEmitida(actualizado) ? '' : mensaje)
+      } catch {
+        setError(mensaje)
+      }
     } finally {
       setFacturando((prev) => {
         const next = new Set(prev)
@@ -107,15 +125,59 @@ export default function Pedidos() {
         tipo: tipoDevolucion,
         items,
       })
-      const { data } = await api.get('/pedidos')
-      setPedidos(data)
-      cerrarPanelDevolucion()
+      // No se cierra el panel: se refresca in situ (pedidos + historial de devoluciones de
+      // ESTE pedido) para que la devolución recién creada, y su botón de Nota de Crédito si
+      // corresponde, aparezcan de inmediato sin tener que cerrar y volver a abrir el panel.
+      const [{ data: pedidosData }, { data: devolucionesData }] = await Promise.all([
+        api.get('/pedidos'),
+        api.get(`/pedidos/${pedido.id}/devoluciones`),
+      ])
+      setPedidos(pedidosData)
+      setDevolucionesPanel(devolucionesData)
+      setCantidadesDevolver({})
+      setMotivoDevolucion('')
     } catch (e) {
       setErrorPanel(getErrorMessage(e))
     } finally {
       setDevolviendo((prev) => {
         const next = new Set(prev)
         next.delete(pedido.id)
+        return next
+      })
+    }
+  }
+
+  const emitirNotaCredito = async (pedido, devolucion) => {
+    setErrorPanel('')
+    setEmitiendoNC((prev) => new Set(prev).add(devolucion.id))
+    try {
+      // Mismo motivo que en facturar(): esto dispara un SOAP real contra ARCA, con margen
+      // extra sobre el timeout default de la instancia `api`.
+      const { data: notaCredito } = await api.post(
+        `/pedidos/${pedido.id}/devoluciones/${devolucion.id}/nota-credito`,
+        null,
+        { timeout: 30000 }
+      )
+      setDevolucionesPanel((prev) =>
+        prev.map((d) => (d.id === devolucion.id ? { ...d, nota_credito: notaCredito } : d))
+      )
+    } catch (e) {
+      const mensaje = getErrorMessage(e)
+      // Mismo criterio de reconciliación que facturar(): si la NC en realidad ya se emitió del
+      // lado del servidor (timeout del navegador, o reintento sobre una ya emitida), refrescar
+      // el historial y mostrar el CAE real en vez de un error falso.
+      try {
+        const { data } = await api.get(`/pedidos/${pedido.id}/devoluciones`)
+        setDevolucionesPanel(data)
+        const actualizada = data.find((d) => d.id === devolucion.id)
+        setErrorPanel(actualizada?.nota_credito ? '' : mensaje)
+      } catch {
+        setErrorPanel(mensaje)
+      }
+    } finally {
+      setEmitiendoNC((prev) => {
+        const next = new Set(prev)
+        next.delete(devolucion.id)
         return next
       })
     }
@@ -234,16 +296,12 @@ export default function Pedidos() {
                     </select>
                   </td>
                   <td>
-                    {p.estado !== 'Cancelado' ? (
-                      <button
-                        onClick={() => abrirPanelDevolucion(p)}
-                        className="bg-red-950/50 hover:bg-red-900/60 text-red-300 text-xs px-2 py-1 rounded whitespace-nowrap"
-                      >
-                        Devolver / Cancelar
-                      </button>
-                    ) : (
-                      <span className="text-gray-600 text-xs">—</span>
-                    )}
+                    <button
+                      onClick={() => abrirPanelDevolucion(p)}
+                      className="bg-red-950/50 hover:bg-red-900/60 text-red-300 text-xs px-2 py-1 rounded whitespace-nowrap"
+                    >
+                      {p.estado === 'Cancelado' ? 'Ver devoluciones' : 'Devolver / Cancelar'}
+                    </button>
                   </td>
                 </tr>
               )
@@ -311,6 +369,48 @@ export default function Pedidos() {
               })}
             </tbody>
           </table>
+
+          {devolucionesPanel.length > 0 && (
+            <div className="space-y-2">
+              <h3 className="text-sm font-semibold text-gray-300">Historial de devoluciones</h3>
+              {devolucionesPanel.map((d) => (
+                <div key={d.id} className="bg-[#0b0f19] rounded-lg p-3 text-xs space-y-1">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <div>
+                      <span className="font-medium">{d.tipo === 'Cancelacion' ? 'Cancelación' : 'Devolución'}</span>
+                      {' — '}
+                      {new Date(d.fecha).toLocaleString('es-AR')}
+                      {d.motivo && <span className="text-gray-500"> · {d.motivo}</span>}
+                    </div>
+                    {d.nota_credito ? (
+                      <div className="text-green-400 whitespace-nowrap">
+                        NC CAE {d.nota_credito.cae} · ${Number(d.nota_credito.importe_total).toLocaleString('es-AR')}
+                      </div>
+                    ) : d.requiere_nota_credito ? (
+                      <button
+                        onClick={() => emitirNotaCredito(pedidoEnPanel, d)}
+                        disabled={emitiendoNC.has(d.id)}
+                        className="bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-400 px-2 py-1 rounded whitespace-nowrap"
+                      >
+                        {emitiendoNC.has(d.id) ? 'Emitiendo NC...' : 'Emitir Nota de Crédito'}
+                      </button>
+                    ) : null}
+                  </div>
+                  <div className="text-gray-400">
+                    {d.items.map((it) => {
+                      const pedidoItem = pedidoEnPanel.items.find((pi) => pi.id === it.pedido_item_id)
+                      return (
+                        <div key={it.id}>
+                          {pedidoItem?.producto?.nombre || `Item #${it.pedido_item_id}`} x{it.cantidad}
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
           <div className="flex flex-wrap items-center gap-3">
             <select
               value={tipoDevolucion}
