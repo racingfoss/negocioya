@@ -411,6 +411,8 @@ class ConfiguracionBase(BaseModel):
     arca_punto_venta_defecto: int = 1
     arca_razon_social: Optional[str] = None
     arca_domicilio_fiscal: Optional[str] = None
+    arca_condicion_iva: str = "RESPONSABLE MONOTRIBUTO"
+    arca_inicio_actividades: Optional[date] = None
 
 
 class Configuracion(ConfiguracionBase):
@@ -441,6 +443,8 @@ class ConfiguracionUpdate(BaseModel):
     arca_punto_venta_defecto: Optional[int] = None
     arca_razon_social: Optional[str] = None
     arca_domicilio_fiscal: Optional[str] = None
+    arca_condicion_iva: Optional[str] = None
+    arca_inicio_actividades: Optional[date] = None
 
 
 # --- Configuración de la tienda (subset público, para el storefront) ---

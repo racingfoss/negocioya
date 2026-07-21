@@ -262,6 +262,14 @@ export default function Pedidos() {
                         <div>CAE {factura.cae}</div>
                         <div>Vto {factura.cae_vencimiento}</div>
                         <div>${Number(factura.importe_total).toLocaleString('es-AR')}</div>
+                        <a
+                          href={`${api.defaults.baseURL}/pedidos/${p.id}/facturas/${factura.id}/pdf`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-blue-400 hover:underline"
+                        >
+                          Ver PDF
+                        </a>
                       </div>
                     ) : pendiente ? (
                       <button
@@ -384,7 +392,15 @@ export default function Pedidos() {
                     </div>
                     {d.nota_credito ? (
                       <div className="text-green-400 whitespace-nowrap">
-                        NC CAE {d.nota_credito.cae} · ${Number(d.nota_credito.importe_total).toLocaleString('es-AR')}
+                        NC CAE {d.nota_credito.cae} · ${Number(d.nota_credito.importe_total).toLocaleString('es-AR')}{' '}
+                        <a
+                          href={`${api.defaults.baseURL}/pedidos/${pedidoEnPanel.id}/facturas/${d.nota_credito.id}/pdf`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-blue-400 hover:underline"
+                        >
+                          Ver PDF
+                        </a>
                       </div>
                     ) : d.requiere_nota_credito ? (
                       <button

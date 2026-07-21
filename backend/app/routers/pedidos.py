@@ -1,7 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy.orm import Session, joinedload
 
-from .. import calculations, facturacion, models, schemas
+from .. import calculations, facturacion, facturas_pdf, models, schemas
 from ..database import get_db
 
 router = APIRouter(prefix="/pedidos", tags=["Pedidos"])
@@ -205,3 +205,28 @@ def emitir_nota_credito(pedido_id: int, devolucion_id: int, db: Session = Depend
     anidamiento consistente con el resto de este router — la validación real es contra
     devolucion_id, que ya identifica su pedido de forma unívoca."""
     return facturacion.emitir_nota_credito(db, devolucion_id)
+
+
+@router.get("/{pedido_id}/facturas/{factura_id}/pdf")
+def factura_pdf(pedido_id: int, factura_id: int, db: Session = Depends(get_db)):
+    """Comprobante imprimible (Factura C o Nota de Crédito C) con código QR ARCA (Fase E) — ver
+    facturas_pdf.generar_pdf_factura para el armado completo. Se genera al vuelo en cada
+    descarga, mismo criterio que GET /importacion/plantilla (nada se persiste en disco)."""
+    if not db.get(models.Pedido, pedido_id):
+        raise HTTPException(404, "Pedido no encontrado.")
+    factura = db.get(models.Factura, factura_id)
+    if not factura or factura.pedido_id != pedido_id:
+        raise HTTPException(404, "Factura no encontrada para este pedido.")
+    try:
+        pdf_bytes = facturas_pdf.generar_pdf_factura(db, factura)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    es_nota_credito = factura.tipo_comprobante == facturas_pdf.TIPO_COMPROBANTE_NOTA_CREDITO_C
+    prefijo = "NC" if es_nota_credito else "Factura"
+    nombre_archivo = f"{prefijo}C_{factura.punto_venta:04d}-{factura.numero_comprobante:08d}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{nombre_archivo}"'},
+    )

@@ -96,8 +96,10 @@ devuelve esa fila, creándola con los defaults de abajo la primera vez que se ne
 | `reserva_stock_minutos` | 20 | Minutos de vida de una reserva de stock para un pedido en armado en Caja. |
 | `arca_cuit` | `null` | CUIT que se usa para pedir el CAE a ARCA (WSFEv1). |
 | `arca_punto_venta_defecto` | 1 | Punto de venta habilitado en ARCA usado para `FECompUltimoAutorizado`/`FECAESolicitar`. |
-| `arca_razon_social` | `null` | Nombre completo para el comprobante. Todavía sin uso en código (fase pendiente del PDF/impresión). |
-| `arca_domicilio_fiscal` | `null` | Domicilio para el comprobante. Todavía sin uso en código (fase pendiente del PDF/impresión). |
+| `arca_razon_social` | `null` | Nombre completo para el comprobante. Usado por el PDF imprimible (`GET /pedidos/{id}/facturas/{id}/pdf`, Fase E) — obligatorio, sin él el endpoint rechaza con 400. |
+| `arca_domicilio_fiscal` | `null` | Domicilio para el comprobante. Mismo uso/obligatoriedad que `arca_razon_social` (Fase E). |
+| `arca_condicion_iva` | `"RESPONSABLE MONOTRIBUTO"` | Condición frente al IVA mostrada en el bloque emisor del PDF imprimible (Fase E). |
+| `arca_inicio_actividades` | `null` | Fecha de inicio de actividades mostrada en el bloque emisor del PDF imprimible (Fase E); opcional, si no está cargada esa línea se omite sin romper el PDF. |
 | `nombre_ecommerce` | `"Adorante"` | Nombre real de la tienda pública (`FashBalance` es el nombre de este software de gestión, no se muestra al público). |
 | `whatsapp_numero` | — | Número de WhatsApp mostrado en el storefront. |
 | `instagram_url` / `facebook_url` | `null` | Redes sociales del storefront (nullable). |
@@ -133,7 +135,7 @@ qué pantalla y qué flujo hay que probar a mano en el navegador antes de dar el
 - Normalización de tildes en el matching de importación de Excel (ver "gap conocido" en `backend/CLAUDE.md`).
 - Columna `CodigoProducto` opcional en la planilla de importación, como fallback de búsqueda si el
   matching por nombre empieza a dar falsos duplicados.
-- Comprobante imprimible con código QR para las Facturas emitidas (Fase C solo pide y guarda el
-  CAE, no genera nada imprimible todavía).
 - Opción de facturar con los datos reales del comprador (DNI/CUIT) en vez de Consumidor Final
   fijo — la Fase C siempre factura como Consumidor Final, sin pedirle datos a nadie.
+- Envío del PDF de Factura/Nota de Crédito por email/WhatsApp (Fase E solo genera el PDF al vuelo
+  para descarga manual desde `Pedidos.jsx`, explícitamente fuera de alcance).

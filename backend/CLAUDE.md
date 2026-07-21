@@ -428,9 +428,8 @@ Orden/Venta real en una Factura en esta fase — eso llega en la Fase C.
   desde ⚙️ Configuración sin acceso a la infraestructura del servidor. Solo lo que depende del
   filesystem/red del contenedor (`ARCA_ENTORNO`, rutas de certificado) sigue en `.env` — cambiarlas
   requiere reiniciar el contenedor de todos modos porque son archivos/URLs, no datos que Florencia deba
-  poder tocar sin ayuda técnica. `arca_razon_social`/`arca_domicilio_fiscal` **todavía no los usa ningún
-  código** (`FECAESolicitar` no los necesita, van en el comprobante impreso — fase futura no
-  planificada).
+  poder tocar sin ayuda técnica. `arca_razon_social`/`arca_domicilio_fiscal` **no los usa
+  `FECAESolicitar`** (WSFEv1 no los necesita) — los usa el comprobante impreso, ver Fase E más abajo.
 - **Dependencias nuevas**: `zeep` (cliente SOAP, resuelve el WSDL de WSAA/WSFEv1 solo) y `cryptography`
   (firma CMS/PKCS#7). `lxml` no se agregó como dependencia directa — la TRA y la respuesta de `loginCms`
   se arman/parsean con `xml.etree.ElementTree` de la stdlib, `zeep` ya trae `lxml` transitivamente.
@@ -771,6 +770,71 @@ Crédito C (13).
   en positivo. Reintento de una segunda Nota de Crédito para la misma devolución → rechazado con 400.
   Devolución procesada ANTES de facturar el pedido → intento de Nota de Crédito rechazado con 400 y el
   motivo correcto, mismo resultado para una devolución de un pedido que nunca se facturó.
+
+## Fase E — PDF de Factura/Nota de Crédito con código QR (ARCA)
+
+Conecta la Fase C (Factura C) y la Fase D parte 2 (Nota de Crédito C) con un comprobante imprimible
+real: PDF con los datos exigidos por RG 1415 + código QR según RG 4892 de ARCA. Hasta acá `facturas`
+solo guardaba el CAE — no existía ningún artefacto imprimible. Puramente aditiva: solo **lee** `Factura`
+ya emitida, no toca el flujo de emisión (`facturacion.py`, `arca/wsfe.py`/`wsaa.py`). Antes de escribir
+código de `reportlab` se armó y aprobó con la usuaria un mockup ASCII del layout completo (uno para
+Factura C, uno para Nota de Crédito C) — el layout implementado es ese, sin iterar a ciegas.
+
+- **`backend/app/arca/qr.py`** (nuevo): módulo puro, sin acceso a DB — mismo criterio de aislamiento que
+  `wsaa.py`/`wsfe.py` (`arca/` sigue sin saber qué es un Pedido/Factura). `construir_url_qr(*,
+  fecha_emision, cuit, punto_venta, tipo_comprobante, numero_comprobante, importe_total, doc_tipo,
+  doc_nro, cae) -> str` arma `https://www.arca.gob.ar/fe/qr/?p={JSON en Base64}` exactamente según la
+  especificación (campos `ver=1, fecha, cuit, ptoVta, tipoCmp, nroCmp, importe, moneda="PES", ctz=1,
+  tipoDocRec, nroDocRec, tipoCodAut="E", codAut`). Solo `json`/`base64` de stdlib — no importa `qrcode`
+  acá a propósito, eso es responsabilidad de la capa de presentación.
+- **`backend/app/facturas_pdf.py`** (nuevo, mismo nivel que `facturacion.py`, no adentro de `arca/`):
+  `generar_pdf_factura(db, factura) -> bytes`. **Lanza `ValueError`** (no `HTTPException`) — sigue el
+  criterio de `calculations.py`, no se suma a las dos únicas excepciones documentadas del proyecto que
+  lanzan `HTTPException` directo (`calculations.validar_movimiento` y `facturacion.py`); el router
+  traduce el `ValueError` a 400. Valida en orden: `factura.estado == "Emitida"` (no se imprime un
+  intento fallido); `Configuracion.arca_razon_social`/`arca_domicilio_fiscal` cargados (sin sentido
+  emitir un comprobante legalmente incompleto). Arma la URL del QR con `arca.qr.construir_url_qr(...)` y
+  la renderiza a PNG con `qrcode.make(...)` en un `BytesIO`; arma el PDF con `reportlab.platypus`
+  (`SimpleDocTemplate` + `Table`/`Paragraph`/`Image`, A4). Contenido según `tipo_comprobante`: **11
+  (Factura C)** — ítems de `factura.pedido.items` (usa `calculations.descripcion_variante` para
+  variantes, precio unitario y subtotal del `PedidoItem` denormalizado, no del producto actual). **13
+  (Nota de Crédito C)** — ítems de `factura.devolucion.items` (`DevolucionItem`, join a su `PedidoItem`
+  original vía la relationship `pedido_item`; la cantidad sale de `DevolucionItem.cantidad`, que puede
+  ser menor a la original si la devolución fue parcial) más una línea "Comprobante que rectifica: Factura
+  C {pv:04d}-{nro:08d}" leyendo `factura.factura_original_id`. `Factura` no tiene relationships hacia
+  `devolucion`/`factura_original` (criterio minimalista ya documentado en Fase D parte 2), así que se
+  resuelven con `db.get(models.Devolucion, factura.devolucion_id)` /
+  `db.get(models.Factura, factura.factura_original_id)` explícitos. En ningún caso se discrimina IVA
+  (leyenda fija "Responsable Monotributo — IVA no discriminado", igual que WSFEv1). Formato de moneda
+  es-AR armado a mano (`_money`, punto de miles/coma decimal) — no hay ninguna librería de formato de
+  moneda en el proyecto.
+- **`GET /pedidos/{pedido_id}/facturas/{factura_id}/pdf`** (`routers/pedidos.py`): 404 si el pedido no
+  existe o la `Factura` no existe/no pertenece a ese `pedido_id`; `try/except ValueError as e: raise
+  HTTPException(400, str(e))` alrededor de `facturas_pdf.generar_pdf_factura` (mismo patrón que
+  `crear_devolucion`); en éxito, `Response(content=pdf_bytes, media_type="application/pdf",
+  headers={"Content-Disposition": 'inline; filename="..."'})` — `inline` a propósito para que abra en una
+  pestaña nueva en vez de forzar descarga. Se genera al vuelo en cada request, sin persistir nada en
+  disco — mismo criterio que `GET /importacion/plantilla`.
+- **`models.Configuracion` — dos columnas nuevas** (`ALTER TABLE` manual, tabla ya existente):
+  `arca_condicion_iva` (`String(50)`, default `"RESPONSABLE MONOTRIBUTO"`) y `arca_inicio_actividades`
+  (`Date`, nullable — si no está cargada, esa línea se omite del PDF sin romperlo). Reflejadas en
+  `ConfiguracionBase`/`ConfiguracionUpdate` (`schemas.py`). Tabla completa de campos de `configuracion`
+  en el `CLAUDE.md` de la raíz.
+- **Dependencias nuevas**: `reportlab` (armado del PDF) y `qrcode[pil]` (PNG del QR, usa Pillow como
+  backend de imagen). `python:3.11-slim` resolvió wheels prearmadas para ambas sin necesitar
+  `build-essential` — mismo chequeo ya hecho con `zeep`/`cryptography` en la Fase A.
+- **Probado end-to-end contra la API real** (pedidos ya facturados en homologación): PDF de Factura C y
+  de Nota de Crédito C descargados y validados como PDF real (magic bytes `%PDF-1.4`…`%%EOF`, texto
+  extraído confirma emisor/CAE/ítems/total, y en la Nota de Crédito la línea "Comprobante que rectifica"
+  con el número correcto de la Factura C original); QR decodificado a mano confirma el JSON exacto del
+  spec, y escaneado con un lector real de celular resuelve contra `arca.gob.ar`. Casos de error
+  confirmados: `Factura` con `estado="Error"` → 400; pedido inexistente → 404; `factura_id` que no
+  pertenece al `pedido_id` de la ruta → 404; `Configuracion` con `arca_domicilio_fiscal` vacío → 400 con
+  el mensaje pidiendo completar ⚙️ Configuración.
+- **Qué NO se tocó**: `ecommerce/` (storefront), `backend/app/arca/wsfe.py`/`wsaa.py`, `facturacion.py`
+  (solo se lee `Factura`, no se modifica el flujo de emisión), `reservas_stock`, `Compras.jsx`. Nada de
+  envío por email/WhatsApp ni persistencia del PDF en disco — explícitamente fuera de alcance de esta
+  fase.
 
 ## Convenciones de código (backend)
 

@@ -100,12 +100,15 @@ El backend de esta feature (tabla `mix_snapshots`, detección lazy) está en `ba
 
 La tabla completa de campos editables (con sus defaults y qué controla cada uno) está en el `CLAUDE.md`
 de la raíz. La pantalla es un formulario genérico **data-driven** (constante `GRUPOS`, agrupa los campos
-por sección: "Stock y Reposición", "Costos", "Tienda Online", etc.) — un campo numérico nuevo en
-`configuracion` se agrega como una entrada más de `GRUPOS`, sin lógica especial por campo. La sección
-"Tienda Online" edita `nombre_ecommerce`, `whatsapp_numero`, `instagram_url`, `facebook_url`,
-`email_contacto` con el mismo `GET`/`PUT /configuracion` que el resto — esos campos los consume
-`ecommerce/` vía un endpoint aparte (`GET /ecommerce/configuracion-tienda`, ver `backend/CLAUDE.md` y
-`ecommerce/CLAUDE.md`), pero se editan siempre desde acá.
+por sección: "Stock y Reposición", "Costos", "Tienda Online", etc.) — un campo numérico o de texto nuevo
+en `configuracion` se agrega como una entrada más de `GRUPOS` (`{ key, label, ayuda, tipo }`), sin lógica
+especial por campo. El input genérico distingue tres `tipo`: `'texto'` (`<input type="text">`), `'fecha'`
+(`<input type="date">`, agregado en la Fase E para `arca_inicio_actividades`) y el default sin `tipo`
+(`<input type="number">`) — un campo de fecha nuevo no necesita más que sumar `tipo: 'fecha'` a su
+entrada de `GRUPOS`. La sección "Tienda Online" edita `nombre_ecommerce`, `whatsapp_numero`,
+`instagram_url`, `facebook_url`, `email_contacto` con el mismo `GET`/`PUT /configuracion` que el resto —
+esos campos los consume `ecommerce/` vía un endpoint aparte (`GET /ecommerce/configuracion-tienda`, ver
+`backend/CLAUDE.md` y `ecommerce/CLAUDE.md`), pero se editan siempre desde acá.
 
 ## Fase B — Pedido unificado: Caja como carrito (`Movimientos.jsx` / `Pedidos.jsx`)
 
@@ -238,3 +241,16 @@ El backend (`Devolucion`/`DevolucionItem`, `procesar_devolucion`, Nota de Crédi
   resto de la app), y en el `catch` refrescan el pedido/devolución real desde el backend — si la
   Factura/NC ya existe (porque el timeout cortó una request que en realidad terminó bien), la UI se
   corrige sola mostrando el CAE real sin mostrar error.
+
+## Fase E — link "Ver PDF" (`Pedidos.jsx`)
+
+El backend (PDF con QR, `GET /pedidos/{id}/facturas/{id}/pdf`) está en `backend/CLAUDE.md`. Del lado del
+frontend es aditivo puro: dos links `<a target="_blank">` nuevos, sin estado de React nuevo (no pasan por
+`axios`, son URLs de descarga directas al backend) y sin cambios en ningún fetch existente.
+
+- En la columna "Facturar" (rama `factura ? (...)`, junto a CAE/Vto/importe): "Ver PDF" apunta a
+  `${api.defaults.baseURL}/pedidos/${p.id}/facturas/${factura.id}/pdf`.
+- En el historial de devoluciones (rama `d.nota_credito ? (...)`, junto a "NC CAE ... · $..."): "Ver PDF"
+  apunta a `${api.defaults.baseURL}/pedidos/${pedidoEnPanel.id}/facturas/${d.nota_credito.id}/pdf`.
+- Se usa `api.defaults.baseURL` (la instancia axios ya configurada en `src/api.js`) en vez de exportar
+  `API_URL` aparte solo para esto — `Pedidos.jsx` no tenía esa constante importada hasta ahora.

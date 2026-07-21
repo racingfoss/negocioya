@@ -150,6 +150,18 @@ const GRUPOS = [
         ayuda: 'Dirección que va a figurar en el comprobante. Todavía no se usa para pedir el CAE, se deja cargado para cuando se arme el comprobante imprimible.',
         tipo: 'texto',
       },
+      {
+        key: 'arca_condicion_iva',
+        label: 'Condición frente al IVA',
+        ayuda: 'Va a figurar en el bloque emisor del comprobante imprimible (PDF). Ej: RESPONSABLE MONOTRIBUTO.',
+        tipo: 'texto',
+      },
+      {
+        key: 'arca_inicio_actividades',
+        label: 'Inicio de actividades',
+        ayuda: 'Va a figurar en el bloque emisor del comprobante imprimible (PDF). Dejalo vacío para omitir esa línea.',
+        tipo: 'fecha',
+      },
     ],
   },
 ]
@@ -208,8 +220,8 @@ export default function Configuracion() {
               <label className="md:col-span-1 font-medium text-sm pt-2">{c.label}</label>
               <div className="md:col-span-2">
                 <input
-                  type={c.tipo === 'texto' ? 'text' : 'number'}
-                  step={c.tipo === 'texto' ? undefined : 'any'}
+                  type={c.tipo === 'texto' ? 'text' : c.tipo === 'fecha' ? 'date' : 'number'}
+                  step={c.tipo === 'texto' || c.tipo === 'fecha' ? undefined : 'any'}
                   className="w-full md:w-72 bg-[#0b0f19] border border-gray-700 rounded-lg p-2"
                   value={config[c.key] ?? ''}
                   onChange={(e) => cambiar(c.key, e.target.value)}

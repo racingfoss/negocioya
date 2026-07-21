@@ -228,6 +228,11 @@ class Configuracion(Base):
     arca_punto_venta_defecto = Column(Integer, nullable=False, default=1)
     arca_razon_social = Column(String(150), nullable=True)
     arca_domicilio_fiscal = Column(String(255), nullable=True)
+    # Fase E — comprobante imprimible: condición frente al IVA e inicio de actividades, van en el
+    # bloque emisor del PDF (ver backend/app/facturas_pdf.py). arca_inicio_actividades es opcional:
+    # si no está cargada, esa línea se omite del PDF sin romperlo.
+    arca_condicion_iva = Column(String(50), nullable=False, default="RESPONSABLE MONOTRIBUTO")
+    arca_inicio_actividades = Column(Date, nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 

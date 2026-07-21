@@ -1,78 +1,93 @@
-# Resumen de la última modificación — Fixes de UX en Nota de Crédito C (uso real)
+# Resumen de la última modificación — Fase E: PDF de Factura/Nota de Crédito con QR (ARCA)
 
-Después de que Florencia usara Fase D parte 2 (Nota de Crédito C) en la práctica, reportó 3 problemas
-en `Pedidos.jsx`. Los tres eran de frontend puro — el backend ya calculaba/persistía todo correctamente
-(`requiere_nota_credito`, `nota_credito`, la Factura/NC real), el problema era cuándo/cómo el frontend
-pedía esos datos y qué hacía con un error. No se tocó nada de `calculations.py`, `facturacion.py`,
-`routers/pedidos.py`, `schemas.py`, `models.py` ni `arca/` en esta ronda.
+Implementación de `prompt1.md`: hasta ahora `facturas` solo guardaba el CAE real que devuelve ARCA, sin
+ningún artefacto imprimible para entregarle a la clienta. Esta fase agrega la generación de ese PDF
+(Factura C y Nota de Crédito C, con el mismo código parametrizado) con el código QR obligatorio según la
+RG 4892 de ARCA. Es puramente aditiva: solo **lee** una `Factura` ya emitida, no toca el flujo de emisión
+(`facturacion.py`, `arca/wsfe.py`/`wsaa.py`, `reservas_stock`, `Compras.jsx`, ni el storefront).
 
-## 1. Devolución total → desaparecía el botón para ver el historial/NC
+Como pedía `prompt1.md` explícitamente, antes de escribir código de `reportlab` se armó un mockup ASCII
+del layout completo (uno para Factura C, uno para Nota de Crédito C — emisor arriba, datos de comprobante
++ CAE, receptor, tabla de ítems, totales, QR abajo del todo) y se esperó aprobación antes de implementar.
+Los dos mockups se aprobaron tal cual, sin ajustes.
 
-Una devolución que cubre el 100% de las líneas pone `Pedido.estado = "Cancelado"`. La columna
-"Devolución" ocultaba el botón que abre el panel con la condición `p.estado !== 'Cancelado'` — así que
-después de una devolución total no había forma de volver a entrar a ver el historial ni el botón
-"Emitir Nota de Crédito". **Fix**: el botón siempre se muestra; el texto cambia a "Ver devoluciones"
-(en vez de "Devolver / Cancelar") cuando `estado === "Cancelado"`.
+## 1. Backend — módulos nuevos
 
-## 2. Devolución parcial → había que reabrir el panel para ver el botón de NC
+- **`backend/app/arca/qr.py`** (nuevo): `construir_url_qr(...)` arma
+  `https://www.arca.gob.ar/fe/qr/?p={JSON en Base64}` exactamente según el mapeo de campos de la
+  especificación (`ver, fecha, cuit, ptoVta, tipoCmp, nroCmp, importe, moneda="PES", ctz=1, tipoDocRec,
+  nroDocRec, tipoCodAut="E", codAut`). Módulo puro, sin acceso a DB — mismo criterio de aislamiento que
+  `wsaa.py`/`wsfe.py`.
+- **`backend/app/facturas_pdf.py`** (nuevo, mismo nivel que `facturacion.py`): `generar_pdf_factura(db,
+  factura) -> bytes`. Valida `estado == "Emitida"` y que `Configuracion.arca_razon_social`/
+  `arca_domicilio_fiscal` estén cargados (lanza `ValueError`, no `HTTPException` — mismo criterio que
+  `calculations.py`). Arma el QR (PNG con `qrcode`) y el PDF (`reportlab.platypus`, A4) siguiendo el
+  mockup aprobado. Ítems: de `Pedido.items` para Factura C, o de `Devolucion.items` (join a su
+  `PedidoItem` original) más la línea "Comprobante que rectifica" para Nota de Crédito C.
+- **`GET /pedidos/{pedido_id}/facturas/{factura_id}/pdf`** (`routers/pedidos.py`): 404 si no
+  corresponden, 400 si `generar_pdf_factura` rechaza, `Response` con `media_type="application/pdf"` e
+  `inline` (abre en pestaña nueva). Se genera al vuelo, no se persiste nada en disco — mismo criterio que
+  `GET /importacion/plantilla`.
 
-`confirmarDevolucion` cerraba el panel solo al confirmar con éxito (`cerrarPanelDevolucion()`), así que
-el historial actualizado (con la devolución recién creada y su elegibilidad de NC) recién se volvía a
-pedir la próxima vez que se abría el panel. **Fix**: ya no se cierra — se refresca `devolucionesPanel`
-in situ (junto con `GET /pedidos`) y solo se limpian los campos del formulario de carga, dejando el
-panel abierto y al día.
+## 2. Configuración — 2 campos nuevos
 
-## 3. Timeout del cliente HTTP cortaba Facturar/NC con un mensaje engañoso
+`Configuracion.arca_condicion_iva` (default `"RESPONSABLE MONOTRIBUTO"`) y `arca_inicio_actividades`
+(fecha, opcional — si no está cargada, esa línea se omite del PDF). `ALTER TABLE` manual ya aplicado
+sobre la base real (sin Alembic, como el resto del proyecto). Reflejados en `models.py`, `schemas.py`
+(`ConfiguracionBase`/`ConfiguracionUpdate`) y en `Configuracion.jsx` (grupo "ARCA / Facturación
+electrónica"). El input genérico data-driven de esa pantalla ganó un tercer `tipo: 'fecha'`
+(`<input type="date">`), antes solo distinguía texto vs. numérico.
 
-Reportado como: "a veces al hacer click en Facturar/NC aparece 'No se pudo conectar con la API...'
-aunque estoy local", y al reintentar, el sistema decía que ya se había facturado/emitido pero sin
-mostrarlo bien.
+## 3. Frontend — link "Ver PDF" (`Pedidos.jsx`)
 
-**Causa raíz** (confirmada leyendo el código, no asumida): `frontend/src/api.js` tiene un timeout
-global de 10s en la instancia axios, que aplica también a `/facturar` y `/nota-credito`. Esas dos
-llamadas disparan un SOAP real contra ARCA (WSAA, con renovación de ticket cada ~12hs, + 2 llamadas
-WSFEv1) que en la práctica puede superar los 10s. El backend no tiene ningún timeout propio
-(`uvicorn --reload` sin límite) y sigue procesando igual — termina guardando la Factura/NC real aunque
-el navegador ya haya cortado la conexión por su cuenta. Confirmado además, a pedido explícito del
-usuario antes de tocar código: los dos endpoints (`facturar`, `emitir_nota_credito`) son `def`
-sincrónicos, no `async def` — FastAPI/Starlette ya los corre en un thread aparte del pool de workers
-automáticamente, así que mientras se factura un pedido el resto del sistema (storefront incluido)
-sigue respondiendo normal. No hizo falta ningún cambio de concurrencia del lado del backend.
+Dos `<a target="_blank">` nuevos, sin estado de React nuevo: en la columna "Facturar" (junto a
+CAE/Vto/importe) y en el historial de devoluciones (junto al CAE de la Nota de Crédito ya emitida). Usan
+`api.defaults.baseURL` en vez de exportar una constante `API_URL` nueva solo para esto.
 
-**Fix, 100% en `Pedidos.jsx`**:
-- `facturar`/`emitirNotaCredito` pasan `{ timeout: 30000 }` puntual en esas dos llamadas (el default
-  global de `api.js`, 10s, se deja igual para el resto de la app, que son operaciones CRUD rápidas).
-- En el `catch` de las dos, en vez de solo mostrar el error, se refresca el pedido/devolución real
-  desde el backend (`GET /pedidos` / `GET /pedidos/{id}/devoluciones`). Si resulta que la Factura/NC
-  ya existe (porque el timeout cortó una request que en realidad terminó bien del lado del servidor, o
-  porque era un reintento sobre algo ya emitido), la UI se corrige sola mostrando el CAE real **sin
-  mostrar error**. Si genuinamente no hay Factura/NC emitida (ARCA la rechazó de verdad), el error se
-  sigue mostrando igual que antes.
+## 4. Dependencias nuevas
 
-**`CLAUDE.md`** actualizado con una subsección nueva dentro de "Fase D, parte 2 — Nota de Crédito C"
-documentando los 3 fixes.
+`reportlab==4.2.5` y `qrcode[pil]==7.4.2` en `requirements.txt`. `python:3.11-slim` resolvió wheels
+prearmadas para ambas sin necesitar `build-essential` (mismo chequeo que `zeep`/`cryptography` en la Fase
+A) — build de la imagen backend confirmado sin errores.
 
-## Verificado
+## Verificado contra la API real
 
-- Build de producción (`npm run build`) sin errores, HMR aplicó los cambios en caliente sin romper
-  nada.
-- Backend: confirmado (de nuevo) que reintentar `facturar`/`emitir_nota_credito` sobre algo ya emitido
-  devuelve 400 con el mensaje correcto — el dato que la UI ahora usa para autocorregirse.
-- No se pudo probar visualmente el timeout real en esta sesión (VM headless, sin navegador) — la
-  lógica se verificó por lectura de código y por el hecho de que el backend ya expone correctamente
-  todo lo que la reconciliación necesita (`facturas[]` en `GET /pedidos`, `nota_credito` en
-  `GET /pedidos/{id}/devoluciones`).
+- Rebuild de la imagen `backend`, `ALTER TABLE` aplicado, contenedor arrancado sin errores.
+- `GET /pedidos/31/facturas/17/pdf` (Factura C real, ya facturada en homologación) y
+  `GET /pedidos/30/facturas/16/pdf` (Nota de Crédito C real) devuelven PDFs válidos (magic bytes
+  `%PDF-1.4`…`%%EOF`, no vacíos). Texto extraído del PDF (vía `pypdf`, instalado temporalmente solo para
+  verificar) confirma emisor, CAE, vencimiento, ítems con formato es-AR, total, y en la Nota de Crédito la
+  línea "Comprobante que rectifica: Factura C 0001-00000013" con el número correcto.
+- QR decodificado a mano: el JSON codificado coincide exactamente con el spec. **El usuario escaneó el QR
+  con un lector real de celular y confirmó que resuelve correctamente contra `arca.gob.ar`.**
+- Casos de error probados: `Factura` con `estado="Error"` → 400; pedido inexistente → 404; `factura_id`
+  que no pertenece al `pedido_id` de la ruta → 404; `Configuracion` con `arca_domicilio_fiscal` vacío →
+  400 pidiendo completar ⚙️ Configuración (probado antes de cargar los datos reales, como pedía el
+  testing plan).
+- `vite build` del frontend sin errores.
+- Datos de prueba (fila temporal en `facturas` con `estado="Error"`, valor de prueba en
+  `arca_domicilio_fiscal`) limpiados/restaurados al terminar — la base quedó como estaba antes de probar,
+  salvo por los 2 campos de config nuevos (`arca_condicion_iva` con su default, `arca_inicio_actividades`
+  en `null`, iguales para cualquier instalación nueva).
+
+## `CLAUDE.md` actualizado
+
+- **Raíz**: tabla de `configuracion` con las 2 filas nuevas (`arca_condicion_iva`,
+  `arca_inicio_actividades`) y las descripciones de `arca_razon_social`/`arca_domicilio_fiscal`
+  actualizadas (ya no dicen "sin uso en código"). Sacada de "Ideas mencionadas pero no implementadas" la
+  entrada de comprobante imprimible con QR (ya implementada); agregada la de envío del PDF por
+  email/WhatsApp (eso sigue pendiente, explícitamente fuera de alcance de esta fase).
+- **`backend/CLAUDE.md`**: sección nueva "Fase E — PDF de Factura/Nota de Crédito con código QR (ARCA)".
+- **`frontend/CLAUDE.md`**: sección nueva "Fase E — link 'Ver PDF' (`Pedidos.jsx`)" y nota sobre el
+  `tipo: 'fecha'` en `Configuracion.jsx`.
 
 ## Qué probar a mano en el navegador
 
-Uso normal de "Facturar"/"Emitir Nota de Crédito". Si vuelve a tardar y aparece el aviso de conexión,
-debería autocorregirse solo (mostrar el CAE sin dejar el error en pantalla) en vez de quedar trabado.
-Un doble click sobre algo que ya se facturó/emitió ya no debería mostrar error — debería mostrar
-directamente el CAE. También: abrir el panel de un pedido `Cancelado` (debería decir "Ver
-devoluciones" y seguir funcionando), y confirmar una devolución sin que el panel se cierre solo.
+Abrir `Pedidos.jsx`, click en "Ver PDF" desde la columna Facturar y desde el historial de devoluciones —
+debería abrir el PDF en una pestaña nueva. **Ya confirmado por el usuario**: el QR del PDF escaneado con
+el celular resuelve contra `arca.gob.ar` correctamente.
 
 ## Qué NO se tocó
 
-Backend completo (`calculations.py`, `facturacion.py`, `routers/pedidos.py`, `schemas.py`,
-`models.py`, `arca/`). El timeout global de `api.js` (10s) para el resto de la app. `Compras.jsx`, el
-storefront.
+`ecommerce/` (storefront), `backend/app/arca/wsfe.py`/`wsaa.py`, `facturacion.py` (solo se lee `Factura`),
+`reservas_stock`, `Compras.jsx`. Nada de envío por email/WhatsApp ni persistencia del PDF en disco.
