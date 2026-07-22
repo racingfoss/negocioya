@@ -17,6 +17,7 @@ export default function Pedidos() {
   const [error, setError] = useState('')
   const [facturando, setFacturando] = useState(new Set())
   const [soloPendientes, setSoloPendientes] = useState(false)
+  const [actualizandoFacturarArca, setActualizandoFacturarArca] = useState(new Set())
 
   // Panel de devolución/cancelación (Fase D parte 1) — no hay modal en el proyecto, es una
   // sección condicional debajo de la tabla, mismo criterio que enModoCarrito en Movimientos.jsx.
@@ -43,6 +44,24 @@ export default function Pedidos() {
     } catch (e) {
       setError(getErrorMessage(e))
       setPedidos((prev) => prev.map((p) => (p.id === pedido.id ? { ...p, estado: anterior } : p)))
+    }
+  }
+
+  const cambiarFacturarArca = async (pedido, nuevoValor) => {
+    const anterior = pedido.facturar_arca
+    setPedidos((prev) => prev.map((p) => (p.id === pedido.id ? { ...p, facturar_arca: nuevoValor } : p)))
+    setActualizandoFacturarArca((prev) => new Set(prev).add(pedido.id))
+    try {
+      await api.put(`/pedidos/${pedido.id}/facturar-arca`, { facturar_arca: nuevoValor })
+    } catch (e) {
+      setError(getErrorMessage(e))
+      setPedidos((prev) => prev.map((p) => (p.id === pedido.id ? { ...p, facturar_arca: anterior } : p)))
+    } finally {
+      setActualizandoFacturarArca((prev) => {
+        const next = new Set(prev)
+        next.delete(pedido.id)
+        return next
+      })
     }
   }
 
@@ -271,22 +290,27 @@ export default function Pedidos() {
                           Ver PDF
                         </a>
                       </div>
-                    ) : pendiente ? (
-                      <button
-                        onClick={() => facturar(p)}
-                        disabled={enCurso}
-                        className="bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-400 text-xs px-2 py-1 rounded"
-                      >
-                        {enCurso ? 'Facturando...' : 'Facturar'}
-                      </button>
                     ) : (
-                      <span
-                        className={`px-2 py-1 rounded text-xs font-medium ${
-                          p.facturar_arca ? 'bg-green-950/50 text-green-300' : 'bg-gray-800 text-gray-400'
-                        }`}
-                      >
-                        {p.facturar_arca ? 'Sí' : 'No'}
-                      </span>
+                      <div className="flex flex-col gap-1 items-start">
+                        <label className="flex items-center gap-1 text-xs text-gray-300">
+                          <input
+                            type="checkbox"
+                            checked={p.facturar_arca}
+                            disabled={actualizandoFacturarArca.has(p.id)}
+                            onChange={(e) => cambiarFacturarArca(p, e.target.checked)}
+                          />
+                          Facturar
+                        </label>
+                        {pendiente && (
+                          <button
+                            onClick={() => facturar(p)}
+                            disabled={enCurso}
+                            className="bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-400 text-xs px-2 py-1 rounded"
+                          >
+                            {enCurso ? 'Facturando...' : 'Facturar'}
+                          </button>
+                        )}
+                      </div>
                     )}
                   </td>
                   <td>

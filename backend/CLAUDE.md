@@ -645,6 +645,16 @@ UI (`Pedidos.jsx`: botón Facturar, protección de doble click) está en `fronte
 - **Endpoint `POST /pedidos/{id}/facturar`** (`routers/pedidos.py`): llama a
   `facturacion.facturar_pedido`, `response_model=schemas.FacturaOut`. Devuelve 400 si falló alguna
   validación previa, 502 si ARCA rechazó el comprobante o hubo un error de conexión.
+- **`PUT /pedidos/{id}/facturar-arca`** (`routers/pedidos.py`, `actualizar_facturar_arca`, ronda
+  posterior): permite prender/apagar `facturar_arca` en cualquier momento, para cualquier `canal` —
+  antes ese campo se fijaba una sola vez al confirmar el pedido (Fase B) y quedaba fijo para siempre.
+  Body `schemas.FacturarArcaUpdate` (`{"facturar_arca": bool}`). 404 si el pedido no existe; 400 si
+  `estado == "Cancelado"`; 400 si ya existe una `Factura` de ese pedido con `tipo_comprobante=11` y
+  `estado="Emitida"` (una vez que hay CAE real, la decisión ya se resolvió). Una `Factura` tipo 11 con
+  `estado="Error"` (intento fallido, sin CAE) **no bloquea** — ahí tiene sentido reactivar
+  `facturar_arca` para reintentar. Devuelve `response_model=schemas.PedidoOut` vía `_pedido_out`, mismo
+  criterio que `cambiar_estado`. No toca `facturacion.py`/`arca/` ni la lógica del botón "Facturar" de
+  `Pedidos.jsx` — solo agrega una forma nueva de editar un campo que esa lógica ya lee.
 - **Endpoints `def` sincrónicos, no `async def`**: FastAPI/Starlette los corre en un thread aparte del
   pool de workers automáticamente, así que mientras se factura un pedido (llamada SOAP real que puede
   tardar varios segundos) el resto del sistema (storefront incluido) sigue respondiendo normal — no hizo

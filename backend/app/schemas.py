@@ -301,6 +301,10 @@ class PedidoEstadoUpdate(BaseModel):
     estado: str
 
 
+class FacturarArcaUpdate(BaseModel):
+    facturar_arca: bool
+
+
 # --- Devoluciones/cancelaciones de un Pedido (Fase D parte 1) ---
 
 class DevolucionItemIn(BaseModel):

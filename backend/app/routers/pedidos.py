@@ -156,6 +156,36 @@ def cambiar_estado(pedido_id: int, payload: schemas.PedidoEstadoUpdate, db: Sess
     return _pedido_out(db, pedido)
 
 
+@router.put("/{pedido_id}/facturar-arca", response_model=schemas.PedidoOut)
+def actualizar_facturar_arca(
+    pedido_id: int, payload: schemas.FacturarArcaUpdate, db: Session = Depends(get_db)
+):
+    """Permite prender/apagar facturar_arca en cualquier momento (para cualquier canal), mientras
+    el pedido siga siendo elegible para facturar — antes solo se fijaba una vez al confirmar."""
+    pedido = db.get(models.Pedido, pedido_id)
+    if not pedido:
+        raise HTTPException(404, "Pedido no encontrado.")
+    if pedido.estado == "Cancelado":
+        raise HTTPException(400, "El pedido está cancelado, no hay nada que facturar.")
+    factura_emitida = (
+        db.query(models.Factura)
+        .filter(
+            models.Factura.pedido_id == pedido_id,
+            models.Factura.tipo_comprobante == calculations.TIPO_COMPROBANTE_FACTURA_C,
+            models.Factura.estado == "Emitida",
+        )
+        .first()
+    )
+    if factura_emitida is not None:
+        raise HTTPException(
+            400, "Este pedido ya tiene una Factura C emitida con CAE — no se puede modificar facturar_arca."
+        )
+    pedido.facturar_arca = payload.facturar_arca
+    db.commit()
+    db.refresh(pedido)
+    return _pedido_out(db, pedido)
+
+
 @router.post("/{pedido_id}/facturar", response_model=schemas.FacturaOut)
 def facturar(pedido_id: int, db: Session = Depends(get_db)):
     """Pide un CAE real a ARCA para este pedido (Fase C) — ver facturacion.facturar_pedido para

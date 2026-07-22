@@ -197,6 +197,31 @@ El backend (`facturacion.py`, endpoint `POST /pedidos/{id}/facturar`) está en `
 - Banner ámbar arriba de la tabla (mismo estilo que `Movimientos.jsx`) con la cuenta de pedidos
   pendientes de facturar y un toggle "ver solo pendientes".
 
+## Editar `facturar_arca` en un pedido ya confirmado (`Pedidos.jsx`, ronda posterior a la Fase C)
+
+El backend (`PUT /pedidos/{id}/facturar-arca`) está en `backend/CLAUDE.md`. Caso real: un pedido local
+se confirmó con el checkbox destildado y después la clienta pide factura igual — hacía falta poder
+cambiar `facturar_arca` después de confirmar, no solo al crear el pedido.
+
+- En la columna "Facturar", la rama que **no** tiene factura tipo 11 emitida ya no muestra un badge
+  fijo "Sí/No" — es un `<input type="checkbox">` editable (`cambiarFacturarArca`) que dispara
+  `PUT /pedidos/{id}/facturar-arca` al tildar/destildar. Mismo patrón que `cambiarEstado`: revierte el
+  valor visual si la API rechaza (400), con un Set de ids en vuelo (`actualizandoFacturarArca`) para
+  deshabilitar el checkbox de esa fila mientras la request está en curso — mismo criterio que
+  `facturando`/`devolviendo`.
+- **El checkbox se muestra SIEMPRE que no haya factura emitida, sin importar `pendiente`
+  (`esPendienteDeFacturar`)** — bug real encontrado al probar a mano: la primera versión anidaba el
+  checkbox en la rama `else` de `pendiente ? <botón Facturar> : <checkbox>`, así que apenas un pedido
+  quedaba `pendiente` (facturar_arca=true + elegible) el checkbox desaparecía del todo, reemplazado por
+  el botón "Facturar" — no había forma de destildarlo una vez tildado. Fix: la celda ahora renderiza
+  el checkbox y, debajo, el botón "Facturar" **además**, solo si `pendiente` es `true` — los dos pueden
+  convivir en la misma celda.
+- La rama con factura tipo 11 ya emitida (CAE/Vto/importe/Ver PDF) no se tocó — ahí ya no tiene sentido
+  editar `facturar_arca` (el backend lo bloquea con 400).
+- No hizo falta tocar `esPendienteDeFacturar`/la lógica de cuándo el botón "Facturar" se habilita: ya
+  depende de `facturar_arca`, así que al tildar el checkbox el botón aparece solo si además se cumplen
+  las condiciones existentes (`estado != "Cancelado"`, `monto_neto > 0`).
+
 ## Fase D, parte 1 y 2 — panel de devolución / Nota de Crédito (`Pedidos.jsx`)
 
 El backend (`Devolucion`/`DevolucionItem`, `procesar_devolucion`, Nota de Crédito) está en
