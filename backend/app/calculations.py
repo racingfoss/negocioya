@@ -864,10 +864,12 @@ def monto_neto_pedido(db: Session, pedido: "models.Pedido") -> Decimal:
 # algo no cierra — mismo patrón que reservar_stock/liberar_reserva, para
 # mantener el invariante de que validar_movimiento es la única función de este
 # módulo que lanza HTTPException directamente; el router (POST
-# /pedidos/{id}/devoluciones) atrapa el ValueError y arma el 400. Hace su
-# propio commit (operación atómica de punta a punta), mismo criterio que
-# facturacion.facturar_pedido — el router solo la llama y devuelve el
-# resultado.
+# /pedidos/{id}/devoluciones) atrapa el ValueError y arma el 400. Con
+# commit=True (default) hace su propio commit (operación atómica de punta a
+# punta), mismo criterio que facturacion.facturar_pedido — el router solo la
+# llama y devuelve el resultado. Con commit=False (usado por procesar_cambio,
+# más abajo) deja el control de la transacción al caller, para poder
+# encadenarla con la creación de un Pedido nuevo en un único commit atómico.
 # ---------------------------------------------------------------------------
 def procesar_devolucion(
     db: Session,
@@ -875,6 +877,7 @@ def procesar_devolucion(
     items: list,
     motivo: Optional[str] = None,
     tipo: str = "Devolucion",
+    commit: bool = True,
 ) -> "models.Devolucion":
     if tipo not in ("Cancelacion", "Devolucion"):
         raise ValueError("El tipo debe ser 'Cancelacion' o 'Devolucion'.")
@@ -954,8 +957,9 @@ def procesar_devolucion(
     if all(devuelto_total.get(pi.id, 0) >= pi.cantidad for pi in todos_los_items):
         pedido.estado = "Cancelado"
 
-    db.commit()
-    db.refresh(devolucion)
+    if commit:
+        db.commit()
+        db.refresh(devolucion)
     return devolucion
 
 
@@ -1019,6 +1023,90 @@ def devolucion_requiere_nota_credito(db: Session, devolucion: "models.Devolucion
         .first()
     )
     return ya_tiene_nota_credito is None
+
+
+# ---------------------------------------------------------------------------
+# Cambio de producto — orquesta lo de arriba (procesar_devolucion +
+# crear_pedido_con_items) sin editar el Pedido original en ningún momento. La
+# diferencia de precio NO dispara ningún Movimiento propio: la Devolucion ya
+# resta de caja el ítem devuelto y el Pedido nuevo (una Venta normal) ya suma
+# el ítem nuevo, así que get_caja_actual netea sola la diferencia.
+# Atomicidad completa: las dos funciones de arriba se llaman con commit=False
+# y el único db.commit() de toda la operación es el de acá abajo — si algo
+# lanza ValueError en el medio, no queda nada escrito (ni la Devolucion sola).
+# procesar_cambio no atrapa esos ValueError, los deja subir: el router los
+# traduce a 400, igual que ya hace con procesar_devolucion sola.
+# ---------------------------------------------------------------------------
+def procesar_cambio(
+    db: Session,
+    pedido_original: "models.Pedido",
+    items_devolver: list,
+    items_nuevos: list,
+    motivo: Optional[str] = None,
+    canal_nuevo: str = "local",
+    facturar_arca_nuevo: bool = False,
+    cliente_nombre_nuevo: Optional[str] = None,
+) -> "models.Cambio":
+    devolucion = procesar_devolucion(
+        db, pedido_original.id, items_devolver, motivo=motivo, tipo="Devolucion", commit=False
+    )
+
+    cliente_nombre_final = (
+        cliente_nombre_nuevo if cliente_nombre_nuevo is not None else pedido_original.cliente_nombre
+    )
+    pedido_nuevo = crear_pedido_con_items(
+        db,
+        canal=canal_nuevo,
+        items=items_nuevos,
+        facturar_arca=facturar_arca_nuevo,
+        cliente_nombre=cliente_nombre_final,
+        sesion_id=None,  # un cambio es una acción atómica de un solo paso, no un carrito armado en el tiempo
+        commit=False,
+    )
+
+    diferencia = monto_neto_pedido(db, pedido_nuevo) - monto_devolucion(db, devolucion)
+    cambio = models.Cambio(
+        pedido_original_id=pedido_original.id,
+        devolucion_id=devolucion.id,
+        pedido_nuevo_id=pedido_nuevo.id,
+        diferencia_monto=diferencia,
+        motivo=motivo,
+    )
+    db.add(cambio)
+    db.commit()
+    db.refresh(cambio)
+    return cambio
+
+
+def tasa_cambios_vs_devoluciones(db: Session, dias: int = 30) -> dict:
+    """Reporte (no dato transaccional): de todas las Devolucion en una ventana de días, cuántas
+    fueron en realidad un Cambio (tienen un Cambio.devolucion_id apuntándolas) vs. cuántas fueron
+    reembolso puro. Loop en Python sobre monto_devolucion por cada una — para el volumen de un
+    negocio unipersonal no hace falta una query agregada, mismo criterio que ya aplica el
+    proyecto en otros reportes."""
+    desde = datetime.now(timezone.utc) - timedelta(days=dias)
+    devoluciones = db.query(models.Devolucion).filter(models.Devolucion.fecha >= desde).all()
+    total = len(devoluciones)
+    ids_cambio = {
+        row[0]
+        for row in db.query(models.Cambio.devolucion_id).filter(
+            models.Cambio.devolucion_id.in_([d.id for d in devoluciones])
+        )
+    }
+    cantidad_cambios = len(ids_cambio)
+    cantidad_reembolsos = total - cantidad_cambios
+    tasa_cambio_pct = (cantidad_cambios / total * 100) if total else 0  # 0, no error — sin devoluciones
+    monto_cambiado = sum(float(monto_devolucion(db, d)) for d in devoluciones if d.id in ids_cambio)
+    monto_reembolsado = sum(float(monto_devolucion(db, d)) for d in devoluciones if d.id not in ids_cambio)
+    return {
+        "dias": dias,
+        "total_devoluciones": total,
+        "cantidad_cambios": cantidad_cambios,
+        "cantidad_reembolsos": cantidad_reembolsos,
+        "tasa_cambio_pct": tasa_cambio_pct,
+        "monto_cambiado": monto_cambiado,
+        "monto_reembolsado": monto_reembolsado,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1102,6 +1190,96 @@ def registrar_venta(
     db.add(mov)
     db.flush()  # mov.id disponible sin comprometer la transacción — mismo patrón que resolver_o_crear_variante
     return mov
+
+
+# ---------------------------------------------------------------------------
+# Alta de un Pedido con sus líneas — extraído de routers/pedidos.py::crear_local
+# (Fase B) para poder reusarlo también desde procesar_cambio (más abajo, Cambio
+# de producto). Mismo comportamiento exacto que crear_local: valida stock por
+# línea, arma el Pedido + un Movimiento tipo Venta y un PedidoItem por línea.
+# A diferencia del router original, las validaciones lanzan ValueError (no
+# HTTPException) — mantiene el invariante de que validar_movimiento y
+# facturacion.py son las únicas dos funciones que lanzan HTTPException directo
+# desde código de negocio; crear_local (el wrapper delgado del router) traduce
+# el ValueError a 400, igual que ya hace con procesar_devolucion.
+# ---------------------------------------------------------------------------
+def crear_pedido_con_items(
+    db: Session,
+    *,
+    canal: str,
+    items: list,  # cada uno con .producto_id/.variante_id/.cantidad — schemas.LineaOrdenIn
+    facturar_arca: bool,
+    cliente_nombre: Optional[str] = None,
+    notas: Optional[str] = None,
+    sesion_id: Optional[str] = None,
+    commit: bool = True,
+) -> models.Pedido:
+    # Mismo gotcha de orden ya documentado en crear_local: liberar la reserva de esta sesión ANTES
+    # de validar/vender, pero como primer paso de esta MISMA transacción (si algo falla después,
+    # se revierte junto) — registrar_venta valida stock vía stock_disponible SIN excluir_sesion,
+    # así que si la reserva propia siguiera activa se restaría dos veces contra sí misma.
+    if sesion_id:
+        liberar_reserva(db, sesion_id)
+
+    productos_cache: dict[int, models.Producto] = {}
+    for idx, linea in enumerate(items, start=1):
+        producto = productos_cache.get(linea.producto_id)
+        if producto is None:
+            producto = db.get(models.Producto, linea.producto_id)
+            productos_cache[linea.producto_id] = producto
+        if not producto or not producto.activo:
+            raise ValueError(f"Línea {idx}: el producto no existe o no está activo.")
+        if producto.tiene_variantes:
+            if not linea.variante_id:
+                raise ValueError(f"Línea {idx}: este producto tiene variantes, indicá variante_id.")
+            variante = db.get(models.Variante, linea.variante_id)
+            if not variante or variante.producto_id != linea.producto_id:
+                raise ValueError(f"Línea {idx}: la variante no corresponde a este producto.")
+        elif linea.variante_id:
+            raise ValueError(f"Línea {idx}: este producto no tiene variantes, no envíes variante_id.")
+        disponible = stock_disponible(db, linea.producto_id, linea.variante_id)
+        if linea.cantidad <= 0 or linea.cantidad > disponible:
+            raise ValueError(
+                f"Línea {idx}: stock insuficiente (disponible {disponible}, pediste {linea.cantidad})."
+            )
+
+    total = sum(productos_cache[l.producto_id].precio_venta * l.cantidad for l in items)
+    pedido = models.Pedido(
+        canal=canal,
+        facturar_arca=facturar_arca,
+        estado="Entregado",
+        cliente_nombre=cliente_nombre,
+        notas=notas,
+        total=total,
+    )
+    db.add(pedido)
+    db.flush()  # pedido.id disponible sin comprometer la transacción
+
+    for linea in items:
+        precio_unitario = productos_cache[linea.producto_id].precio_venta
+        mov = registrar_venta(
+            db,
+            linea.producto_id,
+            linea.variante_id,
+            linea.cantidad,
+            monto=precio_unitario * linea.cantidad,
+            concepto=f"Venta mostrador — pedido #{pedido.id}",
+        )
+        db.add(
+            models.PedidoItem(
+                pedido_id=pedido.id,
+                producto_id=linea.producto_id,
+                variante_id=linea.variante_id,
+                cantidad=linea.cantidad,
+                precio_unitario=precio_unitario,
+                movimiento_id=mov.id,
+            )
+        )
+
+    if commit:
+        db.commit()
+        db.refresh(pedido)
+    return pedido
 
 
 # ---------------------------------------------------------------------------

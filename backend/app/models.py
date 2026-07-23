@@ -405,6 +405,24 @@ class DevolucionItem(Base):
     movimiento = relationship("Movimiento")
 
 
+class Cambio(Base):
+    """Vincula una Devolucion (sobre el pedido original) con el Pedido nuevo que la clienta se
+    lleva en su lugar — cambio de producto, no reembolso. Fila de cruce/trazabilidad, sin
+    relationship, mismo criterio que Factura.devolucion_id/factura_original_id (que cruzan las
+    mismas entidades) aunque Pedido/Devolucion sí tengan relationship propia. El Pedido original
+    NUNCA se edita — sigue siendo inmutable salvo devolución/cancelación, como ya es hoy."""
+    __tablename__ = "cambios"
+
+    id = Column(Integer, primary_key=True, index=True)
+    pedido_original_id = Column(Integer, ForeignKey("pedidos.id"), nullable=False)
+    devolucion_id = Column(Integer, ForeignKey("devoluciones.id"), nullable=False)
+    pedido_nuevo_id = Column(Integer, ForeignKey("pedidos.id"), nullable=False)
+    # positivo: la clienta pagó de más. negativo: se le devolvió parte de lo pagado.
+    diferencia_monto = Column(Numeric(12, 2), nullable=False, default=0)
+    fecha = Column(DateTime(timezone=True), server_default=func.now())
+    motivo = Column(Text, nullable=True)
+
+
 class ReservaStock(Base):
     """Reserva efímera de stock para un pedido en armado en Caja (Fase B+). Vence sola por
     tiempo — cualquier cálculo de disponibilidad (calculations.stock_disponible) ignora las

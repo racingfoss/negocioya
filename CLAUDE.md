@@ -20,7 +20,7 @@ hace falta pedirlo a mano):
 
 - **`backend/CLAUDE.md`** — FastAPI + SQLAlchemy + `calculations.py`: modelo de datos completo, todas
   las decisiones de negocio (punto de equilibrio, PPP, BCG, etc.), variantes de producto, importación de
-  Excel, ARCA/facturación, pedidos, reservas de stock, devoluciones/Nota de Crédito.
+  Excel, ARCA/facturación, pedidos, reservas de stock, devoluciones/Nota de Crédito, cambio de producto.
 - **`frontend/CLAUDE.md`** — panel interno (React + Vite, sin TypeScript): convenciones de pantallas,
   Caja/Movimientos, Pedidos, Configuración, y el lado UI de todo lo de arriba.
 - **`ecommerce/CLAUDE.md`** — storefront público (Next.js + TypeScript): catálogo, carrito, checkout,
@@ -71,7 +71,8 @@ calculado), `compras` (reposición de stock, de acá se derivan stock y costo pr
 `producto_atributos`/`variantes`/`variante_valores` (talle/color definidos por la usuaria),
 `configuracion` (singleton, ver tabla abajo), `mix_snapshots` (histórico del mix% real), `producto_fotos`,
 `pedidos`/`pedido_items` (unifica venta e-commerce + local), `reservas_stock` (pedido en armado en Caja),
-`facturas` (CAE de ARCA), `devoluciones`/`devolucion_items`.
+`facturas` (CAE de ARCA), `devoluciones`/`devolucion_items`, `cambios` (vincula una devolución con el
+pedido nuevo de un cambio de producto).
 
 ## Configuración del negocio (`configuracion`, singleton)
 

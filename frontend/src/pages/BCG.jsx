@@ -16,9 +16,11 @@ const fmt = (n) => new Intl.NumberFormat('es-AR', { style: 'currency', currency:
 export default function Analisis() {
   const [data, setData] = useState(null)
   const [dias, setDias] = useState(30)
+  const [cambiosDevoluciones, setCambiosDevoluciones] = useState(null)
 
   useEffect(() => {
     api.get('/dashboard/analisis', { params: { dias } }).then((r) => setData(r.data))
+    api.get('/dashboard/cambios-devoluciones', { params: { dias } }).then((r) => setCambiosDevoluciones(r.data))
   }, [dias])
 
   if (!data) return <p>Cargando...</p>
@@ -179,6 +181,42 @@ export default function Analisis() {
           </div>
         ))}
       </div>
+
+      {cambiosDevoluciones && (
+        <div>
+          <h2 className="text-xl font-bold mb-2">🔄 Cambios vs. reembolsos</h2>
+          <p className="text-gray-400 text-sm mb-2">
+            De todas las devoluciones de la ventana elegida arriba, cuántas terminaron siendo un cambio de
+            producto (la clienta se llevó otra prenda) en vez de un reembolso puro.
+          </p>
+          <div className="bg-[#151b2b] rounded-xl p-5 grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
+            <div>
+              <div className="text-gray-400">Devoluciones totales</div>
+              <div className="text-lg font-semibold">{cambiosDevoluciones.total_devoluciones}</div>
+            </div>
+            <div>
+              <div className="text-gray-400">Cambios</div>
+              <div className="text-lg font-semibold">{cambiosDevoluciones.cantidad_cambios}</div>
+            </div>
+            <div>
+              <div className="text-gray-400">Reembolsos</div>
+              <div className="text-lg font-semibold">{cambiosDevoluciones.cantidad_reembolsos}</div>
+            </div>
+            <div>
+              <div className="text-gray-400">Tasa de cambio</div>
+              <div className="text-lg font-semibold">{cambiosDevoluciones.tasa_cambio_pct.toFixed(1)}%</div>
+            </div>
+            <div>
+              <div className="text-gray-400">Monto cambiado</div>
+              <div className="text-lg font-semibold">{fmt(cambiosDevoluciones.monto_cambiado)}</div>
+            </div>
+            <div>
+              <div className="text-gray-400">Monto reembolsado</div>
+              <div className="text-lg font-semibold">{fmt(cambiosDevoluciones.monto_reembolsado)}</div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

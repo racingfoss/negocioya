@@ -279,3 +279,71 @@ frontend es aditivo puro: dos links `<a target="_blank">` nuevos, sin estado de 
   apunta a `${api.defaults.baseURL}/pedidos/${pedidoEnPanel.id}/facturas/${d.nota_credito.id}/pdf`.
 - Se usa `api.defaults.baseURL` (la instancia axios ya configurada en `src/api.js`) en vez de exportar
   `API_URL` aparte solo para esto — `Pedidos.jsx` no tenía esa constante importada hasta ahora.
+
+## Cambio de producto — wizard (`Pedidos.jsx`)
+
+El backend (`Cambio`, `procesar_cambio`, endpoints) está en `backend/CLAUDE.md`. Botón nuevo "Cambiar
+producto" junto al de "Devolver / Cancelar" (misma celda, mismo criterio de sección condicional debajo
+de la tabla, sin modal). Estado propio (`panelCambioId`, `devolucionesParaCambio`, `cambiosPanel`,
+`cantidadesCambiarDevolver`, `cambiando`, etc.) separado del panel de devolución, para que los dos panels
+puedan coexistir en memoria sin pisarse.
+
+- **Paso 1 (qué se devuelve)**: mismo criterio visual y de cálculo que el panel de devolución ya
+  existente (`cantidadesDevolver`/`yaDevuelto`), pero recalculado sobre `devolucionesParaCambio` (un
+  fetch propio de `GET /pedidos/{id}/devoluciones` al abrir el panel de cambio) — como un `Cambio` crea
+  una `Devolucion` real, la disponibilidad ya sale correcta de ese mismo endpoint sin lógica extra.
+- **Paso 2 (qué prenda entra)**: selector categoría→producto→atributos→variante **copiado** de
+  `Movimientos.jsx` (`opcionesParaAtributo`, `elegirValorAtributo`, `varianteResuelta`, cálculo de stock
+  disponible vía `stockProductos`), con sufijo `Cambio` en cada nombre (`opcionesParaAtributoCambio`,
+  etc.) — mismo criterio ya usado entre `Movimientos.jsx` y `Compras.jsx`: cada pantalla tiene su propia
+  copia, no un hook compartido. **Diferencia clave con la copia de Movimientos.jsx**: no llama a
+  `POST/DELETE /reservas` — un cambio es una acción atómica de un solo paso, no un carrito armado en el
+  tiempo, así que el tope de stock se calcula 100% client-side (stock real menos lo que ya está en el
+  mini-carrito `itemsCambioNuevos`) sin tocar `reservas_stock`. `Pedidos.jsx` no traía `/productos`/
+  `/categorias`/`/stock/productos` para la pantalla normal — se cargan recién al abrir el panel de
+  cambio (`abrirPanelCambio`), no en el mount del componente.
+- **Mini-carrito `itemsCambioNuevos`**: el schema del backend acepta una lista, así que un botón
+  "+ Agregar" permite más de una prenda de reemplazo por cambio, mismo patrón que `itemsPedido` de
+  Movimientos.jsx (sumar cantidad si ya existe la misma línea, en vez de duplicarla).
+- **Preview de diferencia**: calculado en el cliente (cantidad × precio de lo nuevo, menos lo que se
+  devuelve) solo para mostrarlo antes de confirmar — el backend recalcula de forma autoritativa al
+  confirmar, así que no hay riesgo de desincronización.
+- **Mensaje de confirmación con el monto real y la dirección explícita** (`diferencia_monto` que devuelve
+  el `POST /pedidos/{id}/cambios`): "la clienta te debe $X más" / "hay que devolverle $X" / "cambio a
+  precio igual, la Factura original sigue siendo válida" — en los dos primeros casos, si corresponde
+  (`cambio.devolucion.requiere_nota_credito`), se suma un aviso señalando que se puede emitir la Nota de
+  Crédito desde el historial de devoluciones — sin auto-dispararla, el botón que ya existe (Fase D parte
+  2) la cubre sin cambios.
+- **No se cierra el panel al confirmar**: se refresca `GET /pedidos` (para que `estado`/`monto_neto` del
+  pedido original se actualicen en la tabla) + `GET /pedidos/{id}/devoluciones` + `GET
+  /pedidos/{id}/cambios` del pedido en panel, mismo criterio que ya usa `confirmarDevolucion`, así el
+  aviso con el monto/dirección de la diferencia se puede seguir viendo (o volver a consultar reabriendo
+  el panel) sin depender de haber estado mirando la pantalla en el momento de confirmar.
+- **Historial de cambios**: dentro del mismo panel (no uno aparte), listando por `Cambio` la fecha, el
+  resumen ítem devuelto → pedido nuevo, y `diferencia_monto` con la misma dirección explícita de arriba.
+- **Panel de devoluciones existente (sin tocar su mecánica)**: cuando `d.cambio` no es `null` (campo
+  nuevo de `DevolucionOut`), se agrega una línea "🔄 Parte de un cambio → pedido #{d.cambio.pedido_nuevo_id}"
+  en esa fila del historial — así se ve el vínculo aunque se entre por el panel de devolución y no por el
+  de cambios.
+- **Tabla principal de `Pedidos.jsx` (ronda de fixes posterior)**: cuando `p.cambio_origen` no es `null`
+  (campo nuevo de `PedidoOut`), se agrega una línea "🔄 Cambio del pedido #{p.cambio_origen.pedido_original_id}"
+  en la columna Cliente de ESE pedido (el nuevo, no el original) — antes el pedido que nacía de un cambio
+  no tenía ninguna marca visible en la tabla principal, solo se veía el vínculo entrando al panel del
+  pedido original.
+- **Paso 2 (qué prenda entra) — tope de stock visible, no solo bloqueado al confirmar (bug reportado)**:
+  el input de cantidad no tenía `max` ni aviso inline — el tope real ya existía en `agregarItemCambio`
+  (rechaza con `setErrorCambio` si la cantidad supera `stockDisponibleCambio`), pero no había ninguna
+  señal visual antes de hacer click en "+ Agregar", así que se podía escribir cualquier número sin
+  feedback. Fix, mismo patrón ya usado en `Movimientos.jsx` (`max={stockDisponibleEfectivo ?? undefined}`
+  + párrafo de aviso rojo cuando la cantidad cargada supera el disponible): se agregó `max={stockDisponibleCambio
+  ?? undefined}` al input, se deshabilita el input y el botón "+ Agregar" cuando `stockDisponibleCambio <= 0`,
+  y se agregó el mismo párrafo de aviso inline.
+- **Qué NO se tocó**: `Compras.jsx`, el storefront (`ecommerce/`), el mecanismo de reserva de stock de
+  `Movimientos.jsx`.
+
+### Reporte — tarjeta "Cambios vs. reembolsos" (`BCG.jsx`, pantalla Análisis)
+
+El backend (`GET /dashboard/cambios-devoluciones`) está en `backend/CLAUDE.md`. Reusa el estado `dias`
+que ya existe en esa pantalla (selector 7/30/90) — sin selector propio. Tarjeta nueva con el mismo estilo
+`bg-[#151b2b] rounded-xl p-5` que ya usan el scatter/tablas de esa pantalla, mostrando devoluciones
+totales, cambios, reembolsos, tasa %, monto cambiado y monto reembolsado.

@@ -48,3 +48,8 @@ def sellthrough(db: Session = Depends(get_db)):
 @router.get("/contribucion-categorias")
 def contribucion(dias: Optional[int] = None, rollup: bool = False, db: Session = Depends(get_db)):
     return calculations.contribucion_por_categoria(db, dias=dias, rollup=rollup)
+
+
+@router.get("/cambios-devoluciones")
+def cambios_devoluciones(dias: int = 30, db: Session = Depends(get_db)):
+    return calculations.tasa_cambios_vs_devoluciones(db, dias=dias)

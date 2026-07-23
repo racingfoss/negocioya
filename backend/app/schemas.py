@@ -262,6 +262,17 @@ class FacturaOut(BaseModel):
     factura_original_id: Optional[int] = None
 
 
+class CambioOrigenOut(BaseModel):
+    """Vista mínima embebida en PedidoOut.cambio_origen — para que un Pedido que nació de un
+    Cambio de producto (no de una venta directa) se identifique como tal apenas se lo mira en
+    GET /pedidos, sin tener que ir a buscar el historial de cambios del pedido original."""
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    pedido_original_id: int
+    devolucion_id: int
+    fecha: datetime
+
+
 class PedidoOut(BaseModel):
     """Pedido unificado (Fase B), cualquier canal. `canal`/`facturar_arca` son campos
     aditivos sobre lo que antes era OrdenEcommerceOut — el storefront (POST /ecommerce/ordenes)
@@ -286,6 +297,9 @@ class PedidoOut(BaseModel):
     monto_neto: Decimal = Decimal("0")
     items: list[PedidoItemOut] = []
     facturas: list[FacturaOut] = []
+    # Cambio de producto — no es atributo del ORM, lo completa _pedido_out buscando un Cambio con
+    # pedido_nuevo_id == este pedido (0 o 1 fila). No null solo si este Pedido nació de un cambio.
+    cambio_origen: Optional[CambioOrigenOut] = None
 
 
 class PedidoLocalCreate(BaseModel):
@@ -326,6 +340,16 @@ class DevolucionItemOut(BaseModel):
     movimiento_id: Optional[int]
 
 
+class CambioResumenOut(BaseModel):
+    """Vista resumida de un Cambio, embebida en DevolucionOut.cambio para que el panel de
+    devoluciones (que no sabe nada de Cambios) pueda mostrar igual el vínculo."""
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    pedido_nuevo_id: int
+    diferencia_monto: Decimal
+    fecha: datetime
+
+
 class DevolucionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
@@ -339,6 +363,32 @@ class DevolucionOut(BaseModel):
     # Factura tipo 13 ya emitida para esta devolución, si existe.
     requiere_nota_credito: bool = False
     nota_credito: Optional[FacturaOut] = None
+    # Cambio de producto — tampoco es atributo del ORM, lo completa _devolucion_out buscando un
+    # Cambio con devolucion_id == esta devolución (0 o 1 fila). No null solo si esta Devolucion es
+    # en realidad parte de un cambio, no un reembolso puro.
+    cambio: Optional[CambioResumenOut] = None
+
+
+# --- Cambio de producto (devolución + pedido nuevo, orquesta lo de arriba sin tocarlo) ---
+
+class CambioCreate(BaseModel):
+    items_devolver: list[DevolucionItemIn]
+    items_nuevos: list[LineaOrdenIn]
+    motivo: Optional[str] = None
+    canal_nuevo: str = "local"
+    facturar_arca_nuevo: bool = False       # decisión manual, igual que cualquier pedido nuevo en Caja
+    cliente_nombre_nuevo: Optional[str] = None  # None = hereda del pedido original
+
+
+class CambioOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    pedido_original_id: int
+    devolucion: DevolucionOut
+    pedido_nuevo: PedidoOut
+    diferencia_monto: Decimal
+    fecha: datetime
+    motivo: Optional[str]
 
 
 # --- Reserva de stock efímera (pedido en armado en Caja) ---

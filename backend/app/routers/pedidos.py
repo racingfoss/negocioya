@@ -17,6 +17,9 @@ def _pedido_out(db: Session, pedido: models.Pedido) -> schemas.PedidoOut:
     for item in out.items:
         if item.variante_id is not None:
             item.variante_descripcion = calculations.descripcion_variante(db, item.variante_id)
+    cambio_origen = db.query(models.Cambio).filter(models.Cambio.pedido_nuevo_id == pedido.id).first()
+    if cambio_origen is not None:
+        out.cambio_origen = schemas.CambioOrigenOut.model_validate(cambio_origen)
     return out
 
 
@@ -37,7 +40,28 @@ def _devolucion_out(db: Session, devolucion: models.Devolucion) -> schemas.Devol
     )
     if nota_credito is not None:
         out.nota_credito = schemas.FacturaOut.model_validate(nota_credito)
+    cambio = db.query(models.Cambio).filter(models.Cambio.devolucion_id == devolucion.id).first()
+    if cambio is not None:
+        out.cambio = schemas.CambioResumenOut.model_validate(cambio)
     return out
+
+
+def _cambio_out(db: Session, cambio: models.Cambio) -> schemas.CambioOut:
+    """Cambio no tiene relationship hacia Pedido/Devolucion (fila de cruce minimalista, ver
+    models.Cambio) — a diferencia de _pedido_out/_devolucion_out, acá no alcanza con
+    model_validate + completar campos sueltos: pedido_nuevo/devolucion tienen que resolverse
+    enteros a mano, reusando _pedido_out/_devolucion_out para no reinventar esos cálculos."""
+    pedido_nuevo = db.get(models.Pedido, cambio.pedido_nuevo_id)
+    devolucion = db.get(models.Devolucion, cambio.devolucion_id)
+    return schemas.CambioOut(
+        id=cambio.id,
+        pedido_original_id=cambio.pedido_original_id,
+        devolucion=_devolucion_out(db, devolucion),
+        pedido_nuevo=_pedido_out(db, pedido_nuevo),
+        diferencia_monto=cambio.diferencia_monto,
+        fecha=cambio.fecha,
+        motivo=cambio.motivo,
+    )
 
 
 @router.get("/", response_model=list[schemas.PedidoOut])
@@ -60,84 +84,23 @@ def listar(db: Session = Depends(get_db), limit: int = 300):
 @router.post("/", response_model=schemas.PedidoOut)
 def crear_local(payload: schemas.PedidoLocalCreate, db: Session = Depends(get_db)):
     """Alta de un Pedido canal="local" desde Caja — el carrito armado en Movimientos.jsx se confirma
-    acá de una sola vez. Mismo criterio de validación atómica que POST /ecommerce/ordenes (todas las
-    líneas se validan ANTES de escribir nada), pero sin el chequeo de visible_ecommerce (una venta de
-    mostrador puede vender algo no publicado online) ni de forma_entrega/direccion_envio (no aplica a
-    canal local)."""
+    acá de una sola vez. Wrapper delgado: toda la mecánica (validación atómica por línea, liberar la
+    reserva de la sesión primero, armar Pedido + PedidoItem + Movimiento) vive en
+    calculations.crear_pedido_con_items, reusada también por procesar_cambio (Cambio de producto)."""
     if not payload.lineas:
         raise HTTPException(400, "El pedido necesita al menos una línea.")
-
-    # Si este pedido viene de un carrito con reservas propias (sesion_id de Movimientos.jsx), se
-    # liberan ACÁ, antes de validar/vender — no antes de la transacción, en el sentido de "un paso
-    # aparte" con su propio commit (eso dejaría una ventana de carrera), sino como el primer paso de
-    # ESTA MISMA transacción: si cualquier línea falla más abajo, todo (incluida esta liberación) se
-    # revierte junto. Hacerlo acá (y no recién antes del commit final) es necesario porque
-    # registrar_venta() valida el stock internamente vía validar_movimiento(), que llama a
-    # stock_disponible() SIN excluir esta sesión (no se le cambió la firma) — si la reserva propia
-    # siguiera activa en ese momento, se restaría dos veces contra sí misma y una confirmación
-    # legítima (cantidad == lo reservado) se rechazaría por "falta de stock".
-    if payload.sesion_id:
-        calculations.liberar_reserva(db, payload.sesion_id)
-
-    productos_cache: dict[int, models.Producto] = {}
-    for idx, linea in enumerate(payload.lineas, start=1):
-        producto = productos_cache.get(linea.producto_id)
-        if producto is None:
-            producto = db.get(models.Producto, linea.producto_id)
-            productos_cache[linea.producto_id] = producto
-        if not producto or not producto.activo:
-            raise HTTPException(400, f"Línea {idx}: el producto no existe o no está activo.")
-        if producto.tiene_variantes:
-            if not linea.variante_id:
-                raise HTTPException(400, f"Línea {idx}: este producto tiene variantes, indicá variante_id.")
-            variante = db.get(models.Variante, linea.variante_id)
-            if not variante or variante.producto_id != linea.producto_id:
-                raise HTTPException(400, f"Línea {idx}: la variante no corresponde a este producto.")
-        elif linea.variante_id:
-            raise HTTPException(400, f"Línea {idx}: este producto no tiene variantes, no envíes variante_id.")
-        disponible = calculations.stock_disponible(db, linea.producto_id, linea.variante_id)
-        if linea.cantidad <= 0 or linea.cantidad > disponible:
-            raise HTTPException(
-                400, f"Línea {idx}: stock insuficiente (disponible {disponible}, pediste {linea.cantidad})."
-            )
-
-    total = sum(productos_cache[l.producto_id].precio_venta * l.cantidad for l in payload.lineas)
-    # canal local arranca directo en Entregado: la clienta se lo lleva puesto en el momento,
-    # a diferencia de un pedido ecommerce que todavía falta prepararlo/enviarlo.
-    pedido = models.Pedido(
-        canal="local",
-        facturar_arca=payload.facturar_arca,
-        estado="Entregado",
-        cliente_nombre=payload.cliente_nombre,
-        notas=payload.notas,
-        total=total,
-    )
-    db.add(pedido)
-    db.flush()  # pedido.id disponible sin comprometer la transacción
-
-    for linea in payload.lineas:
-        precio_unitario = productos_cache[linea.producto_id].precio_venta
-        mov = calculations.registrar_venta(
+    try:
+        pedido = calculations.crear_pedido_con_items(
             db,
-            linea.producto_id,
-            linea.variante_id,
-            linea.cantidad,
-            monto=precio_unitario * linea.cantidad,
-            concepto=f"Venta mostrador — pedido #{pedido.id}",
+            canal="local",
+            items=payload.lineas,
+            facturar_arca=payload.facturar_arca,
+            cliente_nombre=payload.cliente_nombre,
+            notas=payload.notas,
+            sesion_id=payload.sesion_id,
         )
-        db.add(
-            models.PedidoItem(
-                pedido_id=pedido.id,
-                producto_id=linea.producto_id,
-                variante_id=linea.variante_id,
-                cantidad=linea.cantidad,
-                precio_unitario=precio_unitario,
-                movimiento_id=mov.id,
-            )
-        )
-
-    db.commit()
-    db.refresh(pedido)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return _pedido_out(db, pedido)
 
 
@@ -222,6 +185,43 @@ def listar_devoluciones(pedido_id: int, db: Session = Depends(get_db)):
         .all()
     )
     return [_devolucion_out(db, d) for d in devoluciones]
+
+
+@router.post("/{pedido_id}/cambios", response_model=schemas.CambioOut)
+def crear_cambio(pedido_id: int, payload: schemas.CambioCreate, db: Session = Depends(get_db)):
+    """Cambio de producto: una Devolucion sobre el pedido original + un Pedido nuevo con el ítem de
+    cambio, vinculados por una fila Cambio para trazabilidad — ver calculations.procesar_cambio
+    para la mecánica completa (atomicidad, cálculo de diferencia)."""
+    pedido = db.get(models.Pedido, pedido_id)
+    if not pedido:
+        raise HTTPException(404, "Pedido no encontrado.")
+    try:
+        cambio = calculations.procesar_cambio(
+            db,
+            pedido,
+            payload.items_devolver,
+            payload.items_nuevos,
+            motivo=payload.motivo,
+            canal_nuevo=payload.canal_nuevo,
+            facturar_arca_nuevo=payload.facturar_arca_nuevo,
+            cliente_nombre_nuevo=payload.cliente_nombre_nuevo,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _cambio_out(db, cambio)
+
+
+@router.get("/{pedido_id}/cambios", response_model=list[schemas.CambioOut])
+def listar_cambios(pedido_id: int, db: Session = Depends(get_db)):
+    """Historial de cambios de producto de un Pedido, más reciente primero — mismo criterio que
+    GET /{pedido_id}/devoluciones."""
+    cambios = (
+        db.query(models.Cambio)
+        .filter(models.Cambio.pedido_original_id == pedido_id)
+        .order_by(models.Cambio.fecha.desc())
+        .all()
+    )
+    return [_cambio_out(db, c) for c in cambios]
 
 
 @router.post(

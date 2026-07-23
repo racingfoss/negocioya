@@ -846,6 +846,90 @@ Factura C, uno para Nota de Crédito C) — el layout implementado es ese, sin i
   envío por email/WhatsApp ni persistencia del PDF en disco — explícitamente fuera de alcance de esta
   fase.
 
+## Cambio de producto (devolución + pedido nuevo, orquesta Fase D sin tocarla)
+
+Cubre el caso en que la clienta no quiere el reembolso sino cambiar la prenda por otra. **No es una fase
+nueva** — es un agregado chico que orquesta `procesar_devolucion` (Fase D parte 1) + la creación de un
+`Pedido` (Fase B), sin editar nunca el `Pedido` original. La diferencia de precio no dispara ningún
+`Movimiento` propio: la `Devolucion` ya resta de caja el ítem devuelto y el `Pedido` nuevo (una Venta
+normal) ya suma el ítem nuevo, así que `get_caja_actual` netea la diferencia sola.
+
+- **Tabla nueva `models.Cambio`**: `pedido_original_id`, `devolucion_id`, `pedido_nuevo_id` (los tres FK),
+  `diferencia_monto` (`Numeric(12, 2)`, positivo = la clienta pagó de más, negativo = se le devolvió),
+  `fecha`, `motivo`. Sin `relationship` — es una fila de cruce/trazabilidad, mismo criterio que
+  `Factura.devolucion_id`/`factura_original_id` (que cruzan las mismas entidades), aunque `Pedido`/
+  `PedidoItem`/`Devolucion`/`DevolucionItem` sí tengan `relationship` propia (corrección sobre lo que se
+  asumía al planificar esto: no todo el proyecto es "minimalista sin relationship", solo
+  `ReservaStock`/`MixSnapshot`/estas columnas cruzadas de `Factura`/`Cambio`). Tabla nueva, autocreada por
+  `Base.metadata.create_all()`, sin `ALTER TABLE`.
+- **`calculations.procesar_devolucion` — extendida, no duplicada**: ganó un parámetro `commit: bool =
+  True` (default preserva el comportamiento exacto de siempre, el único call site existente no lo pasa).
+  Con `commit=False` hace los mismos pasos pero no comitea, dejando el control al caller.
+- **`calculations.crear_pedido_con_items` (nueva)** — extraída de `routers/pedidos.py::crear_local`, que
+  hasta esta ronda tenía TODA la lógica de alta de pedido inline en el router (confirmado investigando el
+  código real antes de escribir nada, según lo que pedía este agregado). Mismo comportamiento exacto que
+  antes (valida stock por línea, libera la reserva de la sesión primero si corresponde, arma `Pedido` +
+  `PedidoItem` + `Movimiento` tipo Venta), con dos diferencias: acepta `commit: bool = True`, y sus
+  validaciones lanzan `ValueError` en vez de `HTTPException` (necesario para mantener el invariante de que
+  `validar_movimiento` y `facturacion.py` son las únicas dos funciones que lanzan `HTTPException` directo
+  desde código de negocio). `routers/pedidos.py::crear_local` quedó como wrapper delgado que llama a esta
+  función y traduce `ValueError` a 400 — mismo patrón que ya usaba con `procesar_devolucion`.
+- **`calculations.procesar_cambio(db, pedido_original, items_devolver, items_nuevos, motivo=None,
+  canal_nuevo="local", facturar_arca_nuevo=False, cliente_nombre_nuevo=None) -> models.Cambio`**: llama a
+  `procesar_devolucion(..., commit=False)` y después a `crear_pedido_con_items(..., commit=False)`, calcula
+  `diferencia = monto_neto_pedido(pedido_nuevo) - monto_devolucion(devolucion)`, y hace **un único
+  `db.commit()`** al final (crear la fila `Cambio` incluida) — **atomicidad completa**: si cualquier
+  `ValueError` sube en el medio (stock insuficiente de la prenda nueva, línea que no pertenece al pedido,
+  etc.), no queda escrito nada, ni siquiera la `Devolucion` sola. Probado a propósito contra la API real:
+  un cambio con la prenda de reemplazo sin stock aborta sin dejar una `Devolucion` huérfana en
+  `GET /pedidos/{id}/devoluciones`. `facturar_arca_nuevo` default `False` — no hereda del pedido original,
+  la facturación del pedido nuevo sigue siendo 100% manual como cualquier pedido nuevo de Caja.
+- **Reuse de schemas existentes, sin inventar nuevos para los ítems**: `CambioCreate.items_devolver` es
+  `list[schemas.DevolucionItemIn]` (ya existía, mismos campos `pedido_item_id`/`cantidad`) e
+  `items_nuevos` es `list[schemas.LineaOrdenIn]` (ya existía, mismos campos `producto_id`/`variante_id`/
+  `cantidad`, **sin** `precio_unitario` — confirmado que el precio siempre sale de
+  `producto.precio_venta` en el momento de la venta, nunca del cliente). Nuevos: `CambioResumenOut`
+  (vista embebida en `DevolucionOut.cambio`), `CambioOut` (`devolucion`/`pedido_nuevo` completos, armados
+  con `_devolucion_out`/`_pedido_out` — reusa esos helpers en vez de reinventar `monto_neto`/
+  `requiere_nota_credito`).
+- **`DevolucionOut.cambio`** (nuevo, opcional): para que el panel de devoluciones que ya existe (sin
+  tocar) muestre el vínculo aunque se entre por ahí y no por el historial de cambios. `_devolucion_out`
+  lo completa buscando un `Cambio` con `devolucion_id == esa devolución` (0 o 1 fila — `procesar_cambio`
+  nunca genera más de uno por `Devolucion`).
+- **`PedidoOut.cambio_origen`** (nuevo, opcional, ronda de fixes posterior): igual que `DevolucionOut.cambio`
+  pero desde el otro lado — un pedido pedido "nace" de un `Cambio` cuando es el `pedido_nuevo` de ese
+  `Cambio`, y hasta esta ronda `GET /pedidos` no daba ninguna pista de eso (el vínculo solo se veía
+  entrando al panel de cambios/devoluciones del pedido *original*). `_pedido_out` lo completa buscando un
+  `Cambio` con `pedido_nuevo_id == este pedido` (0 o 1 fila). Nuevo schema `CambioOrigenOut` (`id`,
+  `pedido_original_id`, `devolucion_id`, `fecha`), definido ANTES de `PedidoOut` en `schemas.py` (a
+  diferencia de `CambioResumenOut`, que está definido antes de `DevolucionOut` por la misma razón: Pydantic
+  necesita el tipo ya declarado, no basta un forward-ref string sin `model_rebuild()`). Esto agrega una
+  query más por fila en el loop de `GET /pedidos` (mismo patrón N+1 ya aceptado para `monto_neto`/
+  `requiere_nota_credito` — no se justifica optimizar para el volumen de un negocio unipersonal).
+- **Endpoints nuevos** (`routers/pedidos.py`): `POST /pedidos/{pedido_id}/cambios` (404 si el pedido no
+  existe, 400 con el detalle si `procesar_cambio` rechaza algo) y `GET /pedidos/{pedido_id}/cambios`
+  (historial, más reciente primero) — mismo criterio que los de devoluciones. `_cambio_out` no puede
+  usar `model_validate(cambio)` a secas para `devolucion`/`pedido_nuevo` (`Cambio` no tiene esos atributos,
+  al no tener `relationship`) — construye `schemas.CambioOut(...)` directo en vez de `model_validate` +
+  parchear campos sueltos (a diferencia de `_pedido_out`/`_devolucion_out`, que sí parten de
+  `model_validate` porque esos modelos sí tienen los atributos base).
+- **Reporte — tasa de cambios vs. devoluciones-reembolso**: `calculations.tasa_cambios_vs_devoluciones(db,
+  dias=30) -> dict` (loop en Python sobre `monto_devolucion` por cada `Devolucion` de la ventana — para
+  el volumen de un negocio unipersonal no hace falta una query agregada). Endpoint
+  `GET /dashboard/cambios-devoluciones?dias=30` — **no** `/analisis/...`: no existe `routers/analisis.py`,
+  el análisis combinado vive en `routers/dashboard.py` (prefix `/dashboard`). Sin `response_model` (mismo
+  criterio que el resto de los endpoints de ese router, que devuelven dicts planos sin schema Pydantic).
+- **Qué NO se tocó**: `backend/app/arca/`, `facturacion.py`, `reservas_stock`/`reservar_stock`/
+  `liberar_reserva` (un cambio no usa el mecanismo de carrito — es una acción atómica de un solo paso),
+  `ecommerce/`, `Compras.jsx`.
+- **Probado end-to-end contra la API real** (incluida una Nota de Crédito real en homologación): cambio
+  sobre un pedido sin facturar (`requiere_nota_credito` da `False`); cambio con diferencia positiva (la
+  clienta paga más) y negativa (hay que devolverle); cambio parcial de un pedido con 2 líneas (el
+  `Pedido.estado` original NO pasa a "Cancelado"); cambio a precio igual (`diferencia_monto = 0`, sin
+  efecto especial); cambio sobre un pedido con Factura C ya emitida con CAE real (la `Devolucion` nueva
+  queda con `requiere_nota_credito: true`, el botón "Emitir Nota de Crédito" que ya existe la cubre sin
+  cambios); prenda de cambio sin stock suficiente (aborta sin dejar nada escrito, confirma la atomicidad).
+
 ## Convenciones de código (backend)
 
 Nombres de tablas, campos, funciones y mensajes de error en español. Sin Alembic (ver nota de
